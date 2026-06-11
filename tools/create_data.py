@@ -1,12 +1,12 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
+import os
+import sys
 from os import path as osp
 
-from tools.data_converter import indoor_converter as indoor
-from tools.data_converter import kitti_converter as kitti
-from tools.data_converter import lyft_converter as lyft_converter
-from tools.data_converter import nuscenes_converter as nuscenes_converter
-from tools.data_converter.create_gt_database import create_groundtruth_database
+sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..')))
+
+from tools.data_converter.custom_fastbev_converter import create_custom_fastbev_infos
 from IPython import embed
 
 def kitti_data_prep(root_path, info_prefix, version, out_dir):
@@ -21,6 +21,9 @@ def kitti_data_prep(root_path, info_prefix, version, out_dir):
         version (str): Dataset version.
         out_dir (str): Output directory of the groundtruth database info.
     """
+    from tools.data_converter import kitti_converter as kitti
+    from tools.data_converter.create_gt_database import create_groundtruth_database
+
     kitti.create_kitti_info_file(root_path, info_prefix)
     kitti.create_reduced_point_cloud(root_path, info_prefix)
 
@@ -64,6 +67,9 @@ def nuscenes_data_prep(root_path,
         max_sweeps (int): Number of input consecutive frames. Default: 10
     """
     # embed(header='222')
+    from tools.data_converter import nuscenes_converter as nuscenes_converter
+    from tools.data_converter.create_gt_database import create_groundtruth_database
+
     nuscenes_converter.create_nuscenes_infos(
         root_path, info_prefix, version=version, max_sweeps=max_sweeps)
 
@@ -97,6 +103,8 @@ def lyft_data_prep(root_path, info_prefix, version, max_sweeps=10):
         max_sweeps (int, optional): Number of input consecutive frames.
             Defaults to 10.
     """
+    from tools.data_converter import lyft_converter as lyft_converter
+
     lyft_converter.create_lyft_infos(
         root_path, info_prefix, version=version, max_sweeps=max_sweeps)
 
@@ -110,6 +118,8 @@ def scannet_data_prep(root_path, info_prefix, out_dir, workers):
         out_dir (str): Output directory of the generated info file.
         workers (int): Number of threads to be used.
     """
+    from tools.data_converter import indoor_converter as indoor
+
     indoor.create_indoor_info_file(
         root_path, info_prefix, out_dir, workers=workers)
 
@@ -123,6 +133,8 @@ def s3dis_data_prep(root_path, info_prefix, out_dir, workers):
         out_dir (str): Output directory of the generated info file.
         workers (int): Number of threads to be used.
     """
+    from tools.data_converter import indoor_converter as indoor
+
     indoor.create_indoor_info_file(
         root_path, info_prefix, out_dir, workers=workers)
 
@@ -136,6 +148,8 @@ def sunrgbd_data_prep(root_path, info_prefix, out_dir, workers):
         out_dir (str): Output directory of the generated info file.
         workers (int): Number of threads to be used.
     """
+    from tools.data_converter import indoor_converter as indoor
+
     indoor.create_indoor_info_file(
         root_path, info_prefix, out_dir, workers=workers)
 
@@ -157,6 +171,8 @@ def waymo_data_prep(root_path,
             Here we store pose information of these frames for later use.
     """
     from tools.data_converter import waymo_converter as waymo
+    from tools.data_converter import kitti_converter as kitti
+    from tools.data_converter.create_gt_database import create_groundtruth_database
 
     splits = ['training', 'validation', 'testing']
     for i, split in enumerate(splits):
@@ -210,6 +226,26 @@ parser.add_argument(
     required='False',
     help='name of info pkl')
 parser.add_argument('--extra-tag', type=str, default='kitti')
+parser.add_argument(
+    '--calib-path',
+    type=str,
+    default=None,
+    help='calibration json path for custom_fastbev')
+parser.add_argument(
+    '--train-ratio',
+    type=float,
+    default=0.8,
+    help='train split ratio for custom_fastbev')
+parser.add_argument(
+    '--max-match-us',
+    type=int,
+    default=80000,
+    help='max timestamp delta between label and image frame for custom_fastbev')
+parser.add_argument(
+    '--camera-ids',
+    nargs='+',
+    default=None,
+    help='camera ids for custom_fastbev, e.g. cam0 cam11 cam9 cam3 cam8 cam10')
 parser.add_argument(
     '--workers', type=int, default=4, help='number of threads to be used')
 args = parser.parse_args()
@@ -287,3 +323,13 @@ if __name__ == '__main__':
             info_prefix=args.extra_tag,
             out_dir=args.out_dir,
             workers=args.workers)
+    elif args.dataset == 'custom_fastbev':
+        assert args.calib_path is not None, '--calib-path is required'
+        create_custom_fastbev_infos(
+            root_path=args.root_path,
+            info_prefix=args.extra_tag,
+            calib_path=args.calib_path,
+            out_dir=args.out_dir,
+            train_ratio=args.train_ratio,
+            max_match_us=args.max_match_us,
+            camera_ids=args.camera_ids)

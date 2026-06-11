@@ -42,6 +42,7 @@ class FastBEV(BaseDetector):
         with_cp=False,
         backproject='inplace',
         style='v4',
+        n_images=6,
     ):
         super().__init__(init_cfg=init_cfg)
         self.backbone = build_backbone(backbone)
@@ -99,6 +100,7 @@ class FastBEV(BaseDetector):
         # detach adj feature
         self.seq_detach = seq_detach
         self.backproject = backproject
+        self.n_images = n_images
         # checkpoint
         self.with_cp = with_cp
 
@@ -181,7 +183,7 @@ class FastBEV(BaseDetector):
             # [bs*seq*nv, c, h, w] -> [bs, seq*nv, c, h, w]
             mlvl_feat = mlvl_feat.reshape([batch_size, -1] + list(mlvl_feat.shape[1:]))
             # [bs, seq*nv, c, h, w] -> list([bs, nv, c, h, w])
-            mlvl_feat_split = torch.split(mlvl_feat, 6, dim=1)
+            mlvl_feat_split = torch.split(mlvl_feat, self.n_images, dim=1)
 
             volume_list = []
             for seq_id in range(len(mlvl_feat_split)):
@@ -189,9 +191,9 @@ class FastBEV(BaseDetector):
                 for batch_id, seq_img_meta in enumerate(img_metas):
                     feat_i = mlvl_feat_split[seq_id][batch_id]  # [nv, c, h, w]
                     img_meta = copy.deepcopy(seq_img_meta)
-                    img_meta["lidar2img"]["extrinsic"] = img_meta["lidar2img"]["extrinsic"][seq_id*6:(seq_id+1)*6]
+                    img_meta["lidar2img"]["extrinsic"] = img_meta["lidar2img"]["extrinsic"][seq_id*self.n_images:(seq_id+1)*self.n_images]
                     if isinstance(img_meta["img_shape"], list):
-                        img_meta["img_shape"] = img_meta["img_shape"][seq_id*6:(seq_id+1)*6]
+                        img_meta["img_shape"] = img_meta["img_shape"][seq_id*self.n_images:(seq_id+1)*self.n_images]
                         img_meta["img_shape"] = img_meta["img_shape"][0]
                     height = math.ceil(img_meta["img_shape"][0] / stride_i)
                     width = math.ceil(img_meta["img_shape"][1] / stride_i)
@@ -433,13 +435,14 @@ class FastBEV(BaseDetector):
 
         x_list = []
         img_metas_list = []
+        n_tta_imgs = len(extrinsic_copy) // 2
         for tta_id in range(2):
 
-            img_metas[0]['img_shape'] = img_shape_copy[24*tta_id:24*(tta_id+1)]
-            img_metas[0]['lidar2img']['extrinsic'] = extrinsic_copy[24*tta_id:24*(tta_id+1)]
+            img_metas[0]['img_shape'] = img_shape_copy[n_tta_imgs*tta_id:n_tta_imgs*(tta_id+1)]
+            img_metas[0]['lidar2img']['extrinsic'] = extrinsic_copy[n_tta_imgs*tta_id:n_tta_imgs*(tta_id+1)]
             img_metas_list.append(img_metas)
 
-            feature_bev, _, _ = self.extract_feat(imgs[:, 24*tta_id:24*(tta_id+1)], img_metas, "test")
+            feature_bev, _, _ = self.extract_feat(imgs[:, n_tta_imgs*tta_id:n_tta_imgs*(tta_id+1)], img_metas, "test")
             x = self.bbox_head(feature_bev)
             x_list.append(x)
 

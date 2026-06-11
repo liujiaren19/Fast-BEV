@@ -3,6 +3,7 @@ from .builder import DATASETS, build_dataset
 from .custom_3d import Custom3DDataset
 from .custom_3d_seg import Custom3DSegDataset
 from .internal_dataset import InternalDataset
+from .custom_multiview_dataset import CustomMultiViewDataset
 from .kitti_dataset import KittiDataset
 from .kitti_mono_dataset import KittiMonoDataset
 from .lyft_dataset import LyftDataset
@@ -41,6 +42,7 @@ __all__ = [
     'Custom3DDataset', 'Custom3DSegDataset', 'LoadPointsFromMultiSweeps',
     'WaymoDataset', 'BackgroundPointsFilter', 'VoxelBasedPointSampler',
     'get_loading_pipeline', 'RandomDropPointsColor', 'RandomJitterPoints',
-    'ObjectNameFilter', 'InternalDataset', 'NuScenesMultiViewDataset',
+    'ObjectNameFilter', 'InternalDataset', 'CustomMultiViewDataset',
+    'NuScenesMultiViewDataset',
     'NuScenesMultiView_Map_Dataset2'
 ]

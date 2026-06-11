@@ -23,13 +23,15 @@ class MultiViewPipeline:
         imgs = []
         extrinsics = []
         if not self.sequential:
-            assert len(results['img_info']) == 6
+            assert len(results['img_info']) >= self.n_images
             ids = np.arange(len(results['img_info']))
             replace = True if self.n_images > len(ids) else False
             ids = np.random.choice(ids, self.n_images, replace=replace)
             ids_list = sorted(ids)  # sort & tolist
         else:
-            assert len(results['img_info']) == 6 * self.n_times, f'img info: {len(results["img_info"])}, n_times: {self.n_times}'
+            expected = self.n_images * self.n_times
+            assert len(results['img_info']) == expected, \
+                f'img info: {len(results["img_info"])}, expected: {expected}, n_times: {self.n_times}, n_images: {self.n_images}'
             ids_list = np.arange(len(results['img_info'])).tolist()
         for i in ids_list:
             _results = dict()
