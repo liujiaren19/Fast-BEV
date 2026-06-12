@@ -234,6 +234,113 @@ python tools/train.py configs/fastbev/custom/custom_fastbev_mono_front_r18.py
    compensation.
 6. Compile mmdet3d ops in a CUDA/nvcc environment before full training.
 
+## Next Planned Validation: A, nuScenes Monocular Chain
+
+The current priority is not business-data training yet. The next validation
+target is:
+
+```text
+A: prove that Fast-BEV can run true front-monocular training and inference on
+   nuScenes first.
+```
+
+Rationale:
+
+```text
+final business deployment input = front monocular
+therefore validation should first use train input = front monocular and
+test input = front monocular
+```
+
+Avoid using six-camera training plus one-camera inference as the main result,
+because it mixes pseudo-label value with train/test input mismatch.
+
+Recommended AutoDL instance:
+
+```text
+GPU: RTX 3090, 24 GB
+CPU: 20 cores is enough
+RAM: 90 GB is enough
+System disk: 30 GB
+Data disk: 150 GB preferred
+```
+
+Storage guidance:
+
+```text
+50 GB data disk may work for nuScenes mini only, but it is tight.
+150 GB is preferred because environment, build cache, compiled ops, pretrained
+weights, logs, and checkpoints can otherwise fill the disk and waste GPU time.
+```
+
+Use data disk for repository, data, conda/cache if possible. On AutoDL this is
+often one of:
+
+```text
+/root/autodl-tmp
+/autodl-tmp
+```
+
+After AutoDL boots, first collect:
+
+```bash
+nvidia-smi
+df -h
+free -h
+ls /root
+ls /root/autodl-tmp || true
+ls /autodl-tmp || true
+```
+
+Clone the handoff branch on the AutoDL machine:
+
+```bash
+cd /root/autodl-tmp
+git clone -b test/custom-fastbev-adapter https://github.com/liujiaren19/Fast-BEV.git
+cd Fast-BEV
+```
+
+If the data disk path is different, use that instead of `/root/autodl-tmp`.
+
+Suggested message for the next Codex running on AutoDL:
+
+```text
+I migrated from another Codex session. Do not read the full old chat.
+
+Repository branch:
+test/custom-fastbev-adapter
+
+Goal:
+A: validate true Fast-BEV front-monocular training/inference on nuScenes.
+
+First run:
+git status --short
+git branch --show-current
+sed -n '1,320p' notes/fastbev_custom_handoff.md
+nvidia-smi
+df -h
+free -h
+
+Then continue:
+1. Configure Python 3.8 + torch/mmcv/mmdet/mmseg.
+2. Compile mmdet3d ops with CUDA/nvcc.
+3. Prepare nuScenes mini under data/nuscenes.
+4. Create or adapt a nuScenes front-monocular Fast-BEV config.
+5. Run one training iteration.
+6. Run one-sample inference.
+7. Record errors, fixes, and validation results.
+```
+
+Expected time on a healthy RTX 3090 AutoDL instance:
+
+```text
+minimum chain validation: 2-4 hours
+more reliable small experiment: 6-12 hours
+```
+
+Do not download full nuScenes trainval for this first A validation unless there
+is at least 500 GB free disk. Use nuScenes mini first.
+
 ## Suggested First Commands For Next Codex
 
 ```bash
