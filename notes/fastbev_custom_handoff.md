@@ -220,6 +220,143 @@ Front monocular:
 python tools/train.py configs/fastbev/custom/custom_fastbev_mono_front_r18.py
 ```
 
+## Three-Round Adaptation Roadmap
+
+The intended work should be done in three rounds. Keep these rounds separate so
+that each experiment has a clean conclusion and does not mix unrelated sources
+of error.
+
+### Round 1: Monocular Scenario Validation
+
+Goal:
+
+```text
+Verify that Fast-BEV can really train and infer with front monocular input.
+```
+
+Preferred validation dataset:
+
+```text
+nuScenes mini first, then larger nuScenes split if needed.
+```
+
+Why this is first:
+
+```text
+The final business deployment input is front monocular.
+Before evaluating custom data or pseudo labels, prove that:
+train input = front monocular
+inference input = front monocular
+model/pipeline/config can run end to end
+```
+
+Success criteria:
+
+```text
+1. mmdet3d ops compile in CUDA environment.
+2. nuScenes mini info/config can be loaded.
+3. front-only Fast-BEV config runs at least one training iteration.
+4. loss is finite, no obvious shape/view-count errors.
+5. one-sample inference runs and returns boxes.
+6. optional: visualize predictions or projected GT on a few samples.
+```
+
+Non-goal:
+
+```text
+Do not judge final accuracy from this round.
+This round proves the monocular mechanism is viable.
+```
+
+### Round 2: Custom Data Adaptation Validation
+
+Goal:
+
+```text
+Verify that custom collected data, including business-scenario pseudo labels
+from BEVFusion, can improve or adapt Fast-BEV in the target domain.
+```
+
+Recommended order:
+
+```text
+1. Run the custom converter on real custom data.
+2. Inspect generated pkl counts, camera paths, class distribution, and box range.
+3. Visualize GT/pseudo-GT projection to confirm calibration direction.
+4. Train/evaluate true front-monocular Fast-BEV on custom front-only data.
+5. Compare against the current six-camera-trained/front-only-inference baseline.
+```
+
+Pseudo-label guidance:
+
+```text
+Use BEVFusion pseudo labels as teacher labels for the business scenario, but
+filter them by score/class/range and preferably temporal stability. Avoid
+treating all low-confidence boxes as hard ground truth.
+```
+
+Success criteria:
+
+```text
+1. Custom converter works on real data without path/timestamp mismatch.
+2. Front-only custom dataset can build and run training.
+3. Business-scenario validation or visualization improves versus baseline.
+4. Failure cases are attributable: pseudo-label quality, calibration, range, or
+   monocular model capacity.
+```
+
+Non-goal:
+
+```text
+Do not migrate the entire coordinate system to final ego coordinates in this
+round unless required. Keep the coordinate convention stable to isolate the
+value of custom data and pseudo labels.
+```
+
+### Round 3: Final Coordinate Unification To Ego
+
+Goal:
+
+```text
+Unify training labels, model BEV space, evaluation, and downstream output to
+the final business ego frame:
+X forward, Y left, Z up, origin at rear-axle center projected onto the ground.
+```
+
+Why this is a separate final round:
+
+```text
+The business fleet has different vehicle heights and sensor installation
+patterns: original vehicle sensors, roof rack fixtures, low sedans, large MPVs.
+Sensor-origin labels mix installation height/position into the learning target.
+Final production should use ego-frame labels, while per-vehicle sensor mounting
+differences are handled by sensor_to_ego extrinsics.
+```
+
+Required changes:
+
+```text
+1. Convert all labels to rear-axle-ground ego frame.
+2. Convert camera/lidar calibration to sensor_to_ego and ego_to_img.
+3. Update point_cloud_range and BEV origin.
+4. Update anchor z/ranges and any bbox prior assumptions.
+5. Update visualization and evaluation to use ego frame.
+6. Confirm all downstream consumers expect the same ego convention.
+```
+
+Success criteria:
+
+```text
+1. Projection visualization is correct across multiple vehicle heights and
+   sensor mounting positions.
+2. Training/inference/evaluation all use the same ego frame internally.
+3. Output can be consumed by downstream planning/control without extra ad-hoc
+   coordinate fixes.
+```
+
+Do this only after Round 1 and Round 2 have provided a working monocular
+training chain and evidence that the custom/pseudo-label data is useful.
+
 ## Important Follow-Ups
 
 1. Run the converter on real data and inspect pkl counts/class distribution.
