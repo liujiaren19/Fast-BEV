@@ -140,6 +140,7 @@ class NuScenesDataset(Custom3DDataset):
                  max_interval=3,
                  min_interval=0,
                  fix_direction=False,
+                 camera_types=None,
                  verbose=False):
         self.load_interval = load_interval
         self.use_valid_flag = use_valid_flag
@@ -177,6 +178,7 @@ class NuScenesDataset(Custom3DDataset):
         self.min_interval = min_interval
         self.speed_mode = speed_mode
         self.fix_direction = fix_direction
+        self.camera_types = camera_types
         self.verbose = verbose
 
     def get_cat_ids(self, idx):
@@ -260,7 +262,11 @@ class NuScenesDataset(Custom3DDataset):
                 'sensor2lidar_translation',
                 'cam_intrinsic'
             ]
-            for cam_type, cam_info in info['cams'].items():
+            cam_items = list(info['cams'].items())
+            if self.camera_types is not None:
+                cam_items = [(cam_type, info['cams'][cam_type])
+                             for cam_type in self.camera_types]
+            for cam_type, cam_info in cam_items:
                 image_paths.append(cam_info['data_path'])
 
                 # keep original rts
@@ -373,7 +379,11 @@ class NuScenesDataset(Custom3DDataset):
                         'ego2global_translation',
                         'ego2global_rotation',
                     ]
-                    for cam_id, (cam_type, cam_info) in enumerate(info_adj['cams'].items()):
+                    adj_cam_items = list(info_adj['cams'].items())
+                    if self.camera_types is not None:
+                        adj_cam_items = [(cam_type, info_adj['cams'][cam_type])
+                                         for cam_type in self.camera_types]
+                    for cam_id, (cam_type, cam_info) in enumerate(adj_cam_items):
                         image_paths.append(cam_info['data_path'])
 
                         lidar2img_aug = lidar2img_augs[cam_id].copy()

@@ -27,7 +27,7 @@ class NuScenesMultiViewDataset(MultiViewMixin, NuScenesDataset):
     def get_data_info(self, index):
         data_info = super().get_data_info(index)
         n_cameras = len(data_info['img_filename'])
-        if not self.sequential:
+        if not self.sequential and getattr(self, 'camera_types', None) is None:
             assert n_cameras == 6
 
         new_info = dict(

@@ -687,3 +687,215 @@ sed -n '1,260p' notes/fastbev_custom_handoff.md
 ```
 
 Avoid rereading the full previous chat unless absolutely necessary.
+
+## Round 1 AutoDL Validation Result, 2026-06-12
+
+Status: completed for the minimum smoke-test target. A true front-monocular
+Fast-BEV chain on nuScenes mini now runs through 1 training iteration and
+1 validation-sample inference on AutoDL.
+
+Server and storage:
+
+```text
+Repository: /root/autodl-tmp/Fast-BEV
+Branch: test/custom-fastbev-adapter
+Data root: /root/autodl-tmp/datasets/nuscenes-mini
+Repo data symlink: data/nuscenes -> /root/autodl-tmp/datasets/nuscenes-mini
+GPU: NVIDIA GeForce RTX 3090, 24 GB
+Driver/CUDA from nvidia-smi: driver 595.58.03, CUDA 13.2 capability display
+CUDA toolkit used for builds: nvcc 11.3, /usr/local/cuda
+Python: 3.8.20, /root/miniconda3/bin/python
+Torch: 1.10.0+cu113, torchvision 0.11.1+cu113
+MMCV/MMDet/MMSeg/MMDet3D: 1.4.0 / 2.20.0 / 0.21.1 / 0.16.0 editable
+```
+
+Storage note for this AutoDL machine:
+
+```text
+Use /root/autodl-tmp for repo, datasets, build outputs, checkpoints, and logs.
+The AutoDL system disk persists across shutdown and can be saved into an image,
+but it is smaller/slower. /root/autodl-tmp is the data disk, persists across
+shutdown, and is better for code/data during this task, but is not saved into a
+system image.
+```
+
+Environment setup performed:
+
+```text
+Installed mmcv-full==1.4.0 from OpenMMLab cu113/torch1.10 wheel.
+Installed mmdet==2.20.0 and mmsegmentation==0.21.1.
+Installed nuscenes-devkit, opencv-python-headless==4.8.1.78, networkx==2.2,
+tensorboard, plyfile, scikit-image, trimesh==2.35.39, ipdb, timm==0.6.13,
+yapf==0.40.1.
+Ran pip install -e . and compiled mmdet3d CUDA ops successfully.
+Verified imports for iou3d_cuda, voxel_layer, and spconv.sparse_conv_ext.
+Build log: /root/autodl-tmp/Fast-BEV/build_mmdet3d_ops.log
+```
+
+nuScenes mini preparation:
+
+```text
+Used public AutoDL data already present under /autodl-pub/data/nuScenes.
+Extracted v1.0-mini, map expansion, and CAN bus files to
+/root/autodl-tmp/datasets/nuscenes-mini.
+Added maps/expansion symlink to satisfy NuScenesMap lookup.
+Generated base mini infos with tools/create_data.py:
+  train samples: 323
+  val samples: 81
+Log: /root/autodl-tmp/Fast-BEV/create_nuscenes_mini_infos.log
+Generated Fast-BEV sequential infos:
+  data/nuscenes/nuscenes_infos_train_4d_interval3_max60.pkl
+  data/nuscenes/nuscenes_infos_val_4d_interval3_max60.pkl
+Log: /root/autodl-tmp/Fast-BEV/create_nuscenes_mini_seq_infos.log
+```
+
+Code/config changes made for Round 1:
+
+```text
+mmdet3d/datasets/nuscenes_dataset.py
+  Added camera_types support and filtered current/adjacent camera dicts.
+
+mmdet3d/datasets/nuscenes_monocular_dataset.py
+  Relaxed the non-sequential six-camera assertion when camera_types is set.
+
+mmdet3d/datasets/nuscenes_monocular_dataset_map_2.py
+  Use self.version instead of hardcoded v1.0-trainval for NuScenes API.
+
+tools/data_converter/nuscenes_seq_converter.py
+  Generate train/val sequential infos and derive NuScenes version from pkl
+  metadata, so v1.0-mini works.
+
+mmdet3d/models/backbones/swin_transformer.py
+  Use BACKBONES.register_module(force=True) to avoid duplicate SwinTransformer
+  registration after installing timm/mmdet dependencies.
+
+configs/fastbev/round1/nuscenes_mini_front_mono_fastbev_r18_1iter.py
+  New Round 1 config. It uses n_images=1, CAM_FRONT only, sequential 4-frame
+  input, load_interval=999999 to reduce train/val to one sample, EpochBasedRunner
+  max_epochs=1, BN instead of SyncBN, random init, disk file client, standard
+  AdamW optimizer, and 3D annotation loading only.
+```
+
+Problems encountered and fixes:
+
+```text
+Missing timm -> installed timm==0.6.13.
+Duplicate SwinTransformer registry -> changed local Swin registration to force=True.
+mmcv 1.4.0 incompatible with new yapf FormatCode verify kwarg -> pinned yapf==0.40.1.
+IterBasedRunner rejected by local train.py max_epochs assert -> used EpochBasedRunner.
+CBGSDataset with one-sample smoke config caused ZeroDivisionError -> use direct dataset.
+Base config merge left nested dataset key -> added _delete_=True for train/val/test.
+EvalHook interval=0 invalid -> set evaluation interval to 999999.
+LoadAnnotations3D with with_bbox/with_label requested 2D boxes -> removed those args;
+  defaults load 3D boxes/labels, with_bev_seg=True kept.
+Custom AdamW2 incompatible with torch 1.10 F.adamw signature -> override optimizer to
+  standard AdamW for Round 1 smoke test.
+```
+
+Validation commands and results:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+  configs/fastbev/round1/nuscenes_mini_front_mono_fastbev_r18_1iter.py \
+  --work-dir /root/autodl-tmp/Fast-BEV/work_dirs/round1_nuscenes_mini_front_mono_1iter \
+  2>&1 | tee /root/autodl-tmp/Fast-BEV/train_round1_front_mono_1iter.log
+```
+
+Training result:
+
+```text
+Succeeded for Epoch [1][1/1].
+Checkpoint: work_dirs/round1_nuscenes_mini_front_mono_1iter/epoch_1.pth
+Observed loss: positive_bag_loss 4.0686, negative_bag_loss 0.0003, total loss 4.0690
+Peak logged memory: 2273 MB
+```
+
+Inference command:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/test.py \
+  configs/fastbev/round1/nuscenes_mini_front_mono_fastbev_r18_1iter.py \
+  work_dirs/round1_nuscenes_mini_front_mono_1iter/epoch_1.pth \
+  --out /root/autodl-tmp/Fast-BEV/work_dirs/round1_nuscenes_mini_front_mono_1iter/inference_1sample.pkl \
+  2>&1 | tee /root/autodl-tmp/Fast-BEV/infer_round1_front_mono_1sample.log
+```
+
+Inference result:
+
+```text
+Succeeded on 1 validation sample.
+Output pkl length: 1
+Output keys: boxes_3d, scores_3d, labels_3d
+Predicted boxes: 0
+```
+
+The empty prediction is acceptable for this smoke test because the model was
+randomly initialized and trained for only one sample/one iteration. The important
+Round 1 result is that the real nuScenes front-monocular sequential dataloader,
+Fast-BEV forward/backward, checkpoint save, test-time forward, postprocessing,
+and result serialization all run successfully.
+
+Recommended next step after this Round 1 smoke test:
+
+```text
+Run a small but nontrivial nuScenes-mini front-monocular experiment, e.g. a few
+epochs over all mini train samples, preferably with a compatible pretrained
+ResNet/Fast-BEV initialization if available. Only after that move to custom
+business data/pseudo-label validation. Do not migrate the final rear-axle ego
+coordinate frame until the custom data value experiment is clearer.
+```
+
+## No-GPU Follow-up, 2026-06-12
+
+After the AutoDL instance was restarted without GPU resources, the repository,
+nuScenes mini data, Round 1 checkpoint, and inference pkl were still present on
+`/root/autodl-tmp`.
+
+Added a follow-up full-mini debug config that can be run once GPU resources are
+restored:
+
+```text
+configs/fastbev/round1/nuscenes_mini_front_mono_fastbev_r18_debug.py
+```
+
+It keeps the same true front-monocular setup as the smoke config:
+
+```text
+camera_types = ['CAM_FRONT']
+n_images = 1
+n_times = 4
+sequential = True
+```
+
+Differences from the 1-iter smoke config:
+
+```text
+train load_interval: 1
+train length: 323
+val length: 81
+runner: EpochBasedRunner, max_epochs=3
+evaluation interval: 1
+work_dir: ./work_dirs/round1_nuscenes_mini_front_mono_debug
+```
+
+Validated without GPU by building train/val datasets for both configs:
+
+```text
+smoke config: train_len 1, val_len 1, train_img_count 4, cameras ['CAM_FRONT']
+debug config: train_len 323, val_len 81, train_img_count 4, cameras ['CAM_FRONT']
+ann_info includes gt_bev_seg in both configs.
+```
+
+Web VS Code / code-server note:
+
+```text
+code-server is installed under /root/autodl-tmp/code-server-app.
+It is currently started on 127.0.0.1:6006 with --auth none because access is
+intended to go through the authenticated Jupyter proxy path.
+Jupyter password set during this session: JupyterFastBEV2026
+Jupyter proxy URL path: /jupyter/proxy/6006/
+```
+
+Because AutoDL did not allow unauthenticated custom HTTP services in the user's
+region and the user only had browser access, `jupyter-server-proxy` was installed
+so code-server can be reached through the existing Jupyter browser session.
