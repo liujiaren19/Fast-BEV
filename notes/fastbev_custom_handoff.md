@@ -899,3 +899,54 @@ Jupyter proxy URL path: /jupyter/proxy/6006/
 Because AutoDL did not allow unauthenticated custom HTTP services in the user's
 region and the user only had browser access, `jupyter-server-proxy` was installed
 so code-server can be reached through the existing Jupyter browser session.
+
+## BEVFusion Pseudo Label Converter, 2026-06-12
+
+Added converter:
+
+```text
+tools/data_converter/bevfusion_pred_to_custom_labels.py
+```
+
+Purpose:
+
+```text
+Read BEVFusion-style name.pkl / pred.pkl outputs and emit the custom 3d_od JSON
+label format used by the existing custom Fast-BEV converter.
+```
+
+Default coordinate assumption:
+
+```text
+source prediction boxes: mmdet3d_lidar / Fast-BEV LiDAR, x front, y left, z up
+output custom labels: custom raw main-lidar, x left, y rear, z up
+```
+
+Coordinate transform:
+
+```text
+raw_x_left = fastbev_y_left
+raw_y_rear = -fastbev_x_front
+raw_z_up = fastbev_z_up
+raw_yaw = normalize(fastbev_yaw - pi / 2)
+```
+
+Example usage after placing the data under `data/gt/20260514_9797`:
+
+```bash
+python tools/data_converter/bevfusion_pred_to_custom_labels.py \
+  --name-pkl data/gt/20260514_9797/name.pkl \
+  --pred-pkl data/gt/20260514_9797/pred.pkl \
+  --image-dir data/gt/20260514_9797/20260514103014_1.dat_img \
+  --calib-txt data/gt/20260514_9797/9797_3.txt \
+  --out-dir data/gt/20260514_9797/output/20260514103014_1/3D_OD/lidar \
+  --score-thr 0.2 \
+  --front-range 0 100 -40 40 \
+  --inspect
+```
+
+`--inspect` prints the pkl structure before conversion. The script supports common
+MMDet3D/BEVFusion output keys such as `boxes_3d`, `scores_3d`, `labels_3d`, and
+nested `pts_bbox` / `pred_instances_3d`. It extracts only the basename from
+`name.pkl` paths before matching against the local image directory, because the
+stored pkl paths may not match the actual local path.
