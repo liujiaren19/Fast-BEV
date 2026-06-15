@@ -42,7 +42,7 @@ data_config = {
 train_pipeline = [
     dict(type='MultiViewPipeline', sequential=True, n_images=1, n_times=4, transforms=[
         dict(type='LoadImageFromFile', file_client_args=file_client_args)]),
-    dict(type='LoadAnnotations3D', with_bbox=True, with_label=True),
+    dict(type='LoadAnnotations3D'),
     dict(type='LoadPointsFromFile', dummy=True, coord_type='LIDAR', load_dim=5, use_dim=5),
     dict(
         type='RandomFlip3D',
@@ -97,12 +97,10 @@ data = dict(
     samples_per_gpu=1,
     workers_per_gpu=1,
     train=dict(
-        type='CBGSDataset',
-        dataset=dict(
-            **custom_dataset_common,
-            pipeline=train_pipeline,
-            test_mode=False,
-            ann_file=data_root + ann_prefix + '_infos_train.pkl')),
+        **custom_dataset_common,
+        pipeline=train_pipeline,
+        test_mode=False,
+        ann_file=data_root + ann_prefix + '_infos_train.pkl'),
     val=dict(
         **custom_dataset_common,
         pipeline=test_pipeline,
