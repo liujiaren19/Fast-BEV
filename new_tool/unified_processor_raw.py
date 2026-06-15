@@ -1,18 +1,64 @@
 #!/usr/bin/env python3
 """Convert N7 3D_OD data to Fast-BEV CustomMultiViewDataset pkl files.
 
-This script is intentionally OD-only. It removes the old AVM/parking-slot path
-and emits the pkl schema consumed by mmdet3d.datasets.CustomMultiViewDataset.
+This converter is intentionally OD-only.  It removes the old AVM/parking-slot
+path and emits the light-weight pkl schema consumed by
+``mmdet3d.datasets.CustomMultiViewDataset``.
 
-Output coordinate:
-    mmdet3d_lidar: x front, y left, z up, origin at N7 top lidar.
+Expected raw data layout
+------------------------
+The script accepts several historical N7 layouts.  The two most common layouts
+are shown below; the converter discovers matching ``3D_OD/lidar`` and ``frames``
+directories automatically.
 
+    <data-root>/<dataset>/<sequence>/output/<clip>/3D_OD/lidar/*.json
+    <data-root>/<dataset>/<sequence>/parsed_data/<clip>/frames/<timestamp>/images/<cam_id>/*.jpg
+
+    <data-root>/<dataset>/output/<sequence>/<clip>/3D_OD/lidar/*.json
+    <data-root>/<dataset>/parsed_data/<sequence>/<clip>/frames/<timestamp>/images/<cam_id>/*.jpg
+
+For deterministic train/val/test splits, create a manifest named
+``<dataset>_<set>_clips.txt`` under one of these locations:
+
+    <data-root>/<dataset>_<set>_clips.txt
+    <data-root>/manifests/<dataset>_<set>_clips.txt
+    <data-root>/<dataset>/<dataset>_<set>_clips.txt
+
+Each non-empty manifest line must be ``dataset/sequence/clip``.  If no manifest
+is found, the converter recursively discovers clips under ``--data-path``.
+
+Coordinate convention
+---------------------
 Source 3D_OD labels are treated as:
+
     custom_lidar: x left, y rear/back, z up, origin at N7 top lidar.
 
-The rear-axle-ground ego migration is not applied here. That migration should be
-done as a separate all-geometry change because it must update labels, camera
-extrinsics, ranges, anchors, and visualization together.
+Output pkl boxes and camera extrinsics are converted directly to:
+
+    mmdet3d_lidar: x front, y left, z up, origin at N7 top lidar.
+
+The direct axis conversion is:
+
+    x_fastbev = -y_raw
+    y_fastbev =  x_raw
+    z_fastbev =  z_raw
+    yaw_fastbev = normalize(yaw_raw + pi / 2)
+
+The rear-axle-ground ego migration is intentionally not applied here.  That is a
+separate all-geometry migration because it must update labels, camera extrinsics,
+BEV ranges, anchors, pseudo labels, and visualization together.  The output
+metadata records ``rear_axle_ground_ego_applied=False`` to avoid ambiguity.
+
+Output pkl schema
+-----------------
+The pkl contains ``{"infos": infos, "metadata": metadata}``.  Each info stores
+camera image paths, camera intrinsics/extrinsics, 3D boxes, class names,
+velocities, frame-level lidar poses, and dense ``prev``/``next`` adjacent-frame
+references.  The converter writes clip-local ``lidar2global`` poses when they
+are available from SLAM odometry or label JSON.  ``CustomMultiViewDataset`` then
+uses those poses to motion-compensate adjacent camera frames into the key-frame
+lidar coordinate system, matching the temporal semantics of the original
+Fast-BEV nuScenes pipeline.
 """
 
 from __future__ import annotations
@@ -85,6 +131,15 @@ CLASS_MAPPING = {
 
 # Source N7/custom label frame: x left, y rear/back, z up.
 # Fast-BEV/MMDet3D LiDAR frame: x front, y left, z up.
+#
+# Matrix form of the direct axis remap:
+#   [x_fastbev]   [ 0 -1  0] [x_raw]
+#   [y_fastbev] = [ 1  0  0] [y_raw]
+#   [z_fastbev]   [ 0  0  1] [z_raw]
+#
+# The same matrix is applied to box centers, velocities, and camera extrinsic
+# translations.  Camera rotations are left-multiplied by this matrix so that the
+# camera-to-lidar transform remains expressed in the output Fast-BEV lidar frame.
 RAW_TO_FASTBEV = np.array([
     [0.0, -1.0, 0.0],
     [1.0, 0.0, 0.0],
@@ -110,6 +165,9 @@ class ConversionStats:
     objects_total: int = 0
     objects_kept: int = 0
     objects_unknown_class: int = 0
+    clips_with_pose_file: int = 0
+    labels_with_pose: int = 0
+    labels_without_pose: int = 0
 
     def as_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)
@@ -184,6 +242,141 @@ def rotation_to_wxyz(rot: np.ndarray) -> List[float]:
     return [float(qw), float(qx), float(qy), float(qz)]
 
 
+def pose_vector_to_fastbev(pose: Sequence[float]) -> Dict:
+    """Convert a raw N7 lidar pose into the Fast-BEV lidar coordinate frame.
+
+    Raw pose files and label JSON store seven values as
+    ``[tx, ty, tz, qx, qy, qz, qw]``.  The pose maps a point from the current
+    raw lidar frame to the clip-local reference/global frame:
+
+        p_ref_raw = R_raw @ p_lidar_raw + t_raw
+
+    Training boxes and camera extrinsics are converted to Fast-BEV lidar axes
+    with ``RAW_TO_FASTBEV``.  Pose must be converted the same way, otherwise
+    adjacent-frame motion compensation would mix two coordinate systems.
+    """
+    arr = np.asarray(pose, dtype=np.float64).reshape(-1)
+    if arr.size != 7:
+        raise ValueError(f'expected pose [tx,ty,tz,qx,qy,qz,qw], got shape {arr.shape}')
+    tran_raw = arr[:3].astype(np.float32)
+    rot_raw = quat_xyzw_to_matrix(arr[3:7])
+
+    rot_fastbev = RAW_TO_FASTBEV @ rot_raw @ RAW_TO_FASTBEV.T
+    tran_fastbev = RAW_TO_FASTBEV @ tran_raw
+    return {
+        'raw_lidar2global_translation': tran_raw.astype(np.float32).tolist(),
+        'raw_lidar2global_rotation_xyzw': arr[3:7].astype(np.float32).tolist(),
+        'lidar2global_translation': tran_fastbev.astype(np.float32).tolist(),
+        'lidar2global_rotation': rotation_to_wxyz(rot_fastbev),
+        # Ego is currently defined as the N7 top-lidar frame.  The later
+        # rear-axle-ground migration should update both lidar and ego fields
+        # together; keeping aliases now makes the dataset code close to the
+        # original nuScenes temporal implementation.
+        'ego2global_translation': tran_fastbev.astype(np.float32).tolist(),
+        'ego2global_rotation': rotation_to_wxyz(rot_fastbev),
+    }
+
+
+class OdomPoseIndex:
+    """Timestamp matcher for clip-local SLAM lidar poses.
+
+    ``odom_lidar_reference.txt`` is one clip-local trajectory.  The first row is
+    usually identity, so the coordinate named ``global`` in the output pkl should
+    be read as "clip reference frame", not earth/global map coordinates.  That is
+    sufficient for Fast-BEV temporal compensation because only relative transforms
+    between adjacent and key frames are needed.
+    """
+
+    def __init__(self, path: Optional[Path]):
+        self.path = path
+        self.items: List[Tuple[int, Dict]] = []
+        if path is None or not path.exists():
+            self.timestamps: List[int] = []
+            return
+
+        with path.open('r') as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) < 8:
+                    logger.debug('Skip malformed odom line %s:%d: %s', path, line_no, line)
+                    continue
+                try:
+                    timestamp = int(float(parts[0]))
+                    pose = [float(x) for x in parts[1:8]]
+                    pose_info = pose_vector_to_fastbev(pose)
+                except Exception as exc:
+                    logger.debug('Skip odom line %s:%d: %s', path, line_no, exc)
+                    continue
+                pose_info.update({
+                    'pose_source': 'odom_lidar_reference',
+                    'pose_timestamp': timestamp,
+                    'pose_time_diff_us': 0,
+                    'pose_file': str(path),
+                })
+                self.items.append((timestamp, pose_info))
+
+        self.items.sort(key=lambda x: x[0])
+        self.timestamps = [x[0] for x in self.items]
+
+    def closest(self, timestamp: int, max_diff_us: int) -> Optional[Dict]:
+        if not self.items:
+            return None
+        pos = np.searchsorted(self.timestamps, timestamp)
+        candidates = []
+        for idx in (pos - 1, pos):
+            if 0 <= idx < len(self.items):
+                ts, pose_info = self.items[idx]
+                diff = abs(ts - timestamp)
+                if diff <= max_diff_us:
+                    candidates.append((diff, ts, pose_info))
+        if not candidates:
+            return None
+        diff, _, pose_info = min(candidates, key=lambda x: x[0])
+        pose_info = deepcopy(pose_info)
+        pose_info['pose_time_diff_us'] = int(diff)
+        return pose_info
+
+
+def label_pose_to_fastbev(raw_pose: Optional[Sequence[float]], timestamp: int) -> Optional[Dict]:
+    """Convert ``3d_od.lidar_pose`` from one label JSON into pkl pose fields."""
+    if raw_pose is None:
+        return None
+    try:
+        pose_info = pose_vector_to_fastbev(raw_pose)
+    except Exception as exc:
+        logger.debug('Invalid label lidar_pose at %s: %s', timestamp, exc)
+        return None
+    pose_info.update({
+        'pose_source': 'label_lidar_pose',
+        'pose_timestamp': int(timestamp),
+        'pose_time_diff_us': 0,
+        'pose_file': '',
+    })
+    return pose_info
+
+
+def select_frame_pose(
+    timestamp: int,
+    raw_label_pose: Optional[Sequence[float]],
+    pose_index: Optional[OdomPoseIndex],
+    max_pose_match_us: int,
+) -> Optional[Dict]:
+    """Choose the best frame pose for temporal compensation.
+
+    SLAM odometry is preferred because it is dense and explicitly clip-local.
+    The label's own ``lidar_pose`` is a useful fallback and also allows a pkl to
+    remain temporal-ready when only label JSON pose is available.
+    """
+    if pose_index is not None:
+        pose_info = pose_index.closest(timestamp, max_pose_match_us)
+        if pose_info is not None:
+            return pose_info
+    return label_pose_to_fastbev(raw_label_pose, timestamp)
+
+
 def parse_sensor_to_lidar(raw_ext: Sequence) -> Tuple[np.ndarray, np.ndarray]:
     arr = np.asarray(raw_ext, dtype=np.float64)
     if arr.shape == (4, 4):
@@ -226,6 +419,16 @@ def lidar_main_metadata(calib: Dict) -> Dict:
 
 
 def build_camera_info(sensor: Dict, image_path: Path, data_root: Path) -> Dict:
+    """Build one camera entry for the output pkl.
+
+    Calibration json stores each camera's ``to_lidar_main`` transform in the raw
+    N7/custom lidar frame.  The training pkl must be self-consistent, so this
+    function converts both rotation and translation into the Fast-BEV lidar frame
+    before writing ``sensor2lidar_rotation`` and ``sensor2lidar_translation``.
+
+    ``data_path`` is stored relative to ``data_root`` when possible.  Use the
+    same root as visualizer ``--data-root`` to resolve images later.
+    """
     raw_ext = sensor.get('extrinsic', {}).get('to_lidar_main')
     if raw_ext is None:
         raise ValueError(f'sensor {sensor.get("name")} lacks to_lidar_main extrinsic')
@@ -283,6 +486,13 @@ def annotation_payload(label: Dict) -> Dict:
 
 
 def annotation_to_box(anno: Dict) -> Tuple[List[float], List[float]]:
+    """Convert one raw 3D_OD annotation to Fast-BEV lidar box format.
+
+    Output box format is ``[x, y, z, l, w, h, yaw]`` in the target lidar frame.
+    Velocity is returned separately as ``[vx, vy]`` and later concatenated by the
+    dataset.  The yaw shift of ``+pi/2`` is the angular form of the axis remap:
+    raw forward is ``-Y`` while Fast-BEV forward is ``+X``.
+    """
     loc_raw = np.array([
         anno.get('location', {}).get('x', 0.0),
         anno.get('location', {}).get('y', 0.0),
@@ -344,6 +554,10 @@ def parse_label(label_path: Path, classes: Sequence[str], stats: ConversionStats
 
     return {
         'timestamp': timestamp,
+        # ``lidar_pose`` is optional in older labels.  When present it follows
+        # [tx, ty, tz, qx, qy, qz, qw] and maps the current lidar frame to the
+        # clip-local reference frame used by the labeling pipeline.
+        'raw_lidar_pose': payload.get('lidar_pose'),
         'gt_boxes': boxes_arr,
         'gt_names': np.asarray(gt_names),
         'gt_velocity': velocity_arr,
@@ -376,6 +590,31 @@ def resolve_clip_paths(data_root: Path, ref: ClipRef) -> Optional[Tuple[Path, Pa
     for label_dir, frames_dir in candidates:
         if label_dir.exists() and frames_dir.exists():
             return label_dir, frames_dir
+    return None
+
+
+def resolve_odom_path(data_root: Path, ref: ClipRef, frames_dir: Path) -> Optional[Path]:
+    """Find the optional clip-local SLAM lidar pose file.
+
+    The N7 collection pipeline places odometry next to ``frames`` under
+    ``slamResult/baidu_ins/odom_lidar_reference.txt``.  Historical exports may
+    differ slightly, so this function tries a few deterministic locations before
+    returning ``None``.  Missing odom is not fatal because label JSON may still
+    contain ``lidar_pose``.
+    """
+    base = data_root / ref.dataset
+    if not base.exists():
+        base = data_root
+
+    candidates = [
+        frames_dir.parent / 'slamResult' / 'baidu_ins' / 'odom_lidar_reference.txt',
+        base / ref.sequence / 'parsed_data' / ref.clip / 'slamResult' / 'baidu_ins' / 'odom_lidar_reference.txt',
+        base / 'parsed_data' / ref.sequence / ref.clip / 'slamResult' / 'baidu_ins' / 'odom_lidar_reference.txt',
+        base / 'parsed_data' / ref.clip / 'slamResult' / 'baidu_ins' / 'odom_lidar_reference.txt',
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
     return None
 
 
@@ -435,14 +674,36 @@ def load_refs_for_set(data_root: Path, dataset_name: str, set_name: str) -> List
 
 
 def adjacent_view(info: Dict) -> Dict:
-    return {
+    """Return the subset needed to render one adjacent frame.
+
+    Pose fields are included because temporal Fast-BEV needs to transform an
+    adjacent camera from its own lidar frame into the current key-frame lidar
+    frame.  GT boxes are intentionally not copied into adjacent views because the
+    detection target remains the key frame.
+    """
+    view = {
         'token': info['token'],
         'timestamp': info['timestamp'],
         'cams': info['cams'],
     }
+    for key in (
+        'lidar2global_rotation', 'lidar2global_translation',
+        'ego2global_rotation', 'ego2global_translation',
+        'raw_lidar2global_rotation_xyzw', 'raw_lidar2global_translation',
+        'pose_source', 'pose_timestamp', 'pose_time_diff_us', 'pose_file'):
+        if key in info:
+            view[key] = info[key]
+    return view
 
 
 def link_adjacent_infos(infos: List[Dict], max_adjacent: int) -> None:
+    """Attach dense previous/next frame references inside each clip.
+
+    These references let ``CustomMultiViewDataset`` assemble ``n_times > 1``
+    image sequences.  They copy camera entries and frame-level pose fields only;
+    GT boxes remain on the key frame.  The dataset uses these pose fields to do
+    adjacent-to-key-frame motion compensation at training time.
+    """
     by_clip: Dict[str, List[Dict]] = {}
     for info in infos:
         by_clip.setdefault(info['clip_id'], []).append(info)
@@ -466,8 +727,17 @@ def build_info_for_label(
     camera_ids: Sequence[str],
     classes: Sequence[str],
     keep_empty: bool,
+    pose_index: Optional[OdomPoseIndex],
+    max_pose_match_us: int,
     stats: ConversionStats,
 ) -> Optional[Dict]:
+    """Build one Fast-BEV info dict from one label and matched image frame.
+
+    The key design rule is self-consistency: GT boxes, camera ``sensor2lidar``
+    extrinsics, and frame pose are all expressed in the Fast-BEV lidar frame
+    (x front, y left, z up).  This makes later temporal compensation a pure
+    rigid transform composition problem.
+    """
     ann = parse_label(label_path, classes, stats)
     if len(ann['gt_names']) == 0 and not keep_empty:
         stats.labels_without_gt += 1
@@ -485,9 +755,20 @@ def build_info_for_label(
         cams[cam_id] = build_camera_info(sensor, image_map[cam_id], data_root)
 
     label_ts = ann['timestamp']
+    pose_info = select_frame_pose(
+        timestamp=label_ts,
+        raw_label_pose=ann.get('raw_lidar_pose'),
+        pose_index=pose_index,
+        max_pose_match_us=max_pose_match_us)
+    if pose_info is None:
+        stats.labels_without_pose += 1
+        pose_info = {}
+    else:
+        stats.labels_with_pose += 1
+
     token = f'{ref.dataset}_{ref.sequence}_{ref.clip}_{label_ts}'
     clip_uid = f'{ref.dataset}/{ref.sequence}/{ref.clip}'
-    return {
+    info = {
         'token': token,
         'timestamp': label_ts,
         'frame_timestamp': frame_ts,
@@ -506,6 +787,8 @@ def build_info_for_label(
         'num_radar_pts': np.zeros(len(ann['gt_names']), dtype=np.int32),
         'valid_flag': np.ones(len(ann['gt_names']), dtype=np.bool_),
     }
+    info.update(pose_info)
+    return info
 
 
 def process_clip(
@@ -515,6 +798,7 @@ def process_clip(
     camera_ids: Sequence[str],
     classes: Sequence[str],
     max_match_us: int,
+    max_pose_match_us: int,
     max_adjacent: int,
     keep_empty: bool,
 ) -> Tuple[List[Dict], ConversionStats]:
@@ -525,8 +809,14 @@ def process_clip(
         return [], stats
     label_dir, frames_dir = paths
     matcher = TimestampMatcher(frames_dir)
-    infos: List[Dict] = []
 
+    odom_path = resolve_odom_path(data_root, ref, frames_dir)
+    pose_index = OdomPoseIndex(odom_path) if odom_path is not None else None
+    if pose_index is not None and pose_index.items:
+        stats.clips_with_pose_file += 1
+        logger.debug('Loaded %d odom poses from %s', len(pose_index.items), odom_path)
+
+    infos: List[Dict] = []
     for label_path in sorted(label_dir.glob('*.json')):
         stats.labels_total += 1
         try:
@@ -550,6 +840,8 @@ def process_clip(
                 camera_ids=camera_ids,
                 classes=classes,
                 keep_empty=keep_empty,
+                pose_index=pose_index,
+                max_pose_match_us=max_pose_match_us,
                 stats=stats,
             )
         except Exception as exc:
@@ -571,6 +863,7 @@ def make_metadata(
     set_name: str,
     datasets: Sequence[str],
     max_match_us: int,
+    max_pose_match_us: int,
     max_adjacent: int,
 ) -> Dict:
     return {
@@ -582,9 +875,13 @@ def make_metadata(
         'camera_ids': list(camera_ids),
         'coordinate': 'mmdet3d_lidar:x_front_y_left_z_up; origin=N7_top_lidar',
         'source_coordinate': 'custom_lidar:x_left_y_rear_z_up; origin=N7_top_lidar',
+        'pose_coordinate': 'clip_reference_from_lidar in mmdet3d_lidar axes; clip reference is usually first odom row',
+        'pose_sources': ['odom_lidar_reference', 'label_lidar_pose'],
+        'temporal_compensation': 'CustomMultiViewDataset composes adjacent lidar2global with key lidar2global',
         'raw_to_fastbev': RAW_TO_FASTBEV.tolist(),
         'rear_axle_ground_ego_applied': False,
         'max_match_us': max_match_us,
+        'max_pose_match_us': max_pose_match_us,
         'max_adjacent': max_adjacent,
         'stats': stats.as_dict(),
         'lidar_main_mixed_to_ego': lidar_main_metadata(calib),
@@ -611,6 +908,7 @@ def convert_one_set(
     camera_ids: Sequence[str],
     classes: Sequence[str],
     max_match_us: int,
+    max_pose_match_us: int,
     max_adjacent: int,
     keep_empty: bool,
     separate: bool,
@@ -634,6 +932,7 @@ def convert_one_set(
                 camera_ids=camera_ids,
                 classes=classes,
                 max_match_us=max_match_us,
+                max_pose_match_us=max_pose_match_us,
                 max_adjacent=max_adjacent,
                 keep_empty=keep_empty,
             )
@@ -645,7 +944,9 @@ def convert_one_set(
         logger.info('dataset=%s set=%s infos=%d stats=%s', dataset_name, set_name, len(infos), stats.as_dict())
 
         if separate:
-            metadata = make_metadata(classes, camera_ids, calib, stats, set_name, [dataset_name], max_match_us, max_adjacent)
+            metadata = make_metadata(
+                classes, camera_ids, calib, stats, set_name, [dataset_name],
+                max_match_us, max_pose_match_us, max_adjacent)
             save_pkl(infos, metadata, out_dir / f'{extra_tag}_{dataset_name}_infos_{set_name}.pkl', dry_run)
 
     if separate:
@@ -658,16 +959,33 @@ def convert_one_set(
         if dataset_name in per_dataset_stats:
             merged_stats.merge(per_dataset_stats[dataset_name])
     merged_infos.sort(key=lambda x: x['timestamp'])
-    metadata = make_metadata(classes, camera_ids, calib, merged_stats, set_name, dataset_names, max_match_us, max_adjacent)
+    metadata = make_metadata(
+        classes, camera_ids, calib, merged_stats, set_name, dataset_names,
+        max_match_us, max_pose_match_us, max_adjacent)
     if not merged_infos:
         logger.warning('set=%s produced no infos; skipping output', set_name)
         return
     save_pkl(merged_infos, metadata, out_dir / f'{extra_tag}_infos_{set_name}.pkl', dry_run)
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Convert N7 3D_OD data to Fast-BEV CustomMultiViewDataset pkl files')
+        description='Convert N7 3D_OD data to Fast-BEV CustomMultiViewDataset pkl files',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=(
+            'Example:\n'
+            '  python new_tool/unified_processor_raw.py '
+            '--data-path /data/N7 '
+            '--datasets 2025_04_18_2k '
+            '--sets train val '
+            '--info-json data/info_json/2025_04_18_2k_byd_info.json '
+            '--output-dir /data/N7/fastbev_pkl '
+            '--extra-tag custom_fastbev\n\n'
+            'Then inspect the pkl with:\n'
+            '  python new_tool/draw_gt_pkl.py '
+            '--pkl /data/N7/fastbev_pkl/custom_fastbev_infos_train.pkl '
+            '--data-root /data/N7 '
+            '--output-dir /data/N7/fastbev_vis/train'
+        ))
     parser.add_argument('--data-type', default='od', choices=['od'], help='Only od is supported.')
     parser.add_argument('--data-path', required=True, help='N7 data root, usually ./data/nuscenes')
     parser.add_argument('--datasets', nargs='+', required=True, help='Dataset tags or manifest prefixes')
@@ -677,6 +995,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--extra-tag', default='custom_fastbev', help='Output prefix: {tag}_infos_{set}.pkl')
     parser.add_argument('--template-pkl', default=None, help='Deprecated and ignored; kept for old commands.')
     parser.add_argument('--max-match-us', type=int, default=50000, help='Max label/frame timestamp diff in microseconds')
+    parser.add_argument('--max-pose-match-us', type=int, default=50000, help='Max label/SLAM-pose timestamp diff in microseconds')
     parser.add_argument('--max-adj', '--max-adjacent', dest='max_adjacent', type=int, default=60)
     parser.add_argument('--interval', type=int, default=3, help='Kept in metadata for compatibility; adjacent frames are stored densely.')
     parser.add_argument('--camera-ids', nargs='+', default=CAMERA_ORDER, choices=CAMERA_ORDER)
@@ -712,6 +1031,7 @@ def main() -> None:
     logger.info('datasets=%s sets=%s', args.datasets, args.sets)
     logger.info('camera_ids=%s', args.camera_ids)
     logger.info('coordinate=mmdet3d_lidar:x_front_y_left_z_up origin=N7_top_lidar')
+    logger.info('pose matching max_pose_match_us=%s', args.max_pose_match_us)
 
     for set_name in args.sets:
         convert_one_set(
@@ -724,6 +1044,7 @@ def main() -> None:
             camera_ids=args.camera_ids,
             classes=args.classes,
             max_match_us=args.max_match_us,
+            max_pose_match_us=args.max_pose_match_us,
             max_adjacent=args.max_adjacent,
             keep_empty=args.keep_empty,
             separate=args.separate,

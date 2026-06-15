@@ -36,6 +36,7 @@ class CustomMultiViewDataset(Custom3DDataset):
                  prev_only=True,
                  train_adj_ids=None,
                  test_adj_ids=None,
+                 temporal_compensate=True,
                  max_interval=3,
                  min_interval=0,
                  shuffle=False,
@@ -49,6 +50,8 @@ class CustomMultiViewDataset(Custom3DDataset):
         self.prev_only = prev_only
         self.train_adj_ids = train_adj_ids
         self.test_adj_ids = test_adj_ids
+        self.temporal_compensate = temporal_compensate
+        self._warned_missing_temporal_pose = False
         self.max_interval = max_interval
         self.min_interval = min_interval
         self.shuffle = shuffle
@@ -99,12 +102,86 @@ class CustomMultiViewDataset(Custom3DDataset):
         return osp.join(self.data_root, path)
 
     @staticmethod
-    def _lidar2img_from_cam_info(cam_info):
-        intrinsic = np.asarray(cam_info['cam_intrinsic'], dtype=np.float32)
+    def _quat_wxyz_to_matrix(quat):
+        """Convert nuScenes-style ``[w, x, y, z]`` quaternion to a rotation matrix."""
+        quat = np.asarray(quat, dtype=np.float32).reshape(4)
+        norm = np.linalg.norm(quat)
+        if norm <= 0:
+            raise ValueError('zero-norm quaternion')
+        w, x, y, z = quat / norm
+        return np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ], dtype=np.float32)
+
+    @classmethod
+    def _info_lidar2global(cls, info):
+        """Return ``global_from_lidar`` pose from one converter info.
+
+        The converter writes clip-local poses as ``lidar2global_*`` in the same
+        Fast-BEV lidar axes as the boxes and camera extrinsics.  The coordinate
+        named "global" can be a clip reference frame; temporal compensation only
+        needs relative transforms, so absolute world meaning is not required.
+        """
+        rot = info.get('lidar2global_rotation', info.get('ego2global_rotation'))
+        tran = info.get('lidar2global_translation', info.get('ego2global_translation'))
+        if rot is None or tran is None:
+            return None
+        return cls._quat_wxyz_to_matrix(rot), np.asarray(tran, dtype=np.float32).reshape(3)
+
+    def _sensor2reference_lidar(self, cam_info, frame_info, ref_info):
+        """Express a camera-to-lidar transform in the key-frame lidar system.
+
+        For the key frame itself, the stored ``sensor2lidar`` transform is
+        already correct.  For an adjacent frame, Fast-BEV temporal fusion expects
+        that adjacent camera rays are projected into the key-frame BEV volume.
+        With ``global_from_lidar`` poses, the required rigid transform is:
+
+            key_from_adj = inverse(global_from_key) @ global_from_adj
+            key_lidar_from_adj_cam = key_from_adj @ adj_lidar_from_adj_cam
+
+        If pose is missing, the method falls back to the old direct transform so
+        legacy pkl files and ``n_times=1`` configs remain usable.
+        """
         sensor2lidar_r = np.asarray(
             cam_info['sensor2lidar_rotation'], dtype=np.float32)
         sensor2lidar_t = np.asarray(
-            cam_info['sensor2lidar_translation'], dtype=np.float32)
+            cam_info['sensor2lidar_translation'], dtype=np.float32).reshape(3)
+
+        if (not self.temporal_compensate or ref_info is None or
+                frame_info.get('token') == ref_info.get('token')):
+            return sensor2lidar_r, sensor2lidar_t, False
+
+        ref_pose = self._info_lidar2global(ref_info)
+        frame_pose = self._info_lidar2global(frame_info)
+        if ref_pose is None or frame_pose is None:
+            if not self._warned_missing_temporal_pose:
+                print('CustomMultiViewDataset: temporal pose missing; adjacent frames fall back to un-compensated sensor2lidar.')
+                self._warned_missing_temporal_pose = True
+            return sensor2lidar_r, sensor2lidar_t, False
+
+        ref_to_global_r, ref_to_global_t = ref_pose
+        frame_to_global_r, frame_to_global_t = frame_pose
+        key_from_adj_r = ref_to_global_r.T @ frame_to_global_r
+        key_from_adj_t = ref_to_global_r.T @ (frame_to_global_t - ref_to_global_t)
+
+        compensated_r = key_from_adj_r @ sensor2lidar_r
+        compensated_t = key_from_adj_r @ sensor2lidar_t + key_from_adj_t
+        return compensated_r.astype(np.float32), compensated_t.astype(np.float32), True
+
+    @staticmethod
+    def _lidar2img_from_cam_info(cam_info, sensor2lidar_r=None,
+                                 sensor2lidar_t=None,
+                                 temporal_compensated=False):
+        intrinsic = np.asarray(cam_info['cam_intrinsic'], dtype=np.float32)
+        if sensor2lidar_r is None:
+            sensor2lidar_r = np.asarray(
+                cam_info['sensor2lidar_rotation'], dtype=np.float32)
+        if sensor2lidar_t is None:
+            sensor2lidar_t = np.asarray(
+                cam_info['sensor2lidar_translation'], dtype=np.float32)
+        sensor2lidar_t = np.asarray(sensor2lidar_t, dtype=np.float32).reshape(3)
 
         lidar2cam_r = np.linalg.inv(sensor2lidar_r)
         lidar2cam_t = sensor2lidar_t @ lidar2cam_r.T
@@ -122,6 +199,7 @@ class CustomMultiViewDataset(Custom3DDataset):
             tran=sensor2lidar_t,
             post_rot=np.eye(3, dtype=np.float32),
             post_tran=np.zeros(3, dtype=np.float32),
+            temporal_compensated=temporal_compensated,
         )
         return lidar2img.astype(np.float32), lidar2img_aug
 
@@ -135,7 +213,7 @@ class CustomMultiViewDataset(Custom3DDataset):
                             len(info.get('prev', [])) - 1)
         return info['prev'][max(select_id, 0)]
 
-    def _collect_one_frame(self, info):
+    def _collect_one_frame(self, info, ref_info=None):
         image_paths, lidar2img_rts, lidar2img_augs = [], [], []
         cam_items = info['cams'].items()
         if self.camera_types is not None:
@@ -143,14 +221,20 @@ class CustomMultiViewDataset(Custom3DDataset):
 
         for _, cam_info in cam_items:
             image_paths.append(self._resolve_path(cam_info['data_path']))
-            lidar2img_rt, lidar2img_aug = self._lidar2img_from_cam_info(cam_info)
+            sensor2lidar_r, sensor2lidar_t, compensated = self._sensor2reference_lidar(
+                cam_info, frame_info=info, ref_info=ref_info)
+            lidar2img_rt, lidar2img_aug = self._lidar2img_from_cam_info(
+                cam_info,
+                sensor2lidar_r=sensor2lidar_r,
+                sensor2lidar_t=sensor2lidar_t,
+                temporal_compensated=compensated)
             lidar2img_rts.append(lidar2img_rt)
             lidar2img_augs.append(lidar2img_aug)
         return image_paths, lidar2img_rts, lidar2img_augs
 
     def get_data_info(self, index):
         info = self.data_infos[index]
-        image_paths, lidar2img_rts, lidar2img_augs = self._collect_one_frame(info)
+        image_paths, lidar2img_rts, lidar2img_augs = self._collect_one_frame(info, ref_info=info)
 
         if self.sequential:
             for time_id in range(1, self.n_times):
@@ -158,7 +242,7 @@ class CustomMultiViewDataset(Custom3DDataset):
                     adj_info = info
                 else:
                     adj_info = self._select_adjacent(info, time_id)
-                adj_paths, adj_rts, adj_augs = self._collect_one_frame(adj_info)
+                adj_paths, adj_rts, adj_augs = self._collect_one_frame(adj_info, ref_info=info)
                 image_paths.extend(adj_paths)
                 lidar2img_rts.extend(adj_rts)
                 lidar2img_augs.extend(adj_augs)
