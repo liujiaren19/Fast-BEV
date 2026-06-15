@@ -180,8 +180,21 @@ class FastBEV(BaseDetector):
         mlvl_volumes = []
         for lvl, mlvl_feat in enumerate(mlvl_feats):  
             stride_i = math.ceil(img.shape[-1] / mlvl_feat.shape[-1])  # P4 880 / 32 = 27.5
+            total_views = mlvl_feat.shape[0] // batch_size
+            assert mlvl_feat.shape[0] == batch_size * total_views, (
+                f'feature batch/view mismatch: feat_batch={mlvl_feat.shape[0]}, '
+                f'batch_size={batch_size}')
+            assert total_views % self.n_images == 0, (
+                f'total input views ({total_views}) must be divisible by '
+                f'n_images ({self.n_images})')
+            expected_total_views = None
+            if img_metas:
+                expected_total_views = len(img_metas[0]["lidar2img"]["extrinsic"])
+                assert expected_total_views == total_views, (
+                    f'img_meta extrinsics ({expected_total_views}) do not match '
+                    f'feature views ({total_views})')
             # [bs*seq*nv, c, h, w] -> [bs, seq*nv, c, h, w]
-            mlvl_feat = mlvl_feat.reshape([batch_size, -1] + list(mlvl_feat.shape[1:]))
+            mlvl_feat = mlvl_feat.reshape([batch_size, total_views] + list(mlvl_feat.shape[1:]))
             # [bs, seq*nv, c, h, w] -> list([bs, nv, c, h, w])
             mlvl_feat_split = torch.split(mlvl_feat, self.n_images, dim=1)
 
@@ -192,8 +205,14 @@ class FastBEV(BaseDetector):
                     feat_i = mlvl_feat_split[seq_id][batch_id]  # [nv, c, h, w]
                     img_meta = copy.deepcopy(seq_img_meta)
                     img_meta["lidar2img"]["extrinsic"] = img_meta["lidar2img"]["extrinsic"][seq_id*self.n_images:(seq_id+1)*self.n_images]
+                    assert len(img_meta["lidar2img"]["extrinsic"]) == self.n_images, (
+                        f'seq_id={seq_id} expected {self.n_images} extrinsics, '
+                        f'got {len(img_meta["lidar2img"]["extrinsic"])}')
                     if isinstance(img_meta["img_shape"], list):
                         img_meta["img_shape"] = img_meta["img_shape"][seq_id*self.n_images:(seq_id+1)*self.n_images]
+                        assert len(img_meta["img_shape"]) == self.n_images, (
+                            f'seq_id={seq_id} expected {self.n_images} image shapes, '
+                            f'got {len(img_meta["img_shape"])}')
                         img_meta["img_shape"] = img_meta["img_shape"][0]
                     height = math.ceil(img_meta["img_shape"][0] / stride_i)
                     width = math.ceil(img_meta["img_shape"][1] / stride_i)

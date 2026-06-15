@@ -79,6 +79,71 @@ class KittiSetOrigin:
         return results
 
 
+
+@PIPELINES.register_module()
+class FrontCameraVisibleObjectFilter:
+    """Keep 3D GT boxes whose centers or corners project into selected views."""
+
+    def __init__(self, n_images=1, min_depth=0.1, keep_if_no_boxes=True):
+        self.n_images = n_images
+        self.min_depth = min_depth
+        self.keep_if_no_boxes = keep_if_no_boxes
+
+    def _project_visible(self, points, projection, image_shape):
+        pts = np.concatenate(
+            [points, np.ones((points.shape[0], 1), dtype=np.float32)], axis=1)
+        pts_2d_3 = pts @ projection.T
+        depth = pts_2d_3[:, 2]
+        eps = np.finfo(np.float32).eps
+        xs = pts_2d_3[:, 0] / np.maximum(depth, eps)
+        ys = pts_2d_3[:, 1] / np.maximum(depth, eps)
+        height, width = image_shape[:2]
+        return ((depth > self.min_depth) & (xs >= 0) & (xs < width) &
+                (ys >= 0) & (ys < height))
+
+    def __call__(self, results):
+        if 'gt_bboxes_3d' not in results or 'gt_labels_3d' not in results:
+            return results
+
+        gt_bboxes_3d = results['gt_bboxes_3d']
+        num_boxes = len(gt_bboxes_3d)
+        if num_boxes == 0:
+            return results
+
+        projections = results['lidar2img']['extrinsic'][:self.n_images]
+        image_shapes = results.get('img_shape', [])[:self.n_images]
+        if len(projections) == 0 or len(image_shapes) == 0:
+            if self.keep_if_no_boxes:
+                return results
+            keep = np.zeros(num_boxes, dtype=np.bool_)
+        else:
+            centers = gt_bboxes_3d.tensor[:, :3].detach().cpu().numpy()
+            corners = gt_bboxes_3d.corners.detach().cpu().numpy()
+            keep = np.zeros(num_boxes, dtype=np.bool_)
+            for projection, image_shape in zip(projections, image_shapes):
+                projection = np.asarray(projection[:3, :4], dtype=np.float32)
+                center_visible = self._project_visible(centers, projection, image_shape)
+                corner_points = corners.reshape(-1, 3)
+                corner_visible = self._project_visible(
+                    corner_points, projection, image_shape).reshape(num_boxes, -1).any(axis=1)
+                keep |= center_visible | corner_visible
+
+        mask = gt_bboxes_3d.tensor.new_tensor(keep, dtype=gt_bboxes_3d.tensor.dtype).bool()
+        results['gt_bboxes_3d'] = gt_bboxes_3d[mask]
+        results['gt_labels_3d'] = results['gt_labels_3d'][keep]
+        if 'gt_bboxes' in results:
+            results['gt_bboxes'] = [b for b, k in zip(results['gt_bboxes'], keep) if k]
+        if 'gt_labels' in results:
+            results['gt_labels'] = [l for l, k in zip(results['gt_labels'], keep) if k]
+        if 'gt_bboxes_ignore' in results:
+            results['gt_bboxes_ignore'] = [b for b, k in zip(results['gt_bboxes_ignore'], keep) if k]
+        return results
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}(n_images={self.n_images}, '
+                f'min_depth={self.min_depth})')
+
+
 @PIPELINES.register_module()
 class KittiRandomFlip:
     def __call__(self, results):

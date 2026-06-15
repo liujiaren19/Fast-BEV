@@ -1,18 +1,26 @@
 _base_ = '../exp/paper/fastbev_m0_r18_s256x704_v200x200x4_c192_d2_f4.py'
 
+front_roi = [0, -35, -5, 80, 35, 3]
+front_n_voxels = [160, 140, 4]
+front_voxel_size = [0.5, 0.5, 1.5]
+point_cloud_range = front_roi
+
 # Round 1: nuScenes mini, true front monocular, debug training/inference over full nuScenes mini.
 model = dict(
     n_images=1,
+    n_voxels=[front_n_voxels],
+    voxel_size=[front_voxel_size],
     backbone=dict(norm_cfg=dict(type='BN', requires_grad=True), init_cfg=None),
     neck=dict(norm_cfg=dict(type='BN', requires_grad=True)),
     neck_3d=dict(
         in_channels=64 * 4,
         fuse=dict(in_channels=64 * 4 * 4, out_channels=64 * 4),
-        norm_cfg=dict(type='BN', requires_grad=True)))
+        norm_cfg=dict(type='BN', requires_grad=True)),
+    bbox_head=dict(
+        anchor_generator=dict(ranges=[[0, -35, -1.8, 80, 35, -1.8]])))
 
 data_root = './data/nuscenes/'
 
-point_cloud_range = [-50, -50, -5, 50, 50, 3]
 class_names = [
     'car', 'truck', 'trailer', 'bus', 'construction_vehicle', 'bicycle',
     'motorcycle', 'pedestrian', 'traffic_cone', 'barrier']
@@ -54,6 +62,7 @@ train_pipeline = [
          update_img2lidar=True),
     dict(type='RandomAugImageMultiViewImage', data_config=data_config),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='FrontCameraVisibleObjectFilter', n_images=1, min_depth=0.1),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names),

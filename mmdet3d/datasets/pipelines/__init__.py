@@ -16,7 +16,8 @@ from .transforms_3d import (BackgroundPointsFilter, GlobalAlignment,
                             RandomJitterPoints, VoxelBasedPointSampler)
 
 from .multi_view import (MultiViewPipeline, RandomShiftOrigin, KittiSetOrigin,
-                         KittiRandomFlip, SunRgbdSetOrigin, SunRgbdTotalLoadImageFromFile,
+                         FrontCameraVisibleObjectFilter, KittiRandomFlip,
+                         SunRgbdSetOrigin, SunRgbdTotalLoadImageFromFile,
                          SunRgbdRandomFlip)
 
 __all__ = [
@@ -29,5 +30,6 @@ __all__ = [
     'LoadPointsFromMultiSweeps', 'BackgroundPointsFilter',
     'VoxelBasedPointSampler', 'GlobalAlignment', 'IndoorPatchPointSample',
     'LoadImageFromFileMono3D', 'ObjectNameFilter', 'RandomDropPointsColor',
-    'RandomJitterPoints', 'LoadMultiViewImageFromFilesV2'
+    'RandomJitterPoints', 'LoadMultiViewImageFromFilesV2',
+    'FrontCameraVisibleObjectFilter'
 ]
