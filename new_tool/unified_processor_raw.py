@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Convert N7 3D_OD data to Fast-BEV CustomMultiViewDataset pkl files.
+"""将 N7 自采 3D_OD 数据转换为 Fast-BEV 可训练的 CustomMultiViewDataset pkl。
 
-This converter is intentionally OD-only.  It removes the old AVM/parking-slot
-path and emits the light-weight pkl schema consumed by
-``mmdet3d.datasets.CustomMultiViewDataset``.
+本脚本只处理 3D 障碍物检测 OD 数据。旧版脚本里为 AVM/车位数据保留的
+逻辑已经移除，输出目标是 ``mmdet3d.datasets.CustomMultiViewDataset`` 可以
+直接读取的轻量 pkl。
 
-Expected raw data layout
-------------------------
-The script accepts several historical N7 layouts.  The two most common layouts
-are shown below; the converter discovers matching ``3D_OD/lidar`` and ``frames``
-directories automatically.
+原始数据目录约定
+----------------
+脚本兼容几种历史 N7 导出目录。最常见的两种结构如下；converter 会自动寻找
+匹配的 ``3D_OD/lidar`` 标签目录和 ``frames`` 图像目录。
 
     <data-root>/<dataset>/<sequence>/output/<clip>/3D_OD/lidar/*.json
     <data-root>/<dataset>/<sequence>/parsed_data/<clip>/frames/<timestamp>/images/<cam_id>/*.jpg
@@ -17,48 +16,54 @@ directories automatically.
     <data-root>/<dataset>/output/<sequence>/<clip>/3D_OD/lidar/*.json
     <data-root>/<dataset>/parsed_data/<sequence>/<clip>/frames/<timestamp>/images/<cam_id>/*.jpg
 
-For deterministic train/val/test splits, create a manifest named
-``<dataset>_<set>_clips.txt`` under one of these locations:
+如果需要固定 train/val/test 划分，可以放置 manifest 文件，文件名为
+``<dataset>_<set>_clips.txt``，支持以下位置：
 
     <data-root>/<dataset>_<set>_clips.txt
     <data-root>/manifests/<dataset>_<set>_clips.txt
     <data-root>/<dataset>/<dataset>_<set>_clips.txt
 
-Each non-empty manifest line must be ``dataset/sequence/clip``.  If no manifest
-is found, the converter recursively discovers clips under ``--data-path``.
+manifest 中每个非空、非注释行都必须是 ``dataset/sequence/clip``。如果没有
+找到 manifest，脚本会在 ``--data-path`` 下递归发现 clip。
 
-Coordinate convention
----------------------
-Source 3D_OD labels are treated as:
+坐标系约定
+----------
+N7 3D_OD 标签按如下原始 lidar 坐标系理解：
 
-    custom_lidar: x left, y rear/back, z up, origin at N7 top lidar.
+    custom_lidar: x 向左，y 向后，z 向上，原点在 N7 顶部主 lidar。
 
-Output pkl boxes and camera extrinsics are converted directly to:
+输出 pkl 中的 3D box、速度、相机外参和帧位姿会被直接转换到 Fast-BEV/MMDet3D
+常用 lidar 坐标系：
 
-    mmdet3d_lidar: x front, y left, z up, origin at N7 top lidar.
+    mmdet3d_lidar: x 向前，y 向左，z 向上，原点仍在 N7 顶部主 lidar。
 
-The direct axis conversion is:
+直接轴变换关系是：
 
     x_fastbev = -y_raw
     y_fastbev =  x_raw
     z_fastbev =  z_raw
     yaw_fastbev = normalize(yaw_raw + pi / 2)
 
-The rear-axle-ground ego migration is intentionally not applied here.  That is a
-separate all-geometry migration because it must update labels, camera extrinsics,
-BEV ranges, anchors, pseudo labels, and visualization together.  The output
-metadata records ``rear_axle_ground_ego_applied=False`` to avoid ambiguity.
+这里还没有迁移到“后轴中心在地面投影点”的 ego 坐标系。后轴 ego 迁移需要
+统一更新 label、相机外参、BEV range、anchor、伪标签转换和可视化，因此应作为
+单独的全几何改动处理。当前输出 metadata 中会明确写入
+``rear_axle_ground_ego_applied=False``。
 
-Output pkl schema
------------------
-The pkl contains ``{"infos": infos, "metadata": metadata}``.  Each info stores
-camera image paths, camera intrinsics/extrinsics, 3D boxes, class names,
-velocities, frame-level lidar poses, and dense ``prev``/``next`` adjacent-frame
-references.  The converter writes clip-local ``lidar2global`` poses when they
-are available from SLAM odometry or label JSON.  ``CustomMultiViewDataset`` then
-uses those poses to motion-compensate adjacent camera frames into the key-frame
-lidar coordinate system, matching the temporal semantics of the original
-Fast-BEV nuScenes pipeline.
+输出 pkl 内容
+-------------
+pkl 结构是 ``{"infos": infos, "metadata": metadata}``。每个 info 包含：
+
+    - 六目图像路径
+    - 相机内参和 camera-to-lidar 外参
+    - 3D boxes、类别、速度、track id
+    - 当前帧 lidar pose
+    - ``prev`` / ``next`` 相邻帧引用
+
+当 ``slamResult/baidu_ins/odom_lidar_reference.txt`` 或 label JSON 中存在
+``lidar_pose`` 时，converter 会写入 clip-local 的 ``lidar2global`` 位姿。这里的
+“global”不是地图全局坐标，而是该 clip 的参考坐标系，通常以第一帧为起点。
+``CustomMultiViewDataset`` 会使用这些位姿把 adjacent camera frame 运动补偿到
+key frame lidar 坐标系，从而尽量复刻原 Fast-BEV nuScenes 时序输入语义。
 """
 
 from __future__ import annotations
