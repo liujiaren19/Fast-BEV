@@ -64,6 +64,9 @@ pkl 结构是 ``{"infos": infos, "metadata": metadata}``。每个 info 包含：
 “global”不是地图全局坐标，而是该 clip 的参考坐标系，通常以第一帧为起点。
 ``CustomMultiViewDataset`` 会使用这些位姿把 adjacent camera frame 运动补偿到
 key frame lidar 坐标系，从而尽量复刻原 Fast-BEV nuScenes 时序输入语义。
+
+默认情况下，label JSON 和 ``frames/<timestamp>`` 目录使用 lidar 时间戳精确
+匹配；只有显式设置 ``--frame-match-mode nearest`` 时才会启用最近邻匹配。
 """
 
 from __future__ import annotations
@@ -802,6 +805,7 @@ def process_clip(
     calib: Dict,
     camera_ids: Sequence[str],
     classes: Sequence[str],
+    frame_match_mode: str,
     max_match_us: int,
     max_pose_match_us: int,
     max_adjacent: int,
@@ -813,7 +817,11 @@ def process_clip(
         stats.clips_missing_paths += 1
         return [], stats
     label_dir, frames_dir = paths
-    matcher = TimestampMatcher(frames_dir)
+    # N7 parsed_data/frames uses lidar timestamps as directory names.  Exact
+    # lookup is therefore the default and avoids accidentally pairing a label
+    # with a neighboring lidar frame.  Nearest-neighbor matching is retained only
+    # for older exports that did not preserve exact frame directory names.
+    matcher = TimestampMatcher(frames_dir) if frame_match_mode == 'nearest' else None
 
     odom_path = resolve_odom_path(data_root, ref, frames_dir)
     pose_index = OdomPoseIndex(odom_path) if odom_path is not None else None
@@ -829,11 +837,18 @@ def process_clip(
         except ValueError:
             payload = annotation_payload(load_json(label_path))
             label_ts = int(payload.get('frame_timestamp', 0))
-        matched = matcher.closest(label_ts, max_match_us)
-        if matched is None:
-            stats.labels_without_frame += 1
-            continue
-        frame_ts, frame_dir = matched
+        if frame_match_mode == 'exact':
+            frame_dir = frames_dir / str(label_ts)
+            if not frame_dir.exists():
+                stats.labels_without_frame += 1
+                continue
+            frame_ts = label_ts
+        else:
+            matched = matcher.closest(label_ts, max_match_us)
+            if matched is None:
+                stats.labels_without_frame += 1
+                continue
+            frame_ts, frame_dir = matched
         try:
             info = build_info_for_label(
                 label_path=label_path,
@@ -867,6 +882,7 @@ def make_metadata(
     stats: ConversionStats,
     set_name: str,
     datasets: Sequence[str],
+    frame_match_mode: str,
     max_match_us: int,
     max_pose_match_us: int,
     max_adjacent: int,
@@ -885,6 +901,7 @@ def make_metadata(
         'temporal_compensation': 'CustomMultiViewDataset composes adjacent lidar2global with key lidar2global',
         'raw_to_fastbev': RAW_TO_FASTBEV.tolist(),
         'rear_axle_ground_ego_applied': False,
+        'frame_match_mode': frame_match_mode,
         'max_match_us': max_match_us,
         'max_pose_match_us': max_pose_match_us,
         'max_adjacent': max_adjacent,
@@ -912,6 +929,7 @@ def convert_one_set(
     extra_tag: str,
     camera_ids: Sequence[str],
     classes: Sequence[str],
+    frame_match_mode: str,
     max_match_us: int,
     max_pose_match_us: int,
     max_adjacent: int,
@@ -936,6 +954,7 @@ def convert_one_set(
                 calib=calib,
                 camera_ids=camera_ids,
                 classes=classes,
+                frame_match_mode=frame_match_mode,
                 max_match_us=max_match_us,
                 max_pose_match_us=max_pose_match_us,
                 max_adjacent=max_adjacent,
@@ -951,7 +970,7 @@ def convert_one_set(
         if separate:
             metadata = make_metadata(
                 classes, camera_ids, calib, stats, set_name, [dataset_name],
-                max_match_us, max_pose_match_us, max_adjacent)
+                frame_match_mode, max_match_us, max_pose_match_us, max_adjacent)
             save_pkl(infos, metadata, out_dir / f'{extra_tag}_{dataset_name}_infos_{set_name}.pkl', dry_run)
 
     if separate:
@@ -966,7 +985,7 @@ def convert_one_set(
     merged_infos.sort(key=lambda x: x['timestamp'])
     metadata = make_metadata(
         classes, camera_ids, calib, merged_stats, set_name, dataset_names,
-        max_match_us, max_pose_match_us, max_adjacent)
+        frame_match_mode, max_match_us, max_pose_match_us, max_adjacent)
     if not merged_infos:
         logger.warning('set=%s produced no infos; skipping output', set_name)
         return
@@ -999,7 +1018,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--output-dir', default='./data/nuscenes')
     parser.add_argument('--extra-tag', default='custom_fastbev', help='Output prefix: {tag}_infos_{set}.pkl')
     parser.add_argument('--template-pkl', default=None, help='Deprecated and ignored; kept for old commands.')
-    parser.add_argument('--max-match-us', type=int, default=50000, help='Max label/frame timestamp diff in microseconds')
+    parser.add_argument('--frame-match-mode', choices=['exact', 'nearest'], default='exact', help='Match label JSON to parsed_data frames by exact lidar timestamp or nearest timestamp')
+    parser.add_argument('--max-match-us', type=int, default=50000, help='Max label/frame timestamp diff in microseconds, used only when --frame-match-mode nearest')
     parser.add_argument('--max-pose-match-us', type=int, default=50000, help='Max label/SLAM-pose timestamp diff in microseconds')
     parser.add_argument('--max-adj', '--max-adjacent', dest='max_adjacent', type=int, default=60)
     parser.add_argument('--interval', type=int, default=3, help='Kept in metadata for compatibility; adjacent frames are stored densely.')
@@ -1036,6 +1056,7 @@ def main() -> None:
     logger.info('datasets=%s sets=%s', args.datasets, args.sets)
     logger.info('camera_ids=%s', args.camera_ids)
     logger.info('coordinate=mmdet3d_lidar:x_front_y_left_z_up origin=N7_top_lidar')
+    logger.info('frame matching mode=%s max_match_us=%s', args.frame_match_mode, args.max_match_us)
     logger.info('pose matching max_pose_match_us=%s', args.max_pose_match_us)
 
     for set_name in args.sets:
@@ -1048,6 +1069,7 @@ def main() -> None:
             extra_tag=args.extra_tag,
             camera_ids=args.camera_ids,
             classes=args.classes,
+            frame_match_mode=args.frame_match_mode,
             max_match_us=args.max_match_us,
             max_pose_match_us=args.max_pose_match_us,
             max_adjacent=args.max_adjacent,
