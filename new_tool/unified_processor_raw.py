@@ -137,17 +137,17 @@ CLASS_MAPPING = {
     'barrier': 'barrier',
 }
 
-# Source N7/custom label frame: x left, y rear/back, z up.
-# Fast-BEV/MMDet3D LiDAR frame: x front, y left, z up.
+# 原始 N7/自采标签坐标系：x 向左，y 向后，z 向上。
+# Fast-BEV/MMDet3D LiDAR 坐标系：x 向前，y 向左，z 向上。
 #
-# Matrix form of the direct axis remap:
+# 直接轴向映射的矩阵形式：
 #   [x_fastbev]   [ 0 -1  0] [x_raw]
 #   [y_fastbev] = [ 1  0  0] [y_raw]
 #   [z_fastbev]   [ 0  0  1] [z_raw]
 #
-# The same matrix is applied to box centers, velocities, and camera extrinsic
-# translations.  Camera rotations are left-multiplied by this matrix so that the
-# camera-to-lidar transform remains expressed in the output Fast-BEV lidar frame.
+# 同一个矩阵会用于 box 中心点、速度和相机外参平移。相机旋转矩阵会左乘
+# 该矩阵，使 camera-to-lidar 变换始终表达在输出 pkl 使用的 Fast-BEV
+# lidar 坐标系下。
 RAW_TO_FASTBEV = np.array([
     [0.0, -1.0, 0.0],
     [1.0, 0.0, 0.0],
@@ -251,17 +251,17 @@ def rotation_to_wxyz(rot: np.ndarray) -> List[float]:
 
 
 def pose_vector_to_fastbev(pose: Sequence[float]) -> Dict:
-    """Convert a raw N7 lidar pose into the Fast-BEV lidar coordinate frame.
+    """将原始 N7 lidar pose 转换到 Fast-BEV lidar 坐标系。
 
-    Raw pose files and label JSON store seven values as
-    ``[tx, ty, tz, qx, qy, qz, qw]``.  The pose maps a point from the current
-    raw lidar frame to the clip-local reference/global frame:
+    odom 文件和 label JSON 中都使用七个数保存 pose：
+    ``[tx, ty, tz, qx, qy, qz, qw]``。该 pose 表示当前原始 lidar
+    坐标系到 clip 局部参考坐标系的变换：
 
         p_ref_raw = R_raw @ p_lidar_raw + t_raw
 
-    Training boxes and camera extrinsics are converted to Fast-BEV lidar axes
-    with ``RAW_TO_FASTBEV``.  Pose must be converted the same way, otherwise
-    adjacent-frame motion compensation would mix two coordinate systems.
+    训练用 box 和相机外参已经通过 ``RAW_TO_FASTBEV`` 转到 Fast-BEV
+    lidar 轴向，pose 也必须做同样转换，否则相邻帧运动补偿会混用两个
+    不一致的坐标系。
     """
     arr = np.asarray(pose, dtype=np.float64).reshape(-1)
     if arr.size != 7:
@@ -276,23 +276,22 @@ def pose_vector_to_fastbev(pose: Sequence[float]) -> Dict:
         'raw_lidar2global_rotation_xyzw': arr[3:7].astype(np.float32).tolist(),
         'lidar2global_translation': tran_fastbev.astype(np.float32).tolist(),
         'lidar2global_rotation': rotation_to_wxyz(rot_fastbev),
-        # Ego is currently defined as the N7 top-lidar frame.  The later
-        # rear-axle-ground migration should update both lidar and ego fields
-        # together; keeping aliases now makes the dataset code close to the
-        # original nuScenes temporal implementation.
+        # 当前 ego 暂时定义为 N7 顶部主 lidar 坐标系。后续如果迁移到后轴中心
+        # 地面投影点，需要同步更新 lidar 和 ego 两组字段；现在保持二者别名关系，
+        # 可以让 dataset 侧逻辑更接近原始 nuScenes 时序实现。
         'ego2global_translation': tran_fastbev.astype(np.float32).tolist(),
         'ego2global_rotation': rotation_to_wxyz(rot_fastbev),
     }
 
 
 class OdomPoseIndex:
-    """Timestamp matcher for clip-local SLAM lidar poses.
+    """clip 内 SLAM lidar pose 的时间戳索引。
 
-    ``odom_lidar_reference.txt`` is one clip-local trajectory.  The first row is
-    usually identity, so the coordinate named ``global`` in the output pkl should
-    be read as "clip reference frame", not earth/global map coordinates.  That is
-    sufficient for Fast-BEV temporal compensation because only relative transforms
-    between adjacent and key frames are needed.
+    ``odom_lidar_reference.txt`` 是单个 clip 内的局部轨迹，时间戳已经和
+    lidar 帧做过同步。文件首行通常接近单位位姿，因此输出 pkl 里的
+    ``global`` 应理解为“clip 局部参考坐标系”，不是地理全局地图坐标。
+    Fast-BEV 时序补偿只需要相邻帧和 key frame 之间的相对变换，这个
+    局部参考坐标系已经足够。
     """
 
     def __init__(self, path: Optional[Path]):
@@ -349,7 +348,7 @@ class OdomPoseIndex:
 
 
 def label_pose_to_fastbev(raw_pose: Optional[Sequence[float]], timestamp: int) -> Optional[Dict]:
-    """Convert ``3d_od.lidar_pose`` from one label JSON into pkl pose fields."""
+    """将单个 label JSON 中的 ``3d_od.lidar_pose`` 转成 pkl pose 字段。"""
     if raw_pose is None:
         return None
     try:
@@ -372,11 +371,12 @@ def select_frame_pose(
     pose_index: Optional[OdomPoseIndex],
     max_pose_match_us: int,
 ) -> Optional[Dict]:
-    """Choose the best frame pose for temporal compensation.
+    """为时序补偿选择当前帧 pose。
 
-    SLAM odometry is preferred because it is dense and explicitly clip-local.
-    The label's own ``lidar_pose`` is a useful fallback and also allows a pkl to
-    remain temporal-ready when only label JSON pose is available.
+    优先使用 SLAM odom，因为它是 clip 局部轨迹，且时间戳已经和 lidar
+    帧同步；当 odom 文件缺失、为空或该帧没有落在阈值内的 pose 时，回退到
+    label JSON 自带的 ``lidar_pose``，保证只有标签 pose 时也能生成可用于
+    时序对比的 pkl。
     """
     if pose_index is not None:
         pose_info = pose_index.closest(timestamp, max_pose_match_us)
@@ -407,7 +407,7 @@ def find_sensor(calib: Dict, sensor_name: str) -> Dict:
 
 
 def lidar_main_metadata(calib: Dict) -> Dict:
-    """Preserve the N7 lidar_main mixed to_ego convention for traceability."""
+    """保留 N7 lidar_main 混合式 to_ego 约定，方便后续追溯标定来源。"""
     try:
         sensor = find_sensor(calib, 'lidar_main')
         to_ego = np.asarray(sensor.get('extrinsic', {}).get('to_ego', []), dtype=np.float64)
@@ -427,15 +427,15 @@ def lidar_main_metadata(calib: Dict) -> Dict:
 
 
 def build_camera_info(sensor: Dict, image_path: Path, data_root: Path) -> Dict:
-    """Build one camera entry for the output pkl.
+    """为输出 pkl 构建单个相机条目。
 
-    Calibration json stores each camera's ``to_lidar_main`` transform in the raw
-    N7/custom lidar frame.  The training pkl must be self-consistent, so this
-    function converts both rotation and translation into the Fast-BEV lidar frame
-    before writing ``sensor2lidar_rotation`` and ``sensor2lidar_translation``.
+    标定 json 中每个相机的 ``to_lidar_main`` 变换表达在原始 N7/自采 lidar
+    坐标系下。训练 pkl 必须自洽，因此写入 ``sensor2lidar_rotation`` 和
+    ``sensor2lidar_translation`` 前，会把旋转和平移都转换到 Fast-BEV
+    lidar 坐标系。
 
-    ``data_path`` is stored relative to ``data_root`` when possible.  Use the
-    same root as visualizer ``--data-root`` to resolve images later.
+    ``data_path`` 会尽量保存为相对 ``data_root`` 的路径。后续可视化时，
+    ``--data-root`` 使用同一个根目录即可解析图片路径。
     """
     raw_ext = sensor.get('extrinsic', {}).get('to_lidar_main')
     if raw_ext is None:
@@ -494,12 +494,12 @@ def annotation_payload(label: Dict) -> Dict:
 
 
 def annotation_to_box(anno: Dict) -> Tuple[List[float], List[float]]:
-    """Convert one raw 3D_OD annotation to Fast-BEV lidar box format.
+    """将单个原始 3D_OD 标注转换为 Fast-BEV lidar box 格式。
 
-    Output box format is ``[x, y, z, l, w, h, yaw]`` in the target lidar frame.
-    Velocity is returned separately as ``[vx, vy]`` and later concatenated by the
-    dataset.  The yaw shift of ``+pi/2`` is the angular form of the axis remap:
-    raw forward is ``-Y`` while Fast-BEV forward is ``+X``.
+    输出 box 格式为目标 lidar 坐标系下的 ``[x, y, z, l, w, h, yaw]``。
+    速度单独返回为 ``[vx, vy]``，后续由 dataset 拼接。yaw 增加 ``+pi/2``
+    是轴向映射在角度上的对应关系：原始前向是 ``-Y``，Fast-BEV 前向是
+    ``+X``。
     """
     loc_raw = np.array([
         anno.get('location', {}).get('x', 0.0),
@@ -562,9 +562,9 @@ def parse_label(label_path: Path, classes: Sequence[str], stats: ConversionStats
 
     return {
         'timestamp': timestamp,
-        # ``lidar_pose`` is optional in older labels.  When present it follows
-        # [tx, ty, tz, qx, qy, qz, qw] and maps the current lidar frame to the
-        # clip-local reference frame used by the labeling pipeline.
+        # 旧版标签中 ``lidar_pose`` 可能不存在。存在时它使用
+        # [tx, ty, tz, qx, qy, qz, qw]，表示当前 lidar 坐标系到标注流程使用的
+        # clip 局部参考坐标系的变换。
         'raw_lidar_pose': payload.get('lidar_pose'),
         'gt_boxes': boxes_arr,
         'gt_names': np.asarray(gt_names),
@@ -602,13 +602,13 @@ def resolve_clip_paths(data_root: Path, ref: ClipRef) -> Optional[Tuple[Path, Pa
 
 
 def resolve_odom_path(data_root: Path, ref: ClipRef, frames_dir: Path) -> Optional[Path]:
-    """Find the optional clip-local SLAM lidar pose file.
+    """查找可选的 clip 局部 SLAM lidar pose 文件。
 
-    The N7 collection pipeline places odometry next to ``frames`` under
-    ``slamResult/baidu_ins/odom_lidar_reference.txt``.  Historical exports may
-    differ slightly, so this function tries a few deterministic locations before
-    returning ``None``.  Missing odom is not fatal because label JSON may still
-    contain ``lidar_pose``.
+    N7 采集流程通常会把 odom 放在 ``frames`` 同级目录下的
+    ``slamResult/baidu_ins/odom_lidar_reference.txt``，其中时间戳已经和
+    lidar 帧同步。历史导出目录可能略有差异，所以这里按固定候选路径依次
+    查找；找不到 odom 不视为错误，因为 label JSON 中可能仍包含
+    ``lidar_pose``。
     """
     base = data_root / ref.dataset
     if not base.exists():
@@ -659,11 +659,11 @@ def discover_refs(data_root: Path, dataset_name: str) -> List[ClipRef]:
         if not any(label_dir.glob('*.json')):
             continue
         parents = label_dir.parents
-        # Layout: dataset/sequence/output/clip/3D_OD/lidar
+        # 目录形式：dataset/sequence/output/clip/3D_OD/lidar
         if len(parents) >= 4 and parents[2].name == 'output':
             sequence = '' if parents[3] == base else parents[3].name
             refs.add(ClipRef(dataset=dataset_name, sequence=sequence, clip=parents[1].name))
-        # Layout: dataset/output/sequence/clip/3D_OD/lidar
+        # 目录形式：dataset/output/sequence/clip/3D_OD/lidar
         if len(parents) >= 5 and parents[3].name == 'output':
             refs.add(ClipRef(dataset=dataset_name, sequence=parents[2].name, clip=parents[1].name))
     return sorted(refs, key=lambda x: (x.dataset, x.sequence, x.clip))
@@ -682,12 +682,11 @@ def load_refs_for_set(data_root: Path, dataset_name: str, set_name: str) -> List
 
 
 def adjacent_view(info: Dict) -> Dict:
-    """Return the subset needed to render one adjacent frame.
+    """返回构建单个相邻帧视图所需的字段子集。
 
-    Pose fields are included because temporal Fast-BEV needs to transform an
-    adjacent camera from its own lidar frame into the current key-frame lidar
-    frame.  GT boxes are intentionally not copied into adjacent views because the
-    detection target remains the key frame.
+    这里会带上 pose 字段，因为时序 Fast-BEV 需要把相邻帧相机从它自己的
+    lidar 坐标系变换到当前 key frame 的 lidar 坐标系。GT boxes 不复制到
+    相邻帧视图中，因为检测监督目标始终只属于 key frame。
     """
     view = {
         'token': info['token'],
@@ -705,12 +704,12 @@ def adjacent_view(info: Dict) -> Dict:
 
 
 def link_adjacent_infos(infos: List[Dict], max_adjacent: int) -> None:
-    """Attach dense previous/next frame references inside each clip.
+    """在每个 clip 内挂载稠密的 previous/next 相邻帧引用。
 
-    These references let ``CustomMultiViewDataset`` assemble ``n_times > 1``
-    image sequences.  They copy camera entries and frame-level pose fields only;
-    GT boxes remain on the key frame.  The dataset uses these pose fields to do
-    adjacent-to-key-frame motion compensation at training time.
+    这些引用用于让 ``CustomMultiViewDataset`` 组装 ``n_times > 1`` 的图像
+    序列。相邻帧只复制相机条目和帧级 pose 字段，GT boxes 仍然保留在
+    key frame 上。训练时 dataset 会使用这些 pose 字段完成相邻帧到 key
+    frame 的运动补偿。
     """
     by_clip: Dict[str, List[Dict]] = {}
     for info in infos:
@@ -739,12 +738,11 @@ def build_info_for_label(
     max_pose_match_us: int,
     stats: ConversionStats,
 ) -> Optional[Dict]:
-    """Build one Fast-BEV info dict from one label and matched image frame.
+    """根据单个 label 和匹配到的图像帧构建一个 Fast-BEV info。
 
-    The key design rule is self-consistency: GT boxes, camera ``sensor2lidar``
-    extrinsics, and frame pose are all expressed in the Fast-BEV lidar frame
-    (x front, y left, z up).  This makes later temporal compensation a pure
-    rigid transform composition problem.
+    关键原则是坐标自洽：GT boxes、相机 ``sensor2lidar`` 外参和帧级 pose
+    全部表达在 Fast-BEV lidar 坐标系下（x 前、y 左、z 上）。这样后续
+    时序补偿就只需要做刚体变换组合。
     """
     ann = parse_label(label_path, classes, stats)
     if len(ann['gt_names']) == 0 and not keep_empty:
@@ -817,10 +815,9 @@ def process_clip(
         stats.clips_missing_paths += 1
         return [], stats
     label_dir, frames_dir = paths
-    # N7 parsed_data/frames uses lidar timestamps as directory names.  Exact
-    # lookup is therefore the default and avoids accidentally pairing a label
-    # with a neighboring lidar frame.  Nearest-neighbor matching is retained only
-    # for older exports that did not preserve exact frame directory names.
+    # N7 parsed_data/frames 使用 lidar 时间戳作为目录名，且该时间戳已经和
+    # label JSON 对齐。因此默认直接精确查找 frames/<label_ts>，避免误把标签
+    # 关联到相邻 lidar 帧。最近邻匹配仅作为旧数据导出的兼容选项保留。
     matcher = TimestampMatcher(frames_dir) if frame_match_mode == 'nearest' else None
 
     odom_path = resolve_odom_path(data_root, ref, frames_dir)
@@ -1010,26 +1007,26 @@ def parse_args() -> argparse.Namespace:
             '--data-root /data/N7 '
             '--output-dir /data/N7/fastbev_vis/train'
         ))
-    parser.add_argument('--data-type', default='od', choices=['od'], help='Only od is supported.')
-    parser.add_argument('--data-path', required=True, help='N7 data root, usually ./data/nuscenes')
-    parser.add_argument('--datasets', nargs='+', required=True, help='Dataset tags or manifest prefixes')
+    parser.add_argument('--data-type', default='od', choices=['od'], help='仅支持 3D 障碍物 od 数据。')
+    parser.add_argument('--data-path', required=True, help='N7 数据根目录，通常为 ./data/nuscenes。')
+    parser.add_argument('--datasets', nargs='+', required=True, help='数据集名称或 manifest 前缀。')
     parser.add_argument('--sets', nargs='+', default=['train', 'val', 'test'])
-    parser.add_argument('--info-json', required=True, help='N7 sensor calibration json')
+    parser.add_argument('--info-json', required=True, help='N7 传感器标定 json。')
     parser.add_argument('--output-dir', default='./data/nuscenes')
-    parser.add_argument('--extra-tag', default='custom_fastbev', help='Output prefix: {tag}_infos_{set}.pkl')
-    parser.add_argument('--template-pkl', default=None, help='Deprecated and ignored; kept for old commands.')
-    parser.add_argument('--frame-match-mode', choices=['exact', 'nearest'], default='exact', help='Match label JSON to parsed_data frames by exact lidar timestamp or nearest timestamp')
-    parser.add_argument('--max-match-us', type=int, default=50000, help='Max label/frame timestamp diff in microseconds, used only when --frame-match-mode nearest')
-    parser.add_argument('--max-pose-match-us', type=int, default=50000, help='Max label/SLAM-pose timestamp diff in microseconds')
+    parser.add_argument('--extra-tag', default='custom_fastbev', help='输出 pkl 前缀：{tag}_infos_{set}.pkl。')
+    parser.add_argument('--template-pkl', default=None, help='已废弃且会被忽略，仅为兼容旧命令保留。')
+    parser.add_argument('--frame-match-mode', choices=['exact', 'nearest'], default='exact', help='label JSON 与 parsed_data/frames 的匹配方式：默认按 lidar 时间戳精确匹配，也可选择最近邻。')
+    parser.add_argument('--max-match-us', type=int, default=50000, help='label/frame 最大时间戳差，单位微秒；仅在 --frame-match-mode nearest 时生效。')
+    parser.add_argument('--max-pose-match-us', type=int, default=50000, help='label/SLAM pose 最大时间戳差，单位微秒。')
     parser.add_argument('--max-adj', '--max-adjacent', dest='max_adjacent', type=int, default=60)
-    parser.add_argument('--interval', type=int, default=3, help='Kept in metadata for compatibility; adjacent frames are stored densely.')
+    parser.add_argument('--interval', type=int, default=3, help='为兼容性写入 metadata；相邻帧在 pkl 中按稠密方式保存。')
     parser.add_argument('--camera-ids', nargs='+', default=CAMERA_ORDER, choices=CAMERA_ORDER)
     parser.add_argument('--classes', nargs='+', default=FASTBEV_CLASSES)
-    parser.add_argument('--keep-empty', action='store_true', help='Keep frames with no valid 3D boxes')
-    parser.add_argument('--separate', '-s', action='store_true', help='Write one pkl per dataset/set instead of merging datasets per set')
+    parser.add_argument('--keep-empty', action='store_true', help='保留没有有效 3D box 的帧。')
+    parser.add_argument('--separate', '-s', action='store_true', help='每个 dataset/set 单独写一个 pkl，而不是按 set 合并多个数据集。')
     parser.add_argument('--dry-run', action='store_true')
-    parser.add_argument('--multiprocessing', action='store_true', help='Accepted for old commands; currently ignored.')
-    parser.add_argument('--debug', action='store_true', help='Accepted for old commands; currently no extra raw dump.')
+    parser.add_argument('--multiprocessing', action='store_true', help='兼容旧命令参数，当前会被忽略。')
+    parser.add_argument('--debug', action='store_true', help='兼容旧命令参数，当前不会额外导出 raw dump。')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     return parser.parse_args()
 
