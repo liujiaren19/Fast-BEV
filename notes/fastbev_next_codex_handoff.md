@@ -74,6 +74,27 @@ Fast-BEV/MMDet3D LiDAR frame: x front, y left, z up.
 Axis remap: x_fastbev=-y_raw, y_fastbev=x_raw, z_fastbev=z_raw.
 ```
 
+Current custom training/deploy adaptation:
+
+```text
+1. configs/fastbev/custom/* now enable model.use_distortion=True. Distortion
+   coefficients are passed from CustomMultiViewDataset into lidar2img_aug and
+   lidar2img_extra, then used by FastBEV backproject_inplace when enabled.
+2. configs/fastbev/custom/* now enable RandomAugImageMultiViewImage.force_resize=True
+   so 4K/raw self-collected images are stretched to the target input size instead
+   of resize+crop. nuScenes configs keep the original behavior.
+3. FastBEV supports test_cfg.test_mode in test_pth/test_onnx/test_custom. ONNX
+   runtime sessions are initialized from backbone_onnx/head_onnx, with optional
+   onnx_custom_op_path. test_onnx/test_custom currently expect raw head tensors
+   that can still be decoded by bbox_head.get_bboxes.
+4. Head calibration data can be exported with save_calibrate_data_flag and
+   head_data_path. The exported head inputs are per-temporal-frame BEV tensors
+   with z folded into channels, matching the board-side head ONNX convention.
+5. CBGSDataset has disable_cbgs=False by default. For car-dominant self-collected
+   data, prefer disabling CBGS in config instead of commenting out the wrapper
+   implementation globally.
+```
+
 Current converter behavior:
 
 ```text

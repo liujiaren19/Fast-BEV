@@ -57,7 +57,7 @@ train_pipeline = [
         scale_ratio_range=[0.95, 1.05],
         translation_std=[0.05, 0.05, 0.05],
         update_img2lidar=True),
-    dict(type='RandomAugImageMultiViewImage', data_config=data_config),
+    dict(type='RandomAugImageMultiViewImage', data_config=data_config, force_resize=True),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -69,7 +69,7 @@ test_pipeline = [
     dict(type='MultiViewPipeline', sequential=True, n_images=1, n_times=4, transforms=[
         dict(type='LoadImageFromFile', file_client_args=file_client_args)]),
     dict(type='LoadPointsFromFile', dummy=True, coord_type='LIDAR', load_dim=5, use_dim=5),
-    dict(type='RandomAugImageMultiViewImage', data_config=data_config, is_train=False),
+    dict(type='RandomAugImageMultiViewImage', data_config=data_config, is_train=False, force_resize=True),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names, with_label=False),

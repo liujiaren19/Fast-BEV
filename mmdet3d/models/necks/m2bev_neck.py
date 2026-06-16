@@ -114,7 +114,10 @@ class M2BevNeck(nn.Module):
             out = self.model.forward(x)
             return out
 
-        if bool(os.getenv("DEPLOY", False)):
+        if x.dim() == 4:
+            # 板端 head ONNX 通常直接输入已经折叠 z 维后的 BEV 特征。
+            pass
+        elif bool(os.getenv("DEPLOY", False)):
             N, X, Y, Z, C = x.shape
             x = x.reshape(N, X, Y, Z*C).permute(0, 3, 1, 2)
         else:

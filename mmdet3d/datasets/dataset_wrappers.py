@@ -19,11 +19,16 @@ class CBGSDataset(object):
         dataset (:obj:`CustomDataset`): The dataset to be class sampled.
     """
 
-    def __init__(self, dataset):
+    def __init__(self, dataset, disable_cbgs=False):
         self.dataset = dataset
+        self.disable_cbgs = disable_cbgs
         self.CLASSES = dataset.CLASSES
         self.cat2id = {name: i for i, name in enumerate(self.CLASSES)}
-        self.sample_indices = self._get_sample_indices()
+        if self.disable_cbgs:
+            # 自采数据类别极度偏车时，可在配置层关闭 CBGS，避免全局改采样逻辑。
+            self.sample_indices = list(range(len(self.dataset)))
+        else:
+            self.sample_indices = self._get_sample_indices()
         # self.dataset.data_infos = self.data_infos
         if hasattr(self.dataset, 'flag'):
             self.flag = np.array(

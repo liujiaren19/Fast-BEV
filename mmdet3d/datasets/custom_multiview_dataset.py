@@ -193,6 +193,8 @@ class CustomMultiViewDataset(Custom3DDataset):
         viewpad[:intrinsic.shape[0], :intrinsic.shape[1]] = intrinsic
         lidar2img = viewpad @ lidar2cam_rt.T
 
+        distortion = np.asarray(
+            cam_info.get('distortion', []), dtype=np.float32).reshape(-1)
         lidar2img_aug = dict(
             intrin=intrinsic,
             rot=sensor2lidar_r,
@@ -200,8 +202,13 @@ class CustomMultiViewDataset(Custom3DDataset):
             post_rot=np.eye(3, dtype=np.float32),
             post_tran=np.zeros(3, dtype=np.float32),
             temporal_compensated=temporal_compensated,
+            distortion=distortion,
         )
-        return lidar2img.astype(np.float32), lidar2img_aug
+        lidar2img_extra = dict(
+            distortion=distortion,
+            temporal_compensated=temporal_compensated,
+        )
+        return lidar2img.astype(np.float32), lidar2img_aug, lidar2img_extra
 
     def _select_adjacent(self, info, time_id):
         adj_ids = self.test_adj_ids if self.test_mode else self.train_adj_ids
@@ -214,7 +221,7 @@ class CustomMultiViewDataset(Custom3DDataset):
         return info['prev'][max(select_id, 0)]
 
     def _collect_one_frame(self, info, ref_info=None):
-        image_paths, lidar2img_rts, lidar2img_augs = [], [], []
+        image_paths, lidar2img_rts, lidar2img_augs, lidar2img_extras = [], [], [], []
         cam_items = info['cams'].items()
         if self.camera_types is not None:
             cam_items = [(cam, info['cams'][cam]) for cam in self.camera_types]
@@ -223,18 +230,19 @@ class CustomMultiViewDataset(Custom3DDataset):
             image_paths.append(self._resolve_path(cam_info['data_path']))
             sensor2lidar_r, sensor2lidar_t, compensated = self._sensor2reference_lidar(
                 cam_info, frame_info=info, ref_info=ref_info)
-            lidar2img_rt, lidar2img_aug = self._lidar2img_from_cam_info(
+            lidar2img_rt, lidar2img_aug, lidar2img_extra = self._lidar2img_from_cam_info(
                 cam_info,
                 sensor2lidar_r=sensor2lidar_r,
                 sensor2lidar_t=sensor2lidar_t,
                 temporal_compensated=compensated)
             lidar2img_rts.append(lidar2img_rt)
             lidar2img_augs.append(lidar2img_aug)
-        return image_paths, lidar2img_rts, lidar2img_augs
+            lidar2img_extras.append(lidar2img_extra)
+        return image_paths, lidar2img_rts, lidar2img_augs, lidar2img_extras
 
     def get_data_info(self, index):
         info = self.data_infos[index]
-        image_paths, lidar2img_rts, lidar2img_augs = self._collect_one_frame(info, ref_info=info)
+        image_paths, lidar2img_rts, lidar2img_augs, lidar2img_extras = self._collect_one_frame(info, ref_info=info)
 
         if self.sequential:
             for time_id in range(1, self.n_times):
@@ -242,10 +250,11 @@ class CustomMultiViewDataset(Custom3DDataset):
                     adj_info = info
                 else:
                     adj_info = self._select_adjacent(info, time_id)
-                adj_paths, adj_rts, adj_augs = self._collect_one_frame(adj_info, ref_info=info)
+                adj_paths, adj_rts, adj_augs, adj_extras = self._collect_one_frame(adj_info, ref_info=info)
                 image_paths.extend(adj_paths)
                 lidar2img_rts.extend(adj_rts)
                 lidar2img_augs.extend(adj_augs)
+                lidar2img_extras.extend(adj_extras)
 
         n_cameras = len(image_paths)
         input_dict = dict(
@@ -257,7 +266,7 @@ class CustomMultiViewDataset(Custom3DDataset):
                 extrinsic=[x.astype(np.float32) for x in lidar2img_rts],
                 intrinsic=np.eye(4, dtype=np.float32),
                 lidar2img_aug=lidar2img_augs,
-                lidar2img_extra=[],
+                lidar2img_extra=lidar2img_extras,
             ))
 
         if not self.test_mode:

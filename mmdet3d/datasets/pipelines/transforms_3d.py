@@ -1666,12 +1666,13 @@ class RandomAugImageMultiViewImage(object):
     Args:
         scales
     """
-    def __init__(self, data_config=None, is_train=True, is_debug=False, is_exit=False, tmp='./figs'):
+    def __init__(self, data_config=None, is_train=True, is_debug=False, is_exit=False, tmp='./figs', force_resize=False):
         self.data_config = data_config
         self.is_train = is_train
         self.is_debug = is_debug
         self.is_exit = is_exit
         self.tmp = tmp
+        self.force_resize = force_resize
 
     def random_id(self, N=8, seed=None):
         if seed is not None:
@@ -1689,12 +1690,28 @@ class RandomAugImageMultiViewImage(object):
         aug_extrinsics = []
         for cam_id, img in enumerate(results['img']):
             pil_img = Image.fromarray(img, mode='RGB')
-            resize, resize_dims, crop, flip, rotate, pad = self.sample_augmentation(
-                H=pil_img.height,
-                W=pil_img.width,
-            )
+            if self.force_resize:
+                target_h, target_w = self.data_config['input_size'] if self.is_train else self.data_config['test_input_size']
+                resize, resize_dims, crop, flip, rotate, pad = self.sample_augmentation(
+                    H=target_h, W=target_w)
+                resize_dims = (target_w, target_h)
+                crop = (0, 0, target_w, target_h)
+                flip = False
+                rotate = 0.0
+                sx = float(target_w) / float(pil_img.width)
+                sy = float(target_h) / float(pil_img.height)
+                post_rot_init = torch.diag(torch.tensor([sx, sy], dtype=torch.float32))
+                post_tran_init = torch.zeros(2)
+                resize = 1.0
+            else:
+                resize, resize_dims, crop, flip, rotate, pad = self.sample_augmentation(
+                    H=pil_img.height,
+                    W=pil_img.width,
+                )
+                post_rot_init = torch.eye(2)
+                post_tran_init = torch.zeros(2)
             post_pil_img, post_rot, post_tran = self.img_transform(
-                pil_img, torch.eye(2), torch.zeros(2),
+                pil_img, post_rot_init, post_tran_init,
                 resize=resize,
                 resize_dims=resize_dims,
                 crop=crop,
@@ -1703,8 +1720,11 @@ class RandomAugImageMultiViewImage(object):
                 pad=pad
             )
             aug_imgs.append(np.asarray(post_pil_img))
+            cam_aug = results['lidar2img']['lidar2img_aug'][cam_id]
+            cam_aug['post_rot'] = post_rot
+            cam_aug['post_tran'] = post_tran
             aug_extrinsics.append(
-                self.rts2proj(results['lidar2img']['lidar2img_aug'][cam_id], post_rot, post_tran)
+                self.rts2proj(cam_aug, post_rot, post_tran)
             )
         results['img'] = aug_imgs
         results['lidar2img']['extrinsic'] = aug_extrinsics
