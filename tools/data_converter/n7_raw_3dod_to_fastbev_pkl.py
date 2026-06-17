@@ -426,16 +426,17 @@ def lidar_main_metadata(calib: Dict) -> Dict:
         return {'parse_error': str(exc)}
 
 
-def build_camera_info(sensor: Dict, image_path: Path, data_root: Path) -> Dict:
-    """为输出 pkl 构建单个相机条目。
+def build_camera_template(sensor: Dict) -> Dict:
+    """预计算单个相机的静态标定模板。
+
+    N7 当前使用一份固定标定 json，同一个 clip 乃至同一次转换中的相机
+    内参、畸变参数和 camera-to-lidar 外参都不会随帧变化。这里把这些固定
+    计算提前做一次，后续每帧只需要补入当前图片路径即可。
 
     标定 json 中每个相机的 ``to_lidar_main`` 变换表达在原始 N7/自采 lidar
     坐标系下。训练 pkl 必须自洽，因此写入 ``sensor2lidar_rotation`` 和
     ``sensor2lidar_translation`` 前，会把旋转和平移都转换到 Fast-BEV
     lidar 坐标系。
-
-    ``data_path`` 会尽量保存为相对 ``data_root`` 的路径。后续可视化时，
-    ``--data-root`` 使用同一个根目录即可解析图片路径。
     """
     raw_ext = sensor.get('extrinsic', {}).get('to_lidar_main')
     if raw_ext is None:
@@ -444,18 +445,12 @@ def build_camera_info(sensor: Dict, image_path: Path, data_root: Path) -> Dict:
     sensor_to_fastbev_rot = RAW_TO_FASTBEV @ sensor_to_raw_rot
     sensor_to_fastbev_tran = RAW_TO_FASTBEV @ sensor_to_raw_tran
 
-    try:
-        data_path = osp.relpath(str(image_path), str(data_root))
-    except ValueError:
-        data_path = str(image_path)
-
     intrinsic = np.asarray(sensor.get('intrinsic', {}).get('K', []), dtype=np.float32)
     if intrinsic.shape != (3, 3):
         raise ValueError(f'sensor {sensor.get("name")} has invalid K shape {intrinsic.shape}')
 
     distortion = np.asarray(sensor.get('intrinsic', {}).get('D', []), dtype=np.float32).reshape(-1)
     return {
-        'data_path': data_path,
         'sensor_name': sensor.get('name', ''),
         'cam_intrinsic': intrinsic,
         'sensor2lidar_rotation': sensor_to_fastbev_rot.astype(np.float32),
@@ -465,6 +460,45 @@ def build_camera_info(sensor: Dict, image_path: Path, data_root: Path) -> Dict:
         'distortion': distortion,
         'width': sensor.get('width', 0),
         'height': sensor.get('height', 0),
+    }
+
+
+def build_camera_templates(calib: Dict, camera_ids: Sequence[str]) -> Dict[str, Dict]:
+    """按 camera_id 预计算当前转换任务需要的相机模板。"""
+    templates: Dict[str, Dict] = {}
+    for cam_id in camera_ids:
+        sensor_name = CAMERA_ID_TO_SENSOR[cam_id]
+        sensor = find_sensor(calib, sensor_name)
+        templates[cam_id] = build_camera_template(sensor)
+    return templates
+
+
+def relative_image_path(image_path: Path, data_root: Path) -> str:
+    """把图片路径保存成相对 data_root 的形式，方便 pkl 跨机器迁移。"""
+    try:
+        return osp.relpath(str(image_path), str(data_root))
+    except ValueError:
+        return str(image_path)
+
+
+def build_camera_info(camera_template: Dict, image_path: Path, data_root: Path) -> Dict:
+    """把当前帧图片路径填入静态相机模板，生成 pkl 中的相机条目。
+
+    这里会复制 numpy 数组和 list，避免不同帧在 pickle 反序列化后共享同一份
+    可变对象。后续 dataset 或可视化代码即使临时修改某个相机条目，也不会污染
+    其他帧的标定字段。
+    """
+    return {
+        'data_path': relative_image_path(image_path, data_root),
+        'sensor_name': camera_template['sensor_name'],
+        'cam_intrinsic': camera_template['cam_intrinsic'].copy(),
+        'sensor2lidar_rotation': camera_template['sensor2lidar_rotation'].copy(),
+        'sensor2lidar_translation': camera_template['sensor2lidar_translation'].copy(),
+        'sensor2ego_rotation': list(camera_template['sensor2ego_rotation']),
+        'sensor2ego_translation': list(camera_template['sensor2ego_translation']),
+        'distortion': camera_template['distortion'].copy(),
+        'width': camera_template['width'],
+        'height': camera_template['height'],
     }
 
 
@@ -729,7 +763,7 @@ def build_info_for_label(
     frame_ts: int,
     frame_dir: Path,
     ref: ClipRef,
-    calib: Dict,
+    camera_templates: Dict[str, Dict],
     data_root: Path,
     camera_ids: Sequence[str],
     classes: Sequence[str],
@@ -756,9 +790,7 @@ def build_info_for_label(
 
     cams = {}
     for cam_id in camera_ids:
-        sensor_name = CAMERA_ID_TO_SENSOR[cam_id]
-        sensor = find_sensor(calib, sensor_name)
-        cams[cam_id] = build_camera_info(sensor, image_map[cam_id], data_root)
+        cams[cam_id] = build_camera_info(camera_templates[cam_id], image_map[cam_id], data_root)
 
     label_ts = ann['timestamp']
     pose_info = select_frame_pose(
@@ -800,7 +832,7 @@ def build_info_for_label(
 def process_clip(
     data_root: Path,
     ref: ClipRef,
-    calib: Dict,
+    camera_templates: Dict[str, Dict],
     camera_ids: Sequence[str],
     classes: Sequence[str],
     frame_match_mode: str,
@@ -852,7 +884,7 @@ def process_clip(
                 frame_ts=frame_ts,
                 frame_dir=frame_dir,
                 ref=ref,
-                calib=calib,
+                camera_templates=camera_templates,
                 data_root=data_root,
                 camera_ids=camera_ids,
                 classes=classes,
@@ -922,6 +954,7 @@ def convert_one_set(
     dataset_names: Sequence[str],
     set_name: str,
     calib: Dict,
+    camera_templates: Dict[str, Dict],
     out_dir: Path,
     extra_tag: str,
     camera_ids: Sequence[str],
@@ -948,7 +981,7 @@ def convert_one_set(
             clip_infos, clip_stats = process_clip(
                 data_root=data_root,
                 ref=ref,
-                calib=calib,
+                camera_templates=camera_templates,
                 camera_ids=camera_ids,
                 classes=classes,
                 frame_match_mode=frame_match_mode,
@@ -1049,6 +1082,7 @@ def main() -> None:
         logger.info('--multiprocessing is accepted for compatibility but not used')
 
     calib = load_json(calib_path)
+    camera_templates = build_camera_templates(calib, args.camera_ids)
     logger.info('data_root=%s', data_root)
     logger.info('datasets=%s sets=%s', args.datasets, args.sets)
     logger.info('camera_ids=%s', args.camera_ids)
@@ -1062,6 +1096,7 @@ def main() -> None:
             dataset_names=args.datasets,
             set_name=set_name,
             calib=calib,
+            camera_templates=camera_templates,
             out_dir=out_dir,
             extra_tag=args.extra_tag,
             camera_ids=args.camera_ids,
