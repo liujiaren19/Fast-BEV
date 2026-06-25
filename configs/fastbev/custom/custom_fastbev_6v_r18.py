@@ -3,17 +3,20 @@ _base_ = '../exp/paper/fastbev_m0_r18_s256x704_v200x200x4_c192_d2_f4.py'
 model = dict(
     use_distortion=True,
     n_images=6,
-    bbox_head=dict(num_classes=10),
+    bbox_head=dict(num_classes=2),
 )
 
 dataset_type = 'CustomMultiViewDataset'
 data_root = './data/nuscenes/'
 ann_prefix = 'custom_fastbev'
+# 与 converter 输出命名规则保持一致：{tag}_{scope}_infos_{set}_{YYYYMMDD}.pkl。
+# 当前默认按样例单 clip pkl 配置；如果 converter 输出的是 dataset
+# 或 sequence scope，只需要同步修改 ann_scope。
+ann_scope = '20251203_151928_16'
+ann_date = '20260623'
+ann_file_prefix = f'{ann_prefix}_{ann_scope}'
 point_cloud_range = [-50, -50, -5, 50, 50, 3]
-class_names = [
-    'car', 'truck', 'trailer', 'bus', 'construction_vehicle', 'bicycle',
-    'motorcycle', 'pedestrian', 'traffic_cone', 'barrier'
-]
+class_names = ['car', 'truck']
 camera_types = ['cam0', 'cam11', 'cam9', 'cam3', 'cam8', 'cam10']
 
 input_modality = dict(
@@ -31,6 +34,9 @@ img_norm_cfg = dict(
 
 data_config = {
     'input_size': (256, 704),
+    # N7 标定内参对应 1600x900 图像；即使训练图片已经离线 resize 到
+    # 704x256，投影几何也必须按 1600x900 -> 704x256 缩放一次。
+    'force_resize_source_size': (900, 1600),
     'resize': (-0.06, 0.11),
     'crop': (-0.05, 0.05),
     'rot': (-5.4, 5.4),
@@ -62,7 +68,11 @@ train_pipeline = [
         scale_ratio_range=[0.95, 1.05],
         translation_std=[0.05, 0.05, 0.05],
         update_img2lidar=True),
-    dict(type='RandomAugImageMultiViewImage', data_config=data_config, force_resize=True),
+    dict(
+        type='RandomAugImageMultiViewImage',
+        data_config=data_config,
+        force_resize=True,
+        force_resize_source_size=data_config['force_resize_source_size']),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -74,7 +84,12 @@ test_pipeline = [
     dict(type='MultiViewPipeline', sequential=True, n_images=6, n_times=4, transforms=[
         dict(type='LoadImageFromFile', file_client_args=file_client_args)]),
     dict(type='LoadPointsFromFile', dummy=True, coord_type='LIDAR', load_dim=5, use_dim=5),
-    dict(type='RandomAugImageMultiViewImage', data_config=data_config, is_train=False, force_resize=True),
+    dict(
+        type='RandomAugImageMultiViewImage',
+        data_config=data_config,
+        is_train=False,
+        force_resize=True,
+        force_resize_source_size=data_config['force_resize_source_size']),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names, with_label=False),
@@ -90,11 +105,12 @@ custom_dataset_common = dict(
     camera_types=camera_types,
     sequential=True,
     n_times=4,
-    train_adj_ids=[1, 3, 5],
-    test_adj_ids=[1, 3, 5],
+    train_adj_ids=[0, 1, 2],
+    test_adj_ids=[0, 1, 2],
     max_interval=10,
     min_interval=0,
     eval_iou_thr=[0.25, 0.5],
+    eval_range=point_cloud_range,
 )
 
 data = dict(
@@ -105,16 +121,16 @@ data = dict(
         **custom_dataset_common,
         pipeline=train_pipeline,
         test_mode=False,
-        ann_file=data_root + ann_prefix + '_infos_train.pkl'),
+        ann_file=data_root + f'{ann_file_prefix}_infos_train_{ann_date}.pkl'),
     val=dict(
         **custom_dataset_common,
         pipeline=test_pipeline,
         test_mode=True,
-        ann_file=data_root + ann_prefix + '_infos_val.pkl'),
+        ann_file=data_root + f'{ann_file_prefix}_infos_val_{ann_date}.pkl'),
     test=dict(
         **custom_dataset_common,
         pipeline=test_pipeline,
         test_mode=True,
-        ann_file=data_root + ann_prefix + '_infos_val.pkl'))
+        ann_file=data_root + f'{ann_file_prefix}_infos_val_{ann_date}.pkl'))
 
 evaluation = dict(interval=5, metric=[0.25, 0.5])

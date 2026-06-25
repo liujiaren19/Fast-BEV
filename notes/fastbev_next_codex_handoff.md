@@ -51,7 +51,7 @@ into a pkl that CustomMultiViewDataset can train with.
 Current main converter:
 
 ```text
-tools/data_converter/n7_raw_3dod_to_fastbev_pkl.py
+tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py
 ```
 
 Compatibility wrapper:
@@ -63,7 +63,7 @@ new_tool/unified_processor_raw.py
 Current visualizer:
 
 ```text
-new_tool/draw_gt_pkl.py
+tools/data_converter/n7/visualize_n7_fastbev_pkl.py
 ```
 
 Current known N7 conventions handled by the converter:
@@ -127,8 +127,8 @@ Next required Priority 1 work:
 ```text
 1. Put a real continuous N7 clip under data/nuscenes with actual six-camera
    image files. The currently uploaded six labels are not enough by themselves.
-2. Run tools/data_converter/n7_raw_3dod_to_fastbev_pkl.py on real N7 data and generate pkl.
-3. Visualize BEV boxes and camera projections with new_tool/draw_gt_pkl.py.
+2. Run tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py on real N7 data and generate pkl.
+3. Visualize BEV boxes and camera projections with tools/data_converter/n7/visualize_n7_fastbev_pkl.py.
 4. Verify camera image paths, sensor2lidar projection, yaw direction, box center,
    dimensions, velocity, class mapping, and adjacent-frame pose compensation.
 5. Run CustomMultiViewDataset with n_times=1 and n_times>1 to confirm pkl loading,
@@ -141,7 +141,7 @@ Next required Priority 1 work:
 Practical command shape for conversion:
 
 ```bash
-python tools/data_converter/n7_raw_3dod_to_fastbev_pkl.py \
+python tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py \
   --data-path data/nuscenes \
   --datasets 20251203 \
   --sets train \
@@ -302,8 +302,8 @@ consistent.
 ## Files To Inspect First
 
 ```text
-tools/data_converter/n7_raw_3dod_to_fastbev_pkl.py
-new_tool/draw_gt_pkl.py
+tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py
+tools/data_converter/n7/visualize_n7_fastbev_pkl.py
 mmdet3d/datasets/custom_multiview_dataset.py
 configs/fastbev/round1/custom_n7_6v_fastbev_r18_debug.py
 configs/fastbev/round1/custom_n7_6v_fastbev_r18_smoke.py

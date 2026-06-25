@@ -51,7 +51,9 @@ N7 3D_OD 标签按如下原始 lidar 坐标系理解：
 
 输出 pkl 内容
 -------------
-pkl 结构是 ``{"infos": infos, "metadata": metadata}``。每个 info 包含：
+pkl 结构是 ``{"infos": infos, "metadata": metadata}``。脚本会同时在同目录写入
+``*.summary.json``，只包含 metadata 和统计信息，便于不打开大 pkl 时快速核对。
+每个 info 包含：
 
     - 六目图像路径
     - 相机内参和 camera-to-lidar 外参
@@ -67,25 +69,62 @@ key frame lidar 坐标系，从而尽量复刻原 Fast-BEV nuScenes 时序输入
 
 默认情况下，label JSON 和 ``frames/<timestamp>`` 目录使用 lidar 时间戳精确
 匹配；只有显式设置 ``--frame-match-mode nearest`` 时才会启用最近邻匹配。
+
+常用命令
+--------
+
+    # 704x256 缓存图：data_path 指向离线 resize 后的图片，info_json 仍使用
+    # 生成这些图片之前对应的标定尺寸内参，例如当前 N7 高快数据的 1600x900 K。
+    python tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py \
+        --data-path data/N7_704_256 \
+        --datasets 20251031 \
+        --sets train val \
+        --info-json data/info_json/2025_04_18_2k_byd_info.json \
+        --output-dir data/N7_704_256/pkl \
+        --extra-tag custom_fastbev \
+        --image-size 256 704
+
+    # 原始 1600x900 图：可以不传 --image-size，让脚本读取图片 header；
+    # 批量数据为了少做 IO，也可以显式传 --image-size 900 1600。
+    python tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py \
+        --data-path data/nuscenes \
+        --datasets 20251031 \
+        --sets train val \
+        --info-json data/info_json/2025_04_18_2k_byd_info.json \
+        --output-dir data/nuscenes/pkl/od_2k \
+        --extra-tag custom_fastbev \
+        --image-size 900 1600
+
+    # 转换后建议先做几何校验，再抽帧可视化。
+    python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
+        --pkl data/N7_704_256/pkl/custom_fastbev_20251031_infos_train_20260624.pkl \
+        --data-root data/N7_704_256 \
+        --output-dir work_dirs/vis_n7_704_check \
+        --no-render \
+        --check-geometry \
+        --check-temporal-geometry \
+        --strict-geometry
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
+import bisect
 import json
 import logging
 import math
 import os
 import os.path as osp
 import pickle
+import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+from PIL import Image
 from pyquaternion import Quaternion
 from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
@@ -93,6 +132,78 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def natural_sort_key(value) -> List:
+    """按自然顺序排序字符串，避免 clip_10 排在 clip_2 前面。"""
+
+    key = []
+    for part in re.split(r'(\d+)', str(value)):
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part.lower()))
+    return key
+
+
+def sorted_dir_paths(path: Path) -> List[Path]:
+    """用 os.scandir 快速列出一级子目录，并按自然顺序排序。"""
+
+    try:
+        with os.scandir(path) as entries:
+            return sorted(
+                (Path(entry.path) for entry in entries if entry.is_dir()),
+                key=lambda p: natural_sort_key(p.name),
+            )
+    except FileNotFoundError:
+        return []
+
+
+def sorted_json_files(path: Path) -> List[Path]:
+    """用 os.scandir 快速列出 JSON 文件，并按时间戳/自然顺序排序。"""
+
+    try:
+        with os.scandir(path) as entries:
+            files = [
+                Path(entry.path)
+                for entry in entries
+                if entry.is_file() and entry.name.lower().endswith('.json')
+            ]
+    except FileNotFoundError:
+        return []
+    return sorted(files, key=lambda p: natural_sort_key(p.name))
+
+
+def has_json_files(path: Path) -> bool:
+    """快速判断目录下是否至少有一个 JSON 文件。"""
+
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.lower().endswith('.json'):
+                    return True
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def build_frame_index(frames_dir: Path) -> Dict[int, Path]:
+    """把 frames/<timestamp> 目录一次性建成索引，避免逐 label 反复 exists。"""
+
+    frame_index: Dict[int, Path] = {}
+    for item in sorted_dir_paths(frames_dir):
+        try:
+            frame_index[int(item.name)] = item
+        except ValueError:
+            continue
+    return frame_index
+
+
+class RawDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    """保留 epilog 示例换行，同时继续展示 argparse 默认值。"""
+
 
 CAMERA_ID_TO_SENSOR = {
     'cam0': 'front_wide',
@@ -103,11 +214,17 @@ CAMERA_ID_TO_SENSOR = {
     'cam10': 'right_back',
 }
 CAMERA_ORDER = ['cam0', 'cam11', 'cam9', 'cam3', 'cam8', 'cam10']
+# Fast-BEV 原 4D nuScenes pkl 中 [1, 3, 5] 历史帧下标约对应
+# 0.5s / 1.0s / 1.5s 的时间差。N7 自采帧率可能更高，默认按时间差
+# 选择历史帧，比直接取稠密相邻帧更接近原始时序训练语义。
+DEFAULT_ADJACENT_TIME_OFFSETS_US = [500000, 1000000, 1500000]
+IMAGE_SUFFIXES = {'.jpg', '.jpeg', '.png', '.bmp'}
 
-FASTBEV_CLASSES = [
-    'car', 'truck', 'trailer', 'bus', 'construction_vehicle', 'bicycle',
-    'motorcycle', 'pedestrian', 'traffic_cone', 'barrier'
-]
+# 当前业务主线先训练道路车辆两类：乘用车/小车和货车。
+# N7 原始标签中 no_motor_bike/person 仍在 CLASS_MAPPING 中保留到
+# nuScenes 风格类别名，后续如果要做四类实验，可以通过 --classes
+# car truck bicycle pedestrian 显式打开。
+FASTBEV_CLASSES = ['car', 'truck']
 
 CLASS_MAPPING = {
     'car': 'car',
@@ -172,32 +289,41 @@ class ConversionStats:
     labels_without_gt: int = 0
     objects_total: int = 0
     objects_kept: int = 0
+    objects_filtered_class: int = 0
     objects_unknown_class: int = 0
+    raw_class_counts: Dict[str, int] = field(default_factory=dict)
+    mapped_class_counts: Dict[str, int] = field(default_factory=dict)
+    kept_class_counts: Dict[str, int] = field(default_factory=dict)
     clips_with_pose_file: int = 0
     labels_with_pose: int = 0
     labels_without_pose: int = 0
 
-    def as_dict(self) -> Dict[str, int]:
-        return dict(self.__dict__)
+    def as_dict(self) -> Dict:
+        data = dict(self.__dict__)
+        # dict 字段复制一份，避免调用方误改 stats 内部状态。
+        for key in ('raw_class_counts', 'mapped_class_counts', 'kept_class_counts'):
+            data[key] = dict(data.get(key, {}))
+        return data
 
     def merge(self, other: 'ConversionStats') -> None:
         for key, value in other.as_dict().items():
-            setattr(self, key, getattr(self, key) + value)
+            current = getattr(self, key)
+            if isinstance(current, dict):
+                for sub_key, sub_value in value.items():
+                    current[sub_key] = current.get(sub_key, 0) + sub_value
+            else:
+                setattr(self, key, current + value)
+
+    @staticmethod
+    def count(mapping: Dict[str, int], key: str) -> None:
+        mapping[key] = mapping.get(key, 0) + 1
 
 
 class TimestampMatcher:
     def __init__(self, frame_root: Path):
-        self.items: List[Tuple[int, Path]] = []
-        if frame_root.exists():
-            for item in frame_root.iterdir():
-                if not item.is_dir():
-                    continue
-                try:
-                    ts = int(item.name)
-                except ValueError:
-                    continue
-                self.items.append((ts, item))
-        self.items.sort(key=lambda x: x[0])
+        # 最近邻模式也复用同一个 frame 索引，避免逐目录 Path.iterdir 的额外开销。
+        frame_index = build_frame_index(frame_root)
+        self.items: List[Tuple[int, Path]] = sorted(frame_index.items(), key=lambda x: x[0])
         self.timestamps = [x[0] for x in self.items]
 
     def closest(self, timestamp: int, max_diff_us: int) -> Optional[Tuple[int, Path]]:
@@ -450,6 +576,8 @@ def build_camera_template(sensor: Dict) -> Dict:
         raise ValueError(f'sensor {sensor.get("name")} has invalid K shape {intrinsic.shape}')
 
     distortion = np.asarray(sensor.get('intrinsic', {}).get('D', []), dtype=np.float32).reshape(-1)
+    intrinsic_width = int(sensor.get('width', 0) or 0)
+    intrinsic_height = int(sensor.get('height', 0) or 0)
     return {
         'sensor_name': sensor.get('name', ''),
         'cam_intrinsic': intrinsic,
@@ -458,8 +586,12 @@ def build_camera_template(sensor: Dict) -> Dict:
         'sensor2ego_rotation': rotation_to_wxyz(sensor_to_fastbev_rot),
         'sensor2ego_translation': sensor_to_fastbev_tran.astype(np.float32).tolist(),
         'distortion': distortion,
-        'width': sensor.get('width', 0),
-        'height': sensor.get('height', 0),
+        # intrinsic_width/height 明确表示 cam_intrinsic 和畸变参数对应的图像坐标系。
+        # 旧字段 width/height 保留为兼容别名，含义同样是内参对应尺寸，不是训练图片实际尺寸。
+        'intrinsic_width': intrinsic_width,
+        'intrinsic_height': intrinsic_height,
+        'width': intrinsic_width,
+        'height': intrinsic_height,
     }
 
 
@@ -473,21 +605,63 @@ def build_camera_templates(calib: Dict, camera_ids: Sequence[str]) -> Dict[str, 
     return templates
 
 
+def camera_intrinsic_size_summary(calib: Dict, camera_ids: Sequence[str]) -> Dict[str, Dict]:
+    """记录每个相机内参对应的图像尺寸，方便 pkl 交接和训练配置核对。"""
+    summary: Dict[str, Dict] = {}
+    for cam_id in camera_ids:
+        sensor = find_sensor(calib, CAMERA_ID_TO_SENSOR[cam_id])
+        summary[cam_id] = {
+            'sensor_name': sensor.get('name', ''),
+            'height': int(sensor.get('height', 0) or 0),
+            'width': int(sensor.get('width', 0) or 0),
+        }
+    return summary
+
+
 def relative_image_path(image_path: Path, data_root: Path) -> str:
-    """把图片路径保存成相对 data_root 的形式，方便 pkl 跨机器迁移。"""
-    try:
-        return osp.relpath(str(image_path), str(data_root))
-    except ValueError:
-        return str(image_path)
+    """把图片路径保存成相对 data_root 的形式，方便 pkl 跨机器迁移。
 
-
-def build_camera_info(camera_template: Dict, image_path: Path, data_root: Path) -> Dict:
-    """把当前帧图片路径填入静态相机模板，生成 pkl 中的相机条目。
-
-    这里会复制 numpy 数组和 list，避免不同帧在 pickle 反序列化后共享同一份
-    可变对象。后续 dataset 或可视化代码即使临时修改某个相机条目，也不会污染
-    其他帧的标定字段。
+    常见路径都来自 ``data_root / ...``，优先使用 ``Path.relative_to`` 可以避免
+    ``os.path.relpath`` 每次做绝对路径归一化；只有遇到混合绝对/相对路径或
+    非同根路径时才回退到兼容逻辑。
     """
+    try:
+        return image_path.relative_to(data_root).as_posix()
+    except ValueError:
+        try:
+            return osp.relpath(str(image_path), str(data_root))
+        except ValueError:
+            return str(image_path)
+
+
+def read_image_size(image_path: Path) -> Tuple[int, int]:
+    """读取实际图片尺寸，返回 (height, width)。
+
+    只有在用户没有通过 --image-size 指定缓存图片尺寸时才会调用。PIL 读取
+    header 即可获得尺寸，不需要把整张图片解码成数组。
+    """
+    with Image.open(image_path) as img:
+        width, height = img.size
+    return int(height), int(width)
+
+
+def build_camera_info(
+    camera_template: Dict,
+    image_path: Path,
+    data_root: Path,
+    image_size_override: Optional[Tuple[int, int]] = None,
+) -> Dict:
+    """把当前帧图片路径和尺寸填入静态相机模板，生成 pkl 中的相机条目。
+
+    intrinsic_width/height 表示 cam_intrinsic 对应的图像坐标系尺寸；
+    image_width/height 表示 data_path 当前指向图片文件的实际尺寸。两者必须
+    分开保存，否则 1600x900 标定 + 704x256 缓存图、多车型 2560x1440 标定
+    等场景容易在 pipeline 中重复缩放或漏缩放。
+    """
+    if image_size_override is None:
+        image_height, image_width = read_image_size(image_path)
+    else:
+        image_height, image_width = [int(x) for x in image_size_override]
     return {
         'data_path': relative_image_path(image_path, data_root),
         'sensor_name': camera_template['sensor_name'],
@@ -497,27 +671,54 @@ def build_camera_info(camera_template: Dict, image_path: Path, data_root: Path) 
         'sensor2ego_rotation': list(camera_template['sensor2ego_rotation']),
         'sensor2ego_translation': list(camera_template['sensor2ego_translation']),
         'distortion': camera_template['distortion'].copy(),
-        'width': camera_template['width'],
-        'height': camera_template['height'],
+        'intrinsic_width': camera_template['intrinsic_width'],
+        'intrinsic_height': camera_template['intrinsic_height'],
+        'image_width': image_width,
+        'image_height': image_height,
+        # width/height 作为兼容字段保留，语义是内参对应尺寸。
+        'width': camera_template['intrinsic_width'],
+        'height': camera_template['intrinsic_height'],
     }
 
 
-def image_files(cam_dir: Path) -> List[Path]:
-    files: List[Path] = []
-    for ext in ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.JPG', '*.JPEG', '*.PNG', '*.BMP'):
-        files.extend(Path(x) for x in glob.glob(str(cam_dir / ext)))
-    return sorted(files)
+def first_image_file(cam_dir: Path) -> Optional[Path]:
+    """在单个相机目录中快速找到一张有效图片。
+
+    N7 每个 ``frames/<lidar_ts>/images/<cam_id>`` 目录通常只有一张同步后的
+    图片。旧实现会对 8 种大小写后缀逐个 glob，572 帧六目会触发两万多次
+    目录扫描。这里改为一次 ``os.scandir`` 扫完整个目录，并按文件名选择
+    第一张非空图片，兼容相机图片时间戳和 lidar 时间戳不完全一致的情况。
+    """
+    best_name: Optional[str] = None
+    try:
+        with os.scandir(cam_dir) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                suffix = osp.splitext(entry.name)[1].lower()
+                if suffix not in IMAGE_SUFFIXES:
+                    continue
+                try:
+                    if entry.stat().st_size <= 0:
+                        continue
+                except OSError:
+                    continue
+                if best_name is None or entry.name < best_name:
+                    best_name = entry.name
+    except FileNotFoundError:
+        return None
+
+    if best_name is None:
+        return None
+    return cam_dir / best_name
 
 
 def collect_frame_images(frame_dir: Path, camera_ids: Sequence[str]) -> Optional[Dict[str, Path]]:
     images_root = frame_dir / 'images'
     images: Dict[str, Path] = {}
     for cam_id in camera_ids:
-        files = image_files(images_root / cam_id)
-        if not files:
-            return None
-        image_path = files[0]
-        if not image_path.exists() or image_path.stat().st_size <= 0:
+        image_path = first_image_file(images_root / cam_id)
+        if image_path is None:
             return None
         images[cam_id] = image_path
     return images
@@ -576,13 +777,21 @@ def parse_label(label_path: Path, classes: Sequence[str], stats: ConversionStats
     for anno in annotations:
         stats.objects_total += 1
         raw_name = anno.get('type', 'unknown')
-        mapped_name = CLASS_MAPPING.get(raw_name, raw_name)
-        if mapped_name not in classes:
+        stats.count(stats.raw_class_counts, raw_name)
+        mapped_name = CLASS_MAPPING.get(raw_name)
+        if mapped_name is None:
             stats.objects_unknown_class += 1
+            continue
+        stats.count(stats.mapped_class_counts, mapped_name)
+        if mapped_name not in classes:
+            # 已知类别但不在当前训练类别集合中，例如两类车辆实验中过滤
+            # no_motor_bike/person。单独统计，避免误认为标签类别未知。
+            stats.objects_filtered_class += 1
             continue
         box, velocity = annotation_to_box(anno)
         gt_boxes.append(box)
         gt_names.append(mapped_name)
+        stats.count(stats.kept_class_counts, mapped_name)
         gt_velocity.append(velocity)
         track_ids.append(int(anno.get('track_id', -1)))
         stats.objects_kept += 1
@@ -687,20 +896,60 @@ def discover_refs(data_root: Path, dataset_name: str) -> List[ClipRef]:
     base = data_root / dataset_name
     if not base.exists():
         base = data_root
+
     refs = set()
-    for label_dir_str in glob.glob(str(base / '**' / '3D_OD' / 'lidar'), recursive=True):
-        label_dir = Path(label_dir_str)
-        if not any(label_dir.glob('*.json')):
-            continue
-        parents = label_dir.parents
-        # 目录形式：dataset/sequence/output/clip/3D_OD/lidar
-        if len(parents) >= 4 and parents[2].name == 'output':
-            sequence = '' if parents[3] == base else parents[3].name
-            refs.add(ClipRef(dataset=dataset_name, sequence=sequence, clip=parents[1].name))
-        # 目录形式：dataset/output/sequence/clip/3D_OD/lidar
-        if len(parents) >= 5 and parents[3].name == 'output':
-            refs.add(ClipRef(dataset=dataset_name, sequence=parents[2].name, clip=parents[1].name))
-    return sorted(refs, key=lambda x: (x.dataset, x.sequence, x.clip))
+
+    def add_ref(sequence: str, clip: str, label_dir: Path) -> None:
+        if has_json_files(label_dir):
+            refs.add(ClipRef(dataset=dataset_name, sequence=sequence, clip=clip))
+
+    # 标准 N7 结构：dataset/sequence/output/clip/3D_OD/lidar。
+    for sequence_dir in sorted_dir_paths(base):
+        output_root = sequence_dir / 'output'
+        for clip_dir in sorted_dir_paths(output_root):
+            add_ref(sequence_dir.name, clip_dir.name, clip_dir / '3D_OD' / 'lidar')
+
+    # 历史结构：dataset/output/sequence/clip/3D_OD/lidar。
+    output_root = base / 'output'
+    for sequence_dir in sorted_dir_paths(output_root):
+        for clip_dir in sorted_dir_paths(sequence_dir):
+            add_ref(sequence_dir.name, clip_dir.name, clip_dir / '3D_OD' / 'lidar')
+
+    # 历史结构：dataset/output/clip/3D_OD/lidar。
+    for clip_dir in sorted_dir_paths(output_root):
+        add_ref('', clip_dir.name, clip_dir / '3D_OD' / 'lidar')
+
+    if not refs:
+        # 非标准导出路径才退回 os.walk。正常 22W N7 数据不会走这里。
+        for dirpath, _, filenames in os.walk(base):
+            label_dir = Path(dirpath)
+            if label_dir.name != 'lidar' or label_dir.parent.name != '3D_OD':
+                continue
+            if not any(name.lower().endswith('.json') for name in filenames):
+                continue
+            try:
+                rel_parts = label_dir.relative_to(base).parts
+            except ValueError:
+                rel_parts = label_dir.parts
+            if 'output' not in rel_parts:
+                continue
+            output_index = rel_parts.index('output')
+            sequence = ''
+            clip = label_dir.parents[1].name
+            if output_index > 0 and output_index + 1 < len(rel_parts):
+                sequence = rel_parts[output_index - 1]
+                clip = rel_parts[output_index + 1]
+            elif output_index + 2 < len(rel_parts) and rel_parts[output_index + 2] != '3D_OD':
+                sequence = rel_parts[output_index + 1]
+                clip = rel_parts[output_index + 2]
+            elif output_index + 1 < len(rel_parts):
+                clip = rel_parts[output_index + 1]
+            refs.add(ClipRef(dataset=dataset_name, sequence=sequence, clip=clip))
+
+    return sorted(
+        refs,
+        key=lambda x: (natural_sort_key(x.dataset), natural_sort_key(x.sequence), natural_sort_key(x.clip)),
+    )
 
 
 def load_refs_for_set(data_root: Path, dataset_name: str, set_name: str) -> List[ClipRef]:
@@ -715,18 +964,29 @@ def load_refs_for_set(data_root: Path, dataset_name: str, set_name: str) -> List
     return refs
 
 
-def adjacent_view(info: Dict) -> Dict:
+def adjacent_view(
+    info: Dict,
+    target_time_offset_us: Optional[int] = None,
+    actual_time_offset_us: Optional[int] = None,
+) -> Dict:
     """返回构建单个相邻帧视图所需的字段子集。
 
     这里会带上 pose 字段，因为时序 Fast-BEV 需要把相邻帧相机从它自己的
     lidar 坐标系变换到当前 key frame 的 lidar 坐标系。GT boxes 不复制到
     相邻帧视图中，因为检测监督目标始终只属于 key frame。
+
+    ``target_time_offset_us`` 和 ``actual_time_offset_us`` 只用于调试和追溯：
+    前者表示本来希望选择的时间差，后者表示实际匹配到的相邻帧时间差。
     """
     view = {
         'token': info['token'],
         'timestamp': info['timestamp'],
         'cams': info['cams'],
     }
+    if target_time_offset_us is not None:
+        view['target_time_offset_us'] = int(target_time_offset_us)
+    if actual_time_offset_us is not None:
+        view['actual_time_offset_us'] = int(actual_time_offset_us)
     for key in (
         'lidar2global_rotation', 'lidar2global_translation',
         'ego2global_rotation', 'ego2global_translation',
@@ -737,13 +997,55 @@ def adjacent_view(info: Dict) -> Dict:
     return view
 
 
-def link_adjacent_infos(infos: List[Dict], max_adjacent: int) -> None:
-    """在每个 clip 内挂载稠密的 previous/next 相邻帧引用。
+def closest_temporal_info(
+    clip_infos: Sequence[Dict],
+    timestamps: Sequence[int],
+    target_timestamp: int,
+    start: int,
+    end: int,
+) -> Optional[Dict]:
+    """从同一 clip 的候选帧中用二分查找选择最接近目标时间的帧。
 
-    这些引用用于让 ``CustomMultiViewDataset`` 组装 ``n_times > 1`` 的图像
-    序列。相邻帧只复制相机条目和帧级 pose 字段，GT boxes 仍然保留在
-    key frame 上。训练时 dataset 会使用这些 pose 字段完成相邻帧到 key
-    frame 的运动补偿。
+    ``clip_infos`` 已经按时间戳升序排列，``timestamps`` 是对应的整型时间戳
+    列表。``start``/``end`` 用来限定只能从当前 key frame 之前或之后选帧，
+    因此 time 模式不需要每次复制候选列表，也不需要线性扫描整个历史窗口。
+    """
+    if start >= end:
+        return None
+
+    target_timestamp = int(target_timestamp)
+    pos = bisect.bisect_left(timestamps, target_timestamp, start, end)
+    best_idx: Optional[int] = None
+    for candidate_idx in (pos - 1, pos):
+        if start <= candidate_idx < end:
+            if best_idx is None:
+                best_idx = candidate_idx
+                continue
+            candidate_diff = abs(timestamps[candidate_idx] - target_timestamp)
+            best_diff = abs(timestamps[best_idx] - target_timestamp)
+            if candidate_diff < best_diff:
+                best_idx = candidate_idx
+
+    if best_idx is None:
+        return None
+    return clip_infos[best_idx]
+
+
+def link_adjacent_infos(
+    infos: List[Dict],
+    max_adjacent: int,
+    adjacent_mode: str,
+    adjacent_time_offsets_us: Sequence[int],
+) -> None:
+    """在每个 clip 内挂载 previous/next 相邻帧引用。
+
+    默认 ``time`` 模式按目标时间差选择历史帧，例如 0.5s / 1.0s / 1.5s。
+    这种方式比高帧率数据下直接取稠密上一帧更有意义，也更接近原始
+    Fast-BEV 4D nuScenes pkl 的时序间隔。
+
+    ``dense`` 模式保留旧逻辑：prev[0] 是上一帧，prev[1] 是上上帧。它主要
+    用于兼容旧实验或排查问题。无论哪种模式，相邻帧只复制相机条目和
+    帧级 pose 字段，GT boxes 仍然保留在 key frame 上。
     """
     by_clip: Dict[str, List[Dict]] = {}
     for info in infos:
@@ -751,11 +1053,45 @@ def link_adjacent_infos(infos: List[Dict], max_adjacent: int) -> None:
 
     for clip_infos in by_clip.values():
         clip_infos.sort(key=lambda x: x['timestamp'])
+        timestamps = [int(x['timestamp']) for x in clip_infos]
+        clip_len = len(clip_infos)
         for idx, info in enumerate(clip_infos):
-            prev_infos = clip_infos[max(0, idx - max_adjacent):idx][::-1]
-            next_infos = clip_infos[idx + 1:idx + 1 + max_adjacent]
-            info['prev'] = [adjacent_view(x) for x in prev_infos]
-            info['next'] = [adjacent_view(x) for x in next_infos]
+            if adjacent_mode == 'dense':
+                prev_infos = clip_infos[max(0, idx - max_adjacent):idx][::-1]
+                next_infos = clip_infos[idx + 1:idx + 1 + max_adjacent]
+                info['prev'] = [adjacent_view(x) for x in prev_infos]
+                info['next'] = [adjacent_view(x) for x in next_infos]
+                continue
+
+            prev_views: List[Dict] = []
+            next_views: List[Dict] = []
+            key_ts = int(info['timestamp'])
+            for offset_us in adjacent_time_offsets_us:
+                prev_info = closest_temporal_info(
+                    clip_infos, timestamps, key_ts - int(offset_us), start=0, end=idx)
+                if prev_info is not None:
+                    prev_views.append(adjacent_view(
+                        prev_info,
+                        target_time_offset_us=offset_us,
+                        actual_time_offset_us=key_ts - int(prev_info['timestamp'])))
+
+                next_info = closest_temporal_info(
+                    clip_infos, timestamps, key_ts + int(offset_us), start=idx + 1, end=clip_len)
+                if next_info is not None:
+                    next_views.append(adjacent_view(
+                        next_info,
+                        target_time_offset_us=offset_us,
+                        actual_time_offset_us=int(next_info['timestamp']) - key_ts))
+            info['prev'] = prev_views
+            info['next'] = next_views
+
+
+def normalize_adjacent_time_offsets(offsets: Sequence[int]) -> List[int]:
+    """清洗用户输入的相邻帧目标时间差，单位是微秒。"""
+    values = sorted({int(x) for x in offsets if int(x) > 0})
+    if not values:
+        raise ValueError('adjacent time offsets must contain at least one positive value')
+    return values
 
 
 def build_info_for_label(
@@ -768,6 +1104,7 @@ def build_info_for_label(
     camera_ids: Sequence[str],
     classes: Sequence[str],
     keep_empty: bool,
+    image_size_override: Optional[Tuple[int, int]],
     pose_index: Optional[OdomPoseIndex],
     max_pose_match_us: int,
     stats: ConversionStats,
@@ -790,7 +1127,8 @@ def build_info_for_label(
 
     cams = {}
     for cam_id in camera_ids:
-        cams[cam_id] = build_camera_info(camera_templates[cam_id], image_map[cam_id], data_root)
+        cams[cam_id] = build_camera_info(
+            camera_templates[cam_id], image_map[cam_id], data_root, image_size_override)
 
     label_ts = ann['timestamp']
     pose_info = select_frame_pose(
@@ -804,8 +1142,11 @@ def build_info_for_label(
     else:
         stats.labels_with_pose += 1
 
-    token = f'{ref.dataset}_{ref.sequence}_{ref.clip}_{label_ts}'
-    clip_uid = f'{ref.dataset}/{ref.sequence}/{ref.clip}'
+    # N7 clip 名通常已经包含日期和采集序列，例如 20251031_164821_1。
+    # token 使用 clip + lidar 时间戳，clip_id 直接使用 clip 做时序分组边界。
+    # 如果以后接入 clip 名不全局唯一的数据源，再把 clip_id 扩展回完整路径。
+    token = f'{ref.clip}_{label_ts}'
+    clip_uid = ref.clip
     info = {
         'token': token,
         'timestamp': label_ts,
@@ -839,7 +1180,10 @@ def process_clip(
     max_match_us: int,
     max_pose_match_us: int,
     max_adjacent: int,
+    adjacent_mode: str,
+    adjacent_time_offsets_us: Sequence[int],
     keep_empty: bool,
+    image_size_override: Optional[Tuple[int, int]],
 ) -> Tuple[List[Dict], ConversionStats]:
     stats = ConversionStats(clips_total=1)
     paths = resolve_clip_paths(data_root, ref)
@@ -851,6 +1195,7 @@ def process_clip(
     # label JSON 对齐。因此默认直接精确查找 frames/<label_ts>，避免误把标签
     # 关联到相邻 lidar 帧。最近邻匹配仅作为旧数据导出的兼容选项保留。
     matcher = TimestampMatcher(frames_dir) if frame_match_mode == 'nearest' else None
+    frame_index = build_frame_index(frames_dir) if frame_match_mode == 'exact' else None
 
     odom_path = resolve_odom_path(data_root, ref, frames_dir)
     pose_index = OdomPoseIndex(odom_path) if odom_path is not None else None
@@ -859,7 +1204,7 @@ def process_clip(
         logger.debug('Loaded %d odom poses from %s', len(pose_index.items), odom_path)
 
     infos: List[Dict] = []
-    for label_path in sorted(label_dir.glob('*.json')):
+    for label_path in sorted_json_files(label_dir):
         stats.labels_total += 1
         try:
             label_ts = timestamp_from_path(label_path)
@@ -867,8 +1212,8 @@ def process_clip(
             payload = annotation_payload(load_json(label_path))
             label_ts = int(payload.get('frame_timestamp', 0))
         if frame_match_mode == 'exact':
-            frame_dir = frames_dir / str(label_ts)
-            if not frame_dir.exists():
+            frame_dir = frame_index.get(label_ts) if frame_index is not None else None
+            if frame_dir is None:
                 stats.labels_without_frame += 1
                 continue
             frame_ts = label_ts
@@ -889,6 +1234,7 @@ def process_clip(
                 camera_ids=camera_ids,
                 classes=classes,
                 keep_empty=keep_empty,
+                image_size_override=image_size_override,
                 pose_index=pose_index,
                 max_pose_match_us=max_pose_match_us,
                 stats=stats,
@@ -900,7 +1246,11 @@ def process_clip(
             infos.append(info)
 
     infos.sort(key=lambda x: x['timestamp'])
-    link_adjacent_infos(infos, max_adjacent=max_adjacent)
+    link_adjacent_infos(
+        infos,
+        max_adjacent=max_adjacent,
+        adjacent_mode=adjacent_mode,
+        adjacent_time_offsets_us=adjacent_time_offsets_us)
     return infos, stats
 
 
@@ -915,6 +1265,11 @@ def make_metadata(
     max_match_us: int,
     max_pose_match_us: int,
     max_adjacent: int,
+    adjacent_mode: str,
+    adjacent_time_offsets_us: Sequence[int],
+    output_scope: str,
+    name_date: str,
+    image_size_override: Optional[Tuple[int, int]],
 ) -> Dict:
     return {
         'version': 'custom-fastbev-n7-od',
@@ -934,19 +1289,83 @@ def make_metadata(
         'max_match_us': max_match_us,
         'max_pose_match_us': max_pose_match_us,
         'max_adjacent': max_adjacent,
+        'adjacent_mode': adjacent_mode,
+        'adjacent_time_offsets_us': list(adjacent_time_offsets_us),
+        'output_scope': output_scope,
+        'output_name_date': name_date,
+        'image_size_override': list(image_size_override) if image_size_override is not None else None,
+        'camera_intrinsic_sizes': camera_intrinsic_size_summary(calib, camera_ids),
+        'camera_image_size': (
+            {'height': int(image_size_override[0]), 'width': int(image_size_override[1])}
+            if image_size_override is not None else None
+        ),
+        'camera_intrinsic_size_source': 'info_json sensor width/height; 推荐优先使用原始标定尺寸 info_json，当前脚本会把该尺寸写入每个 camera 条目',
+        'camera_image_size_source': '--image-size override or actual image file header',
         'stats': stats.as_dict(),
         'lidar_main_mixed_to_ego': lidar_main_metadata(calib),
     }
 
 
+def sanitize_filename_part(value: str) -> str:
+    """把数据集/序列/clip 名清洗成适合放入 pkl 文件名的片段。"""
+    value = str(value).strip()
+    cleaned = ''.join(ch if (ch.isalnum() or ch in ('-', '_', '.')) else '_' for ch in value)
+    return cleaned.strip('_') or 'unknown'
+
+
+def output_scope_from_refs(refs: Sequence[ClipRef], dataset_names: Sequence[str]) -> str:
+    """根据本次转换覆盖的数据范围生成文件名中的 scope。
+
+    规则按业务语义从大到小判断：多个 dataset 时使用 dataset 列表；单 dataset
+    内如果只有一个 clip，则使用 clip；多个 clip 但同一个 sequence，则使用
+    sequence；多个 sequence 但同一个 dataset，则使用 dataset。
+    """
+    ref_list = list(refs)
+    datasets = sorted({x.dataset for x in ref_list if x.dataset}, key=natural_sort_key)
+    if not datasets:
+        datasets = sorted({str(x) for x in dataset_names if str(x)}, key=natural_sort_key)
+    clips = sorted({x.clip for x in ref_list if x.clip}, key=natural_sort_key)
+    sequences = sorted({x.sequence for x in ref_list if x.sequence}, key=natural_sort_key)
+
+    if len(datasets) > 1:
+        scope = '-'.join(datasets)
+    elif len(clips) == 1:
+        scope = clips[0]
+    elif len(sequences) == 1:
+        scope = sequences[0]
+    elif len(datasets) == 1:
+        scope = datasets[0]
+    else:
+        scope = 'multi_dataset'
+    return sanitize_filename_part(scope)
+
+
+def output_pkl_path(out_dir: Path, extra_tag: str, scope: str, set_name: str, name_date: str) -> Path:
+    """生成语义化 pkl 文件名：{tag}_{scope}_infos_{set}_{YYYYMMDD}.pkl。"""
+    tag = sanitize_filename_part(extra_tag)
+    set_part = sanitize_filename_part(set_name)
+    date_part = sanitize_filename_part(name_date)
+    return out_dir / f'{tag}_{scope}_infos_{set_part}_{date_part}.pkl'
+
+
 def save_pkl(infos: List[Dict], metadata: Dict, out_path: Path, dry_run: bool) -> None:
+    summary_path = out_path.with_suffix('.summary.json')
+    summary = {
+        'pkl_path': str(out_path),
+        'infos': len(infos),
+        'metadata': metadata,
+    }
     if dry_run:
         logger.info('Dry-run: would write %d infos to %s', len(infos), out_path)
+        logger.info('Dry-run: would write summary to %s', summary_path)
         return
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open('wb') as f:
         pickle.dump({'infos': infos, 'metadata': metadata}, f)
+    with summary_path.open('w', encoding='utf-8') as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
     logger.info('Wrote %d infos to %s', len(infos), out_path)
+    logger.info('Wrote summary to %s', summary_path)
 
 
 def convert_one_set(
@@ -963,18 +1382,24 @@ def convert_one_set(
     max_match_us: int,
     max_pose_match_us: int,
     max_adjacent: int,
+    adjacent_mode: str,
+    adjacent_time_offsets_us: Sequence[int],
+    name_date: str,
     keep_empty: bool,
+    image_size_override: Optional[Tuple[int, int]],
     separate: bool,
     dry_run: bool,
 ) -> None:
     per_dataset: Dict[str, List[Dict]] = {}
     per_dataset_stats: Dict[str, ConversionStats] = {}
+    per_dataset_refs: Dict[str, List[ClipRef]] = {}
 
     for dataset_name in dataset_names:
         refs = load_refs_for_set(data_root, dataset_name, set_name)
         if not refs:
             logger.warning('No clips found for dataset=%s set=%s', dataset_name, set_name)
             continue
+        per_dataset_refs[dataset_name] = refs
         infos: List[Dict] = []
         stats = ConversionStats()
         for ref in tqdm(refs, desc=f'{dataset_name}/{set_name}'):
@@ -988,7 +1413,10 @@ def convert_one_set(
                 max_match_us=max_match_us,
                 max_pose_match_us=max_pose_match_us,
                 max_adjacent=max_adjacent,
+                adjacent_mode=adjacent_mode,
+                adjacent_time_offsets_us=adjacent_time_offsets_us,
                 keep_empty=keep_empty,
+                image_size_override=image_size_override,
             )
             infos.extend(clip_infos)
             stats.merge(clip_stats)
@@ -998,47 +1426,65 @@ def convert_one_set(
         logger.info('dataset=%s set=%s infos=%d stats=%s', dataset_name, set_name, len(infos), stats.as_dict())
 
         if separate:
+            output_scope = output_scope_from_refs(refs, [dataset_name])
             metadata = make_metadata(
                 classes, camera_ids, calib, stats, set_name, [dataset_name],
-                frame_match_mode, max_match_us, max_pose_match_us, max_adjacent)
-            save_pkl(infos, metadata, out_dir / f'{extra_tag}_{dataset_name}_infos_{set_name}.pkl', dry_run)
+                frame_match_mode, max_match_us, max_pose_match_us, max_adjacent,
+                adjacent_mode, adjacent_time_offsets_us, output_scope, name_date, image_size_override)
+            save_pkl(infos, metadata, output_pkl_path(out_dir, extra_tag, output_scope, set_name, name_date), dry_run)
 
     if separate:
         return
 
     merged_infos: List[Dict] = []
+    merged_refs: List[ClipRef] = []
     merged_stats = ConversionStats()
     for dataset_name in dataset_names:
         merged_infos.extend(deepcopy(per_dataset.get(dataset_name, [])))
+        merged_refs.extend(per_dataset_refs.get(dataset_name, []))
         if dataset_name in per_dataset_stats:
             merged_stats.merge(per_dataset_stats[dataset_name])
     merged_infos.sort(key=lambda x: x['timestamp'])
+    output_scope = output_scope_from_refs(merged_refs, dataset_names)
     metadata = make_metadata(
         classes, camera_ids, calib, merged_stats, set_name, dataset_names,
-        frame_match_mode, max_match_us, max_pose_match_us, max_adjacent)
+        frame_match_mode, max_match_us, max_pose_match_us, max_adjacent,
+        adjacent_mode, adjacent_time_offsets_us, output_scope, name_date, image_size_override)
     if not merged_infos:
         logger.warning('set=%s produced no infos; skipping output', set_name)
         return
-    save_pkl(merged_infos, metadata, out_dir / f'{extra_tag}_infos_{set_name}.pkl', dry_run)
+    save_pkl(merged_infos, metadata, output_pkl_path(out_dir, extra_tag, output_scope, set_name, name_date), dry_run)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='将 N7 3D_OD 自采数据转换为 Fast-BEV CustomMultiViewDataset 可用的 pkl 文件',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=RawDefaultsHelpFormatter,
         epilog=(
             '示例：\n'
-            '  python tools/data_converter/n7_raw_3dod_to_fastbev_pkl.py '
-            '--data-path /data/N7 '
-            '--datasets 2025_04_18_2k '
+            '  # 704x256 缓存图：K 仍来自 info_json 标定尺寸，图片实际尺寸通过 --image-size 写入 pkl\n'
+            '  python tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py '
+            '--data-path data/N7_704_256 '
+            '--datasets 20251031 '
             '--sets train val '
             '--info-json data/info_json/2025_04_18_2k_byd_info.json '
-            '--output-dir /data/N7/fastbev_pkl '
-            '--extra-tag custom_fastbev\n\n'
+            '--output-dir data/N7_704_256/pkl '
+            '--extra-tag custom_fastbev '
+            '--image-size 256 704\n\n'
+            '  # 原始 1600x900 图：可省略 --image-size，或为了减少 header IO 显式填写\n'
+            '  python tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py '
+            '--data-path data/nuscenes '
+            '--datasets 20251031 '
+            '--sets train val '
+            '--info-json data/info_json/2025_04_18_2k_byd_info.json '
+            '--output-dir data/nuscenes/pkl/od_2k '
+            '--extra-tag custom_fastbev '
+            '--image-size 900 1600\n\n'
             '随后使用可视化脚本检查 pkl：\n'
-            '  python new_tool/draw_gt_pkl.py '
-            '--pkl /data/N7/fastbev_pkl/custom_fastbev_infos_train.pkl '
-            '--data-root /data/N7 '
-            '--output-dir /data/N7/fastbev_vis/train'
+            '  python tools/data_converter/n7/visualize_n7_fastbev_pkl.py '
+            '--pkl data/N7_704_256/pkl/custom_fastbev_20251031_infos_train_20260624.pkl '
+            '--data-root data/N7_704_256 '
+            '--output-dir work_dirs/vis_n7_704_check '
+            '--no-render --check-geometry --check-temporal-geometry --strict-geometry'
         ))
     parser.add_argument('--data-type', default='od', choices=['od'], help='仅支持 3D 障碍物 od 数据。')
     parser.add_argument('--data-path', required=True, help='N7 数据根目录，通常为 ./data/nuscenes。')
@@ -1046,16 +1492,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sets', nargs='+', default=['train', 'val', 'test'])
     parser.add_argument('--info-json', required=True, help='N7 传感器标定 json。')
     parser.add_argument('--output-dir', default='./data/nuscenes')
-    parser.add_argument('--extra-tag', default='custom_fastbev', help='输出 pkl 前缀：{tag}_infos_{set}.pkl。')
+    parser.add_argument('--extra-tag', default='custom_fastbev', help='输出 pkl 前缀，最终文件名为 {tag}_{scope}_infos_{set}_{YYYYMMDD}.pkl。')
     parser.add_argument('--template-pkl', default=None, help='已废弃且会被忽略，仅为兼容旧命令保留。')
     parser.add_argument('--frame-match-mode', choices=['exact', 'nearest'], default='exact', help='label JSON 与 parsed_data/frames 的匹配方式：默认按 lidar 时间戳精确匹配，也可选择最近邻。')
     parser.add_argument('--max-match-us', type=int, default=50000, help='label/frame 最大时间戳差，单位微秒；仅在 --frame-match-mode nearest 时生效。')
     parser.add_argument('--max-pose-match-us', type=int, default=50000, help='label/SLAM pose 最大时间戳差，单位微秒。')
-    parser.add_argument('--max-adj', '--max-adjacent', dest='max_adjacent', type=int, default=60)
-    parser.add_argument('--interval', type=int, default=3, help='为兼容性写入 metadata；相邻帧在 pkl 中按稠密方式保存。')
+    parser.add_argument('--max-adj', '--max-adjacent', dest='max_adjacent', type=int, default=60, help='dense 模式下每帧最多保留的前后相邻帧数量；time 模式主要由 --adjacent-time-offsets-us 控制。')
+    parser.add_argument('--adjacent-mode', choices=['time', 'dense'], default='time', help='时序相邻帧构建方式：time 按目标时间差选帧，dense 按稠密相邻帧下标选帧。')
+    parser.add_argument('--adjacent-time-offsets-us', nargs='+', type=int, default=DEFAULT_ADJACENT_TIME_OFFSETS_US, help='time 模式下为每个 key frame 选择历史/未来帧的目标时间差，单位微秒。默认约为 0.5s/1.0s/1.5s。')
+    parser.add_argument('--interval', type=int, default=3, help='兼容旧命令参数；当前相邻帧构建由 --adjacent-mode 控制。')
     parser.add_argument('--camera-ids', nargs='+', default=CAMERA_ORDER, choices=CAMERA_ORDER)
     parser.add_argument('--classes', nargs='+', default=FASTBEV_CLASSES)
     parser.add_argument('--keep-empty', action='store_true', help='保留没有有效 3D box 的帧。')
+    parser.add_argument('--image-size', nargs=2, type=int, metavar=('HEIGHT', 'WIDTH'), default=None, help='当前 data_path 指向图片的实际尺寸，例如 704 缓存图传 --image-size 256 704。若不传则逐张读取图片 header。')
     parser.add_argument('--separate', '-s', action='store_true', help='每个 dataset/set 单独写一个 pkl，而不是按 set 合并多个数据集。')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--multiprocessing', action='store_true', help='兼容旧命令参数，当前会被忽略。')
@@ -1083,12 +1532,20 @@ def main() -> None:
 
     calib = load_json(calib_path)
     camera_templates = build_camera_templates(calib, args.camera_ids)
+    adjacent_time_offsets_us = normalize_adjacent_time_offsets(args.adjacent_time_offsets_us)
+    image_size_override = tuple(args.image_size) if args.image_size is not None else None
+    name_date = datetime.now().strftime('%Y%m%d')
     logger.info('data_root=%s', data_root)
     logger.info('datasets=%s sets=%s', args.datasets, args.sets)
     logger.info('camera_ids=%s', args.camera_ids)
     logger.info('coordinate=mmdet3d_lidar:x_front_y_left_z_up origin=N7_top_lidar')
     logger.info('frame matching mode=%s max_match_us=%s', args.frame_match_mode, args.max_match_us)
     logger.info('pose matching max_pose_match_us=%s', args.max_pose_match_us)
+    logger.info('adjacent mode=%s time_offsets_us=%s max_adjacent=%s', args.adjacent_mode, adjacent_time_offsets_us, args.max_adjacent)
+    logger.info('output name date=%s', name_date)
+    logger.info('image_size_override=%s', image_size_override)
+    if image_size_override is None:
+        logger.warning('未设置 --image-size，converter 会逐帧读取图片 header；22W 帧全量转换建议显式传入图片尺寸。')
 
     for set_name in args.sets:
         convert_one_set(
@@ -1105,7 +1562,11 @@ def main() -> None:
             max_match_us=args.max_match_us,
             max_pose_match_us=args.max_pose_match_us,
             max_adjacent=args.max_adjacent,
+            adjacent_mode=args.adjacent_mode,
+            adjacent_time_offsets_us=adjacent_time_offsets_us,
+            name_date=name_date,
             keep_empty=args.keep_empty,
+            image_size_override=image_size_override,
             separate=args.separate,
             dry_run=args.dry_run,
         )
