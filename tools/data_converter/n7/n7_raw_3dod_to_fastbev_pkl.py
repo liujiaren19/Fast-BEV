@@ -95,13 +95,10 @@ key frame lidar 坐标系，从而尽量复刻原 Fast-BEV nuScenes 时序输入
         --extra-tag custom_fastbev \
         --image-size 900 1600
 
-    # 转换后建议先做几何校验，再抽帧可视化。
-    python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
+    # 转换后建议先做几何/时序字段校验，再抽帧可视化。
+    python tools/data_converter/n7/validate_n7_fastbev_pkl.py \
         --pkl data/N7_704_256/pkl/custom_fastbev_20251031_infos_train_20260624.pkl \
-        --data-root data/N7_704_256 \
-        --output-dir work_dirs/vis_n7_704_check \
-        --no-render \
-        --check-geometry \
+        --output-dir work_dirs/validate_n7_704 \
         --check-temporal-geometry \
         --strict-geometry
 """
@@ -1479,12 +1476,11 @@ def parse_args() -> argparse.Namespace:
             '--output-dir data/nuscenes/pkl/od_2k '
             '--extra-tag custom_fastbev '
             '--image-size 900 1600\n\n'
-            '随后使用可视化脚本检查 pkl：\n'
-            '  python tools/data_converter/n7/visualize_n7_fastbev_pkl.py '
+            '随后使用校验脚本检查 pkl 几何/时序字段：\n'
+            '  python tools/data_converter/n7/validate_n7_fastbev_pkl.py '
             '--pkl data/N7_704_256/pkl/custom_fastbev_20251031_infos_train_20260624.pkl '
-            '--data-root data/N7_704_256 '
-            '--output-dir work_dirs/vis_n7_704_check '
-            '--no-render --check-geometry --check-temporal-geometry --strict-geometry'
+            '--output-dir work_dirs/validate_n7_704 '
+            '--check-temporal-geometry --strict-geometry'
         ))
     parser.add_argument('--data-type', default='od', choices=['od'], help='仅支持 3D 障碍物 od 数据。')
     parser.add_argument('--data-path', required=True, help='N7 数据根目录，通常为 ./data/nuscenes。')

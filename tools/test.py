@@ -104,6 +104,15 @@ def parse_args():
         action='store_true',
         help='whether debug')
     parser.add_argument('--debug_num', type=int, default=50)
+    parser.add_argument(
+        '--profile-test',
+        action='store_true',
+        help='print test dataloader / forward / postprocess timing')
+    parser.add_argument(
+        '--profile-interval',
+        type=int,
+        default=20,
+        help='print one profile line every N test batches')
     
     parser.add_argument('--extrinsic-noise', '-n', type=float, default=0)
     
@@ -223,14 +232,28 @@ def main():
 
     if not distributed:
         model = MMDataParallel(model, device_ids=[0])
-        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir, debug=args.debug)
+        outputs = single_gpu_test(
+            model,
+            data_loader,
+            args.show,
+            args.show_dir,
+            debug=args.debug,
+            profile=args.profile_test,
+            profile_interval=args.profile_interval)
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
-        outputs = multi_gpu_test(model, data_loader, args.tmpdir,
-                                 args.gpu_collect, debug=args.debug, debug_num=args.debug_num)
+        outputs = multi_gpu_test(
+            model,
+            data_loader,
+            args.tmpdir,
+            args.gpu_collect,
+            debug=args.debug,
+            debug_num=args.debug_num,
+            profile=args.profile_test,
+            profile_interval=args.profile_interval)
 
     rank, _ = get_dist_info()
     if rank == 0:

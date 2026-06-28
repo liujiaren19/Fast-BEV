@@ -177,6 +177,20 @@ class FastBEV(BaseDetector):
         input_dict = {name: input_data[i] for i, name in enumerate(input_names)}
         return session.run(None, input_dict)
 
+    @staticmethod
+    def _slice_view_meta(img_meta, start, end):
+        img_meta = copy.deepcopy(img_meta)
+        lidar2img = img_meta.get("lidar2img", {})
+        for key in ("extrinsic", "lidar2img_aug", "lidar2img_extra"):
+            value = lidar2img.get(key)
+            if isinstance(value, list):
+                lidar2img[key] = value[start:end]
+        for key in ("img_shape", "ori_shape", "pad_shape", "img_info", "filename"):
+            value = img_meta.get(key)
+            if isinstance(value, list) and len(value) >= end:
+                img_meta[key] = value[start:end]
+        return img_meta
+
     def _resize_feature(self, feat, size):
         kwargs = dict(size=size, mode=self.feature_resize_mode)
         if self.feature_resize_mode == 'bilinear':
@@ -378,19 +392,19 @@ class FastBEV(BaseDetector):
                     if profile:
                         # meta 计时覆盖 deepcopy 和按当前时序帧切分相机内外参等元信息。
                         profile_stage = self._profile_now()
-                    img_meta = copy.deepcopy(seq_img_meta)
                     start = seq_id * self.n_images
                     end = (seq_id + 1) * self.n_images
-                    img_meta["lidar2img"]["extrinsic"] = img_meta["lidar2img"]["extrinsic"][start:end]
+                    img_meta = self._slice_view_meta(seq_img_meta, start, end)
                     assert len(img_meta["lidar2img"]["extrinsic"]) == self.n_images, (
                         f'seq_id={seq_id} expected {self.n_images} extrinsics, '
                         f'got {len(img_meta["lidar2img"]["extrinsic"])}')
                     for key in ('lidar2img_aug', 'lidar2img_extra'):
                         value = img_meta["lidar2img"].get(key)
                         if isinstance(value, list):
-                            img_meta["lidar2img"][key] = value[start:end]
+                            assert len(value) == self.n_images, (
+                                f'seq_id={seq_id} expected {self.n_images} {key} entries, '
+                                f'got {len(value)}')
                     if isinstance(img_meta["img_shape"], list):
-                        img_meta["img_shape"] = img_meta["img_shape"][start:end]
                         assert len(img_meta["img_shape"]) == self.n_images, (
                             f'seq_id={seq_id} expected {self.n_images} image shapes, '
                             f'got {len(img_meta["img_shape"])}')
@@ -705,19 +719,23 @@ class FastBEV(BaseDetector):
         return bbox_results
 
     def aug_test(self, imgs, img_metas):
-        img_shape_copy = copy.deepcopy(img_metas[0]['img_shape'])
-        extrinsic_copy = copy.deepcopy(img_metas[0]['lidar2img']['extrinsic'])
-
         x_list = []
         img_metas_list = []
-        n_tta_imgs = len(extrinsic_copy) // 2
-        for tta_id in range(2):
+        n_tta = 2
+        total_views = len(img_metas[0]['lidar2img']['extrinsic'])
+        assert total_views % n_tta == 0, 'TTA 输入视角数必须能按增强次数整除'
+        n_tta_imgs = total_views // n_tta
+        for tta_id in range(n_tta):
+            start = n_tta_imgs * tta_id
+            end = n_tta_imgs * (tta_id + 1)
+            cur_img_metas = [
+                self._slice_view_meta(img_meta, start, end)
+                for img_meta in img_metas
+            ]
+            img_metas_list.append(cur_img_metas)
 
-            img_metas[0]['img_shape'] = img_shape_copy[n_tta_imgs*tta_id:n_tta_imgs*(tta_id+1)]
-            img_metas[0]['lidar2img']['extrinsic'] = extrinsic_copy[n_tta_imgs*tta_id:n_tta_imgs*(tta_id+1)]
-            img_metas_list.append(img_metas)
-
-            feature_bev, _, _ = self.extract_feat(imgs[:, n_tta_imgs*tta_id:n_tta_imgs*(tta_id+1)], img_metas, "test")
+            feature_bev, _, _ = self.extract_feat(
+                imgs[:, start:end], cur_img_metas, "test")
             x = self.bbox_head(feature_bev)
             x_list.append(x)
 

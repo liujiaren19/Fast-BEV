@@ -16,12 +16,35 @@ import torch.distributed as dist
 import ipdb
 
 
+def _sync_cuda_for_profile():
+    """同步 CUDA 队列，确保 profile 计时能覆盖真实 GPU 前向耗时。"""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _format_profile(prefix, iter_id, batch_size, data_time, forward_time,
+                    post_time, iter_time, avg_data, avg_forward, avg_post,
+                    avg_iter, sample_count):
+    """格式化 test profile 输出，便于从日志直接判断瓶颈。"""
+    throughput = batch_size / max(iter_time, 1e-6)
+    avg_throughput = sample_count / max(avg_iter * max(iter_id + 1, 1), 1e-6)
+    print(
+        '{} #{:05d} batch={} data={:.3f}s forward={:.3f}s post={:.3f}s '
+        'iter={:.3f}s task/s={:.2f} | avg data={:.3f}s forward={:.3f}s '
+        'post={:.3f}s iter={:.3f}s task/s={:.2f}'.format(
+            prefix, iter_id, batch_size, data_time, forward_time, post_time,
+            iter_time, throughput, avg_data, avg_forward, avg_post, avg_iter,
+            avg_throughput))
+
+
 def single_gpu_test(model,
                     data_loader,
                     show=False,
                     out_dir=None,
                     show_score_thr=0.3,
-                    debug=False):
+                    debug=False,
+                    profile=False,
+                    profile_interval=20):
     """Test model with single gpu.
 
     This method tests model with single gpu and gives the 'show' option.
@@ -47,13 +70,30 @@ def single_gpu_test(model,
     if debug:
         for i in range(5):
             print('#### debug mode in api/test.py, only 30 images ####')
+    profile_interval = max(int(profile_interval), 1)
+    total_data_time = 0.0
+    total_forward_time = 0.0
+    total_post_time = 0.0
+    total_iter_time = 0.0
+    total_samples = 0
+    end = time.time()
+
     for i, data in enumerate(data_loader):
+        data_time = time.time() - end
         if debug:
             if i > 30:
                 return results
+
+        if profile:
+            _sync_cuda_for_profile()
+        forward_start = time.time()
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
+        if profile:
+            _sync_cuda_for_profile()
+        forward_time = time.time() - forward_start
 
+        post_start = time.time()
         if show:
             # Visualize the results of MMDetection3D model
             # 'show_results' is MMdetection3D visualization API
@@ -98,10 +138,28 @@ def single_gpu_test(model,
         batch_size = len(result)
         for _ in range(batch_size):
             prog_bar.update()
+
+        post_time = time.time() - post_start
+        iter_time = time.time() - end
+        total_data_time += data_time
+        total_forward_time += forward_time
+        total_post_time += post_time
+        total_iter_time += iter_time
+        total_samples += batch_size
+        if profile and (i == 0 or (i + 1) % profile_interval == 0):
+            denom = float(i + 1)
+            _format_profile(
+                '[TEST_PROFILE single]', i, batch_size, data_time,
+                forward_time, post_time, iter_time, total_data_time / denom,
+                total_forward_time / denom, total_post_time / denom,
+                total_iter_time / denom, total_samples)
+        end = time.time()
     return results
 
 
-def multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, debug=False, debug_num=50):
+def multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False,
+                   debug=False, debug_num=50, profile=False,
+                   profile_interval=20):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
     under two different modes: gpu and cpu modes. By setting 'gpu_collect=True'
@@ -130,23 +188,56 @@ def multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, debug=Fal
         for i in range(5):
             print('#### debug mode in api/test.py, only {} images ####'.format(num_img))
 
+    profile_interval = max(int(profile_interval), 1)
+    total_data_time = 0.0
+    total_forward_time = 0.0
+    total_post_time = 0.0
+    total_iter_time = 0.0
+    total_samples = 0
+    end = time.time()
+
     # ipdb.set_trace()
     for i, data in enumerate(data_loader):
+        data_time = time.time() - end
         if debug and world_size == 1:
             if i > num_img:
                 return results
+
+        _sync_cuda_for_profile()
+        forward_start = time.time()
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
             # encode mask results
             # if isinstance(result[0], tuple):
             #     result = [(bbox_results, encode_mask_results(mask_results))
             #               for bbox_results, mask_results in result]
+        _sync_cuda_for_profile()
+        forward_time = time.time() - forward_start
+
+        post_start = time.time()
         results.extend(result)
 
         if rank == 0:
             batch_size = len(result)
             for _ in range(batch_size * world_size):
                 prog_bar.update()
+
+            post_time = time.time() - post_start
+            iter_time = time.time() - end
+            total_data_time += data_time
+            total_forward_time += forward_time
+            total_post_time += post_time
+            total_iter_time += iter_time
+            total_samples += batch_size * world_size
+            if profile and (i == 0 or (i + 1) % profile_interval == 0):
+                denom = float(i + 1)
+                _format_profile(
+                    '[TEST_PROFILE dist-rank0]', i, batch_size * world_size,
+                    data_time, forward_time, post_time, iter_time,
+                    total_data_time / denom, total_forward_time / denom,
+                    total_post_time / denom, total_iter_time / denom,
+                    total_samples)
+        end = time.time()
 
     # collect results from all ranks
     if gpu_collect:
