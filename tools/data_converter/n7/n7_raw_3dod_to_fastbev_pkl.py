@@ -399,9 +399,9 @@ def pose_vector_to_fastbev(pose: Sequence[float]) -> Dict:
         'raw_lidar2global_rotation_xyzw': arr[3:7].astype(np.float32).tolist(),
         'lidar2global_translation': tran_fastbev.astype(np.float32).tolist(),
         'lidar2global_rotation': rotation_to_wxyz(rot_fastbev),
-        # 当前 ego 暂时定义为 N7 顶部主 lidar 坐标系。后续如果迁移到后轴中心
-        # 地面投影点，需要同步更新 lidar 和 ego 两组字段；现在保持二者别名关系，
-        # 可以让 dataset 侧逻辑更接近原始 nuScenes 时序实现。
+        # 当前 ego 暂时定义为 N7 顶部主 lidar 坐标系。第三步迁移到后轴中心
+        # 地面投影点时，只需要更新 ego2global_*，不要影响当前 lidar2global_*
+        # 时序补偿链路。
         'ego2global_translation': tran_fastbev.astype(np.float32).tolist(),
         'ego2global_rotation': rotation_to_wxyz(rot_fastbev),
     }

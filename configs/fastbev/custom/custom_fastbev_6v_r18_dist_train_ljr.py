@@ -34,9 +34,6 @@ img_norm_cfg = dict(
 
 data_config = {
     'input_size': (256, 704),
-    # N7 标定内参对应 1600x900 图像；即使训练图片已经离线 resize 到
-    # 704x256，投影几何也必须按 1600x900 -> 704x256 缩放一次。
-    'force_resize_source_size': (900, 1600),
     'resize': (-0.06, 0.11),
     'crop': (-0.05, 0.05),
     'rot': (-5.4, 5.4),
@@ -71,8 +68,7 @@ train_pipeline = [
     dict(
         type='RandomAugImageMultiViewImage',
         data_config=data_config,
-        force_resize=True,
-        force_resize_source_size=data_config['force_resize_source_size']),
+        force_resize=True),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -88,8 +84,7 @@ test_pipeline = [
         type='RandomAugImageMultiViewImage',
         data_config=data_config,
         is_train=False,
-        force_resize=True,
-        force_resize_source_size=data_config['force_resize_source_size']),
+        force_resize=True),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names, with_label=False),
@@ -128,11 +123,13 @@ data = dict(
         **custom_dataset_common,
         pipeline=test_pipeline,
         test_mode=True,
+        samples_per_gpu=8,
         ann_file=data_root + f'{ann_file_prefix}_infos_val_{ann_date}.pkl'),
     test=dict(
         **custom_dataset_common,
         pipeline=test_pipeline,
         test_mode=True,
+        samples_per_gpu=8,
         ann_file=data_root + f'{ann_file_prefix}_infos_val_{ann_date}.pkl'))
 
 evaluation = dict(interval=5, metric=[0.25, 0.5])

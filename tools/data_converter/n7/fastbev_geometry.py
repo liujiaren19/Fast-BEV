@@ -39,18 +39,29 @@ def camera_dimension_fields(cam_info: Dict, image_shape: Optional[Tuple[int, int
     缓存图会出现二者不一致的情况，可视化时必须先把 K 从源尺寸缩到实际图片
     尺寸，再投影到图上。
     """
-    intrinsic_width = int(cam_info.get('intrinsic_width', cam_info.get('width', 0)) or 0)
-    intrinsic_height = int(cam_info.get('intrinsic_height', cam_info.get('height', 0)) or 0)
-    image_width = int(cam_info.get('image_width', intrinsic_width) or intrinsic_width or 0)
-    image_height = int(cam_info.get('image_height', intrinsic_height) or intrinsic_height or 0)
+    required_size_keys = (
+        'intrinsic_width', 'intrinsic_height', 'image_width', 'image_height')
+    missing_size_keys = [key for key in required_size_keys if key not in cam_info]
+    if missing_size_keys:
+        raise KeyError(
+            'N7 camera info missing required size fields: {}'.format(
+                ', '.join(missing_size_keys)))
+
+    intrinsic_width = int(cam_info['intrinsic_width'])
+    intrinsic_height = int(cam_info['intrinsic_height'])
+    image_width = int(cam_info['image_width'])
+    image_height = int(cam_info['image_height'])
+    if min(intrinsic_width, intrinsic_height, image_width, image_height) <= 0:
+        raise ValueError(
+            'N7 camera size fields must be positive: intrinsic={}x{}, image={}x{}'.format(
+                intrinsic_width, intrinsic_height, image_width, image_height))
 
     if image_shape is not None:
         loaded_height, loaded_width = [int(v) for v in image_shape[:2]]
-        if image_width > 0 and image_height > 0 and (image_width != loaded_width or image_height != loaded_height):
-            logger.debug(
-                'pkl image size %sx%s differs from loaded image size %sx%s; use loaded size for visualization',
-                image_width, image_height, loaded_width, loaded_height)
-        image_width, image_height = loaded_width, loaded_height
+        if image_width != loaded_width or image_height != loaded_height:
+            raise ValueError(
+                'pkl image size {}x{} differs from loaded image size {}x{}'.format(
+                    image_width, image_height, loaded_width, loaded_height))
 
     return dict(
         intrinsic_width=intrinsic_width,
@@ -188,10 +199,10 @@ def info_lidar2global(info: Dict) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     返回的位姿已经是 Fast-BEV 训练坐标轴下的 ``global_from_lidar``。这里的
     global 可以只是每个 clip 的局部参考系；时序补偿只需要相对运动，不依赖
     真实全局地图坐标。返回 ``None`` 表示可以逐帧可视化，但无法按原版 Fast-BEV
-    的方式做相邻帧运动补偿。
+    的方式做相邻帧运动补偿。新版 N7 pkl 只读取 ``lidar2global_*`` 字段。
     """
-    rot = info.get('lidar2global_rotation', info.get('ego2global_rotation'))
-    tran = info.get('lidar2global_translation', info.get('ego2global_translation'))
+    rot = info.get('lidar2global_rotation')
+    tran = info.get('lidar2global_translation')
     if rot is None or tran is None:
         return None
     return quat_wxyz_to_matrix(rot), np.asarray(tran, dtype=np.float32).reshape(3)

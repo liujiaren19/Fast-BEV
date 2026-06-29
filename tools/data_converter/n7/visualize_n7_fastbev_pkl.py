@@ -758,8 +758,6 @@ def camera_info_for_loaded_image(cam_info: Dict, image: np.ndarray) -> Dict:
     intrinsic_height = dims['intrinsic_height']
     image_width = dims['image_width']
     image_height = dims['image_height']
-    if intrinsic_width <= 0 or intrinsic_height <= 0 or image_width <= 0 or image_height <= 0:
-        return cam_info
 
     sx = image_width / float(intrinsic_width)
     sy = image_height / float(intrinsic_height)

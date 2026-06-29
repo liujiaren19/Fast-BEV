@@ -4,8 +4,9 @@
 这份配置用于 data/N7_704_256 数据根：
 - 图片已经离线从 1600x900 强制 resize 到 704x256。
 - info_json / pkl 中的相机内参仍保持 1600x900 标定，不要预先缩放 K。
-- RandomAugImageMultiViewImage 会通过 force_resize_source_size=(900, 1600)
-  把 1600x900 -> 704x256 的 post_rot 写入投影矩阵，保证几何只缩放一次。
+- 新版 pkl 必须写入 intrinsic_width/height 和 image_width/height；
+  RandomAugImageMultiViewImage 会按 intrinsic_* -> input_size 写入 post_rot，
+  保证几何只缩放一次。
 """
 
 _base_ = './custom_fastbev_6v_r18.py'

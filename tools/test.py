@@ -104,15 +104,6 @@ def parse_args():
         action='store_true',
         help='whether debug')
     parser.add_argument('--debug_num', type=int, default=50)
-    parser.add_argument(
-        '--profile-test',
-        action='store_true',
-        help='print test dataloader / forward / postprocess timing')
-    parser.add_argument(
-        '--profile-interval',
-        type=int,
-        default=20,
-        help='print one profile line every N test batches')
     
     parser.add_argument('--extrinsic-noise', '-n', type=float, default=0)
     
@@ -237,9 +228,7 @@ def main():
             data_loader,
             args.show,
             args.show_dir,
-            debug=args.debug,
-            profile=args.profile_test,
-            profile_interval=args.profile_interval)
+            debug=args.debug)
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
@@ -251,9 +240,7 @@ def main():
             args.tmpdir,
             args.gpu_collect,
             debug=args.debug,
-            debug_num=args.debug_num,
-            profile=args.profile_test,
-            profile_interval=args.profile_interval)
+            debug_num=args.debug_num)
 
     rank, _ = get_dist_info()
     if rank == 0:

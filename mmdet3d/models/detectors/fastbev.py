@@ -2,8 +2,6 @@
 import math
 import os
 import shutil
-# FASTBEV_PROFILE 计时依赖 time.perf_counter；正常训练不开启该开关时只保留轻量判断。
-import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +12,7 @@ from mmseg.models import build_head as build_seg_head
 from mmdet.models.detectors import BaseDetector
 from mmdet3d.core import bbox3d2result
 from mmseg.ops import resize
-from mmcv.runner import get_dist_info, auto_fp16
+from mmcv.runner import auto_fp16
 
 import copy
 import numpy as np
@@ -122,9 +120,6 @@ class FastBEV(BaseDetector):
         self.max_calibration_samples = max_calibration_samples
         self.onnx_custom_op_path = onnx_custom_op_path
         self._calibration_samples_saved = 0
-        # profile 计数器只限制前若干次打印，避免长时间训练持续做 CUDA 同步计时。
-        self._profile_extract_iter = 0
-        self._profile_train_iter = 0
         # BEV 网格点缓存用于复用相同 n_voxels/voxel_size/origin 下的体素中心点。
         self._points_cache = {}
         # checkpoint
@@ -219,23 +214,6 @@ class FastBEV(BaseDetector):
             self._points_cache[key] = cached
         return cached
 
-    @staticmethod
-    def _profile_enabled():
-        # 通过环境变量临时打开性能剖析，不改 config，便于在线上/调试脚本快速 A/B。
-        return os.getenv('FASTBEV_PROFILE', '0').lower() not in ('0', 'false', 'no', '')
-
-    @staticmethod
-    def _profile_limit():
-        # 默认只打印前 10 次，防止日志过多，也避免 profiling 的同步开销污染完整训练。
-        return int(os.getenv('FASTBEV_PROFILE_ITERS', '10'))
-
-    @staticmethod
-    def _profile_now():
-        # CUDA kernel 默认异步执行；计时前同步一次，才能看清各阶段真实耗时。
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return time.perf_counter()
-
     def _extract_onnx_backbone(self, img):
         if self.backbone_session is None:
             raise RuntimeError('ONNX backbone session 尚未初始化')
@@ -263,6 +241,9 @@ class FastBEV(BaseDetector):
         test_cfg = self.test_cfg or {}
         if not test_cfg.get('save_calibrate_data_flag', False):
             return
+        # backbone/head 共用同一个样本计数，避免校准脚本误拷全量数据。
+        if self._calibration_samples_saved >= self.max_calibration_samples:
+            return
         data_path = test_cfg.get('backbone_data_path')
         if not data_path or not img_metas:
             return
@@ -289,15 +270,6 @@ class FastBEV(BaseDetector):
         self._calibration_samples_saved += 1
 
     def extract_feat(self, img, img_metas, mode):
-        # extract_feat 是 FastBEV 训练最重的路径；这里按阶段统计二维特征、投影、点云网格、回投影和拼接耗时。
-        profile = self._profile_enabled() and self._profile_extract_iter < self._profile_limit()
-        profile_t0 = self._profile_now() if profile else None
-        profile_last = profile_t0
-        profile_meta = 0.0
-        profile_projection = 0.0
-        profile_points = 0.0
-        profile_backproject = 0.0
-        profile_stack = 0.0
         self._save_backbone_calibration(img_metas)
         batch_size = img.shape[0]
         img = img.reshape(
@@ -351,13 +323,6 @@ class FastBEV(BaseDetector):
                         mlvl_feats_.append(mlvl_feats[msid])
                 mlvl_feats = mlvl_feats_
 
-        if profile:
-            # 二维 backbone、neck 以及多尺度融合整体计为 backbone_neck_fuse。
-            profile_backbone = self._profile_now() - profile_last
-            profile_last = self._profile_now()
-        else:
-            profile_backbone = 0.0
-
         if isinstance(self.n_voxels, list) and len(mlvl_feats) < len(self.n_voxels):
             pad_feats = len(self.n_voxels) - len(mlvl_feats)
             for _ in range(pad_feats):
@@ -365,6 +330,15 @@ class FastBEV(BaseDetector):
 
         mlvl_volumes = []
         deploy_head_inputs = []
+        test_cfg = self.test_cfg or {}
+        need_save_head_calibration = (
+            test_cfg.get('save_calibrate_data_flag', False)
+            and self._calibration_samples_saved < self.max_calibration_samples
+        )
+        need_deploy_head_inputs = (
+            mode in ['test_onnx', 'test_custom']
+            or need_save_head_calibration
+        )
         for lvl, mlvl_feat in enumerate(mlvl_feats):
             stride_i = math.ceil(img.shape[-1] / mlvl_feat.shape[-1])
             total_views = mlvl_feat.shape[0] // batch_size
@@ -389,9 +363,6 @@ class FastBEV(BaseDetector):
                 volumes = []
                 for batch_id, seq_img_meta in enumerate(img_metas):
                     feat_i = mlvl_feat_split[seq_id][batch_id]
-                    if profile:
-                        # meta 计时覆盖 deepcopy 和按当前时序帧切分相机内外参等元信息。
-                        profile_stage = self._profile_now()
                     start = seq_id * self.n_images
                     end = (seq_id + 1) * self.n_images
                     img_meta = self._slice_view_meta(seq_img_meta, start, end)
@@ -411,16 +382,10 @@ class FastBEV(BaseDetector):
                         img_meta["img_shape"] = img_meta["img_shape"][0]
                     height = math.ceil(img_meta["img_shape"][0] / stride_i)
                     width = math.ceil(img_meta["img_shape"][1] / stride_i)
-                    if profile:
-                        profile_meta += self._profile_now() - profile_stage
-                        profile_stage = self._profile_now()
 
                     # projection 由当前时序帧的 lidar2img 外参、图像增强矩阵和特征 stride 共同决定。
                     projection = self._compute_projection(
                         img_meta, stride_i, noise=self.extrinsic_noise).to(feat_i.device)
-                    if profile:
-                        profile_projection += self._profile_now() - profile_stage
-                        profile_stage = self._profile_now()
                     if self.style in ['v1', 'v2']:
                         n_voxels, voxel_size = self.n_voxels[0], self.voxel_size[0]
                     else:
@@ -433,9 +398,6 @@ class FastBEV(BaseDetector):
                         device=feat_i.device,
                         dtype=projection.dtype,
                     )
-                    if profile:
-                        profile_points += self._profile_now() - profile_stage
-                        profile_stage = self._profile_now()
 
                     if self.backproject == 'inplace':
                         volume = backproject_inplace(
@@ -451,35 +413,25 @@ class FastBEV(BaseDetector):
                         valid = valid > 0
                         volume[:, ~valid[0]] = 0.0
 
-                    if profile:
-                        profile_backproject += self._profile_now() - profile_stage
                     volumes.append(volume)
-                if profile:
-                    # stack/cat 单独统计，便于区分真正的 backproject 计算和张量拼接开销。
-                    profile_stage = self._profile_now()
                 seq_volume = torch.stack(volumes)
-                if lvl == 0:
+                if self.style in ['v1', 'v2']:
+                    # v1/v2 的 head 训练输入与 3D ONNX 导出保持一致：每个时序先折成
+                    # [bs, z*c, x, y]，再按时序拼成 [bs, t*z*c, x, y]。
+                    seq_volume = self._volume_to_deploy_input(seq_volume)
+                    if lvl == 0 and need_deploy_head_inputs:
+                        deploy_head_inputs.append(seq_volume)
+                elif lvl == 0 and need_deploy_head_inputs:
                     deploy_head_inputs.append(self._volume_to_deploy_input(seq_volume))
                 volume_list.append(seq_volume)
-                if profile:
-                    profile_stack += self._profile_now() - profile_stage
 
-            if profile:
-                profile_stage = self._profile_now()
             mlvl_volumes.append(torch.cat(volume_list, dim=1))
-            if profile:
-                profile_stack += self._profile_now() - profile_stage
-
-        if profile:
-            profile_volume_total = self._profile_now() - profile_last
-            profile_last = self._profile_now()
-        else:
-            profile_volume_total = 0.0
 
         if mode in ['test_onnx', 'test_custom']:
             return self._onnx_head_forward(deploy_head_inputs, img.device), None, None
 
-        self._save_head_calibration(deploy_head_inputs)
+        if need_save_head_calibration:
+            self._save_head_calibration(deploy_head_inputs)
 
         if self.style in ['v1', 'v2']:
             mlvl_volumes = torch.cat(mlvl_volumes, dim=1)
@@ -504,12 +456,6 @@ class FastBEV(BaseDetector):
                 mlvl_volumes[i] = mlvl_volume
             mlvl_volumes = torch.cat(mlvl_volumes, dim=1)
 
-        if profile:
-            profile_merge = self._profile_now() - profile_last
-            profile_last = self._profile_now()
-        else:
-            profile_merge = 0.0
-
         x = mlvl_volumes
         def _inner_forward(x):
             out = self.neck_3d(x)
@@ -519,22 +465,6 @@ class FastBEV(BaseDetector):
             x = cp.checkpoint(_inner_forward, x)
         else:
             x = _inner_forward(x)
-
-        if profile:
-            profile_neck3d = self._profile_now() - profile_last
-            profile_total = self._profile_now() - profile_t0
-            # 输出单行结构化耗时，方便直接从训练日志中定位瓶颈阶段。
-            print(
-                '[FASTBEV_PROFILE extract_feat #{:03d}] total={:.3f}s backbone_neck_fuse={:.3f}s '
-                'volume_total={:.3f}s meta={:.3f}s projection={:.3f}s points={:.3f}s '
-                'backproject={:.3f}s stack_cat={:.3f}s merge={:.3f}s neck3d={:.3f}s '
-                'batch={} total_views={} n_images={} use_distortion={}'.format(
-                    self._profile_extract_iter, profile_total, profile_backbone,
-                    profile_volume_total, profile_meta, profile_projection, profile_points,
-                    profile_backproject, profile_stack, profile_merge, profile_neck3d,
-                    batch_size, total_views if 'total_views' in locals() else 'na',
-                    self.n_images, self.use_distortion))
-            self._profile_extract_iter += 1
 
         return x, None, features_2d
 
@@ -565,14 +495,7 @@ class FastBEV(BaseDetector):
     def forward_train(
         self, img, img_metas, gt_bboxes_3d, gt_labels_3d, gt_bev_seg=None, **kwargs
     ):
-        # forward_train 级 profile 用来确认耗时是在特征提取、检测头前向，还是 loss 计算。
-        profile = self._profile_enabled() and self._profile_train_iter < self._profile_limit()
-        profile_t0 = self._profile_now() if profile else None
         feature_bev, valids, features_2d = self.extract_feat(img, img_metas, "train")
-        if profile:
-            profile_extract = self._profile_now() - profile_t0
-            # 后续 stage 以 extract_feat 结束时间为起点，继续拆分 bbox_head 与 bbox_loss。
-            profile_stage = self._profile_now()
         """
         feature_bev: [(1, 256, 100, 100)]
         valids: (1, 1, 200, 200, 12)
@@ -583,17 +506,8 @@ class FastBEV(BaseDetector):
         losses = dict()
         if self.bbox_head is not None:
             x = self.bbox_head(feature_bev)
-            if profile:
-                profile_bbox_head = self._profile_now() - profile_stage
-                profile_stage = self._profile_now()
             loss_det = self.bbox_head.loss(*x, gt_bboxes_3d, gt_labels_3d, img_metas)
-            if profile:
-                profile_bbox_loss = self._profile_now() - profile_stage
-                profile_stage = self._profile_now()
             losses.update(loss_det)
-        else:
-            profile_bbox_head = 0.0
-            profile_bbox_loss = 0.0
 
         if self.seg_head is not None:
             assert len(gt_bev_seg) == 1
@@ -622,21 +536,10 @@ class FastBEV(BaseDetector):
                 )
                 img_metas_2d.append(tmp_dict)
 
-            rank, world_size = get_dist_info()
             loss_2d = self.bbox_head_2d.forward_train(
                 features_2d, img_metas_2d, gt_bboxes, gt_labels
             )
             losses.update(loss_2d)
-
-        if profile:
-            profile_total = self._profile_now() - profile_t0
-            # 与 extract_feat 的 profile 行配套输出，便于同一 iteration 对齐分析。
-            print(
-                '[FASTBEV_PROFILE forward_train #{:03d}] total={:.3f}s extract={:.3f}s '
-                'bbox_head={:.3f}s bbox_loss={:.3f}s batch={} img_shape={}'.format(
-                    self._profile_train_iter, profile_total, profile_extract,
-                    profile_bbox_head, profile_bbox_loss, img.shape[0], tuple(img.shape)))
-            self._profile_train_iter += 1
 
         return losses
 
@@ -828,8 +731,8 @@ def _camera_distortion(img_meta, cam_id, device, dtype):
     return None
 
 
-def _project_points_with_distortion(points, projection, img_meta, stride):
-    """使用相机畸变参数把 lidar 体素点投影到特征图坐标。"""
+def _project_points_with_distortion_loop(points, projection, img_meta, stride):
+    """逐相机畸变投影 fallback，保持历史行为。"""
     if img_meta is None:
         return torch.bmm(projection, points)
     lidar2img = img_meta.get('lidar2img', {})
@@ -887,6 +790,85 @@ def _project_points_with_distortion(points, projection, img_meta, stride):
     return torch.stack(outputs)
 
 
+def _project_points_with_distortion(points, projection, img_meta, stride):
+    """使用相机畸变参数把 lidar 体素点投影到特征图坐标。"""
+    if img_meta is None:
+        return torch.bmm(projection, points)
+    lidar2img = img_meta.get('lidar2img', {})
+    aug_infos = lidar2img.get('lidar2img_aug', [])
+    n_images = points.shape[0]
+    if not isinstance(aug_infos, list) or len(aug_infos) < n_images:
+        return torch.bmm(projection, points)
+
+    device = points.device
+    dtype = points.dtype
+    eye3 = torch.eye(3, device=device, dtype=dtype)
+    zero3 = torch.zeros(3, device=device, dtype=dtype)
+    sensor2lidar_rs = []
+    sensor2lidar_ts = []
+    intrinsics = []
+    post_rots = []
+    post_trans = []
+    distortions = []
+    for cam_id in range(n_images):
+        aug = aug_infos[cam_id]
+        if not isinstance(aug, dict) or 'rot' not in aug or 'tran' not in aug or 'intrin' not in aug:
+            return _project_points_with_distortion_loop(points, projection, img_meta, stride)
+        distortion = _camera_distortion(img_meta, cam_id, device, dtype)
+        if distortion is None:
+            return _project_points_with_distortion_loop(points, projection, img_meta, stride)
+
+        sensor2lidar_rs.append(torch.as_tensor(aug['rot'], device=device, dtype=dtype).reshape(3, 3))
+        sensor2lidar_ts.append(torch.as_tensor(aug['tran'], device=device, dtype=dtype).reshape(3, 1))
+        intrinsics.append(torch.as_tensor(aug['intrin'], device=device, dtype=dtype).reshape(3, 3))
+        post_rots.append(torch.as_tensor(aug.get('post_rot', eye3), device=device, dtype=dtype).reshape(3, 3))
+        post_trans.append(torch.as_tensor(aug.get('post_tran', zero3), device=device, dtype=dtype).reshape(3, 1))
+
+        padded = torch.zeros(8, device=device, dtype=dtype)
+        if distortion.numel() >= 8:
+            padded[:] = distortion[:8]
+        else:
+            padded[:min(distortion.numel(), 5)] = distortion[:min(distortion.numel(), 5)]
+        distortions.append(padded)
+
+    sensor2lidar_r = torch.stack(sensor2lidar_rs)
+    sensor2lidar_t = torch.stack(sensor2lidar_ts)
+    intrinsic = torch.stack(intrinsics)
+    post_rot = torch.stack(post_rots)
+    post_tran = torch.stack(post_trans)
+    distortion = torch.stack(distortions)
+
+    lidar2cam_r = torch.inverse(sensor2lidar_r)
+    cam_points = torch.bmm(lidar2cam_r, points[:, :3] - sensor2lidar_t)
+    z_depth = cam_points[:, 2]
+    z = z_depth.clamp(min=1e-5)
+    x_c = cam_points[:, 0] / z
+    y_c = cam_points[:, 1] / z
+    r2 = x_c * x_c + y_c * y_c
+
+    k1 = distortion[:, 0:1]
+    k2 = distortion[:, 1:2]
+    p1 = distortion[:, 2:3]
+    p2 = distortion[:, 3:4]
+    k3 = distortion[:, 4:5]
+    k4 = distortion[:, 5:6]
+    k5 = distortion[:, 6:7]
+    k6 = distortion[:, 7:8]
+    radial_num = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+    radial_den = 1 + k4 * r2 + k5 * r2 ** 2 + k6 * r2 ** 3
+    x_distorted = x_c * radial_num / radial_den + (2 * p1 * x_c * y_c + p2 * (r2 + 2 * x_c ** 2))
+    y_distorted = y_c * radial_num / radial_den + (p1 * (r2 + 2 * y_c ** 2) + 2 * p2 * x_c * y_c)
+
+    distorted = torch.stack((x_distorted, y_distorted, torch.ones_like(x_distorted)), dim=1)
+    pixel = torch.bmm(intrinsic, distorted)
+    pixel = pixel / pixel[:, 2:3].clamp(min=1e-5)
+    pixel = torch.bmm(post_rot, pixel) + post_tran
+    pixel_xy = pixel[:, :2] / float(stride)
+    return torch.stack(
+        (pixel_xy[:, 0] * z_depth, pixel_xy[:, 1] * z_depth, z_depth),
+        dim=1)
+
+
 def backproject_inplace(features, points, projection, img_meta=None, seq_id=0, stride=1, use_distortion=False):
     '''
     function: 2d feature + predefined point cloud -> 3d volume
@@ -901,14 +883,15 @@ def backproject_inplace(features, points, projection, img_meta=None, seq_id=0, s
     n_x_voxels, n_y_voxels, n_z_voxels = points.shape[-3:]
     # [3, 200, 200, 12] -> [1, 3, 480000] -> [6, 3, 480000]
     points = points.view(1, 3, -1).expand(n_images, 3, -1)
-    # [6, 3, 480000] -> [6, 4, 480000]
-    points = torch.cat((points, torch.ones_like(points[:, :1])), dim=1)
+    n_points = points.shape[-1]
     # ego_to_cam
     # [6, 3, 4] * [6, 4, 480000] -> [6, 3, 480000]
     if use_distortion:
-        points_2d_3 = _project_points_with_distortion(points, projection, img_meta, stride)
+        points_homo = torch.cat((points, torch.ones_like(points[:, :1])), dim=1)
+        points_2d_3 = _project_points_with_distortion(points_homo, projection, img_meta, stride)
     else:
-        points_2d_3 = torch.bmm(projection, points)  # lidar2img
+        # 无畸变路径避免每次构造齐次坐标，直接执行 R @ xyz + t。
+        points_2d_3 = torch.bmm(projection[:, :, :3], points) + projection[:, :, 3:4]
     x = (points_2d_3[:, 0] / points_2d_3[:, 2]).round().long()  # [6, 480000]
     y = (points_2d_3[:, 1] / points_2d_3[:, 2]).round().long()  # [6, 480000]
     z = points_2d_3[:, 2]  # [6, 480000]
@@ -916,10 +899,19 @@ def backproject_inplace(features, points, projection, img_meta=None, seq_id=0, s
 
     # method2：特征填充，只填充有效特征，重复特征直接覆盖
     volume = torch.zeros(
-        (n_channels, points.shape[-1]), device=features.device
+        (n_channels, n_points), device=features.device
     ).type_as(features)
-    for i in range(n_images):
-        volume[:, valid[i]] = features[i, :, y[i, valid[i]], x[i, valid[i]]]
+    # 等价于原先按相机顺序逐个写入、后写覆盖的规则，但每个 BEV 点只写一次。
+    camera_order = torch.arange(
+        n_images, device=features.device, dtype=torch.long).view(n_images, 1)
+    camera_choice = torch.where(
+        valid, camera_order, torch.full_like(camera_order, -1)).max(dim=0).values
+    assigned = camera_choice >= 0
+    if assigned.any():
+        dst_index = assigned.nonzero(as_tuple=False).squeeze(1)
+        src_cam = camera_choice[dst_index]
+        sampled = features[src_cam, :, y[src_cam, dst_index], x[src_cam, dst_index]]
+        volume[:, dst_index] = sampled.transpose(0, 1)
 
     volume = volume.view(n_channels, n_x_voxels, n_y_voxels, n_z_voxels)
     return volume

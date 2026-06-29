@@ -58,8 +58,6 @@ fi
 TEST_BATCH="${TEST_BATCH:-8}"
 WORKERS="${WORKERS:-8}"
 DISABLE_FP16="${DISABLE_FP16:-1}"
-PROFILE_TEST="${PROFILE_TEST:-1}"
-PROFILE_INTERVAL="${PROFILE_INTERVAL:-10}"
 OUT_DIR="${OUT_DIR:-${WEIGHT_DIR}/test_results}"
 OUT_PKL="${OUT_PKL:-${OUT_DIR}/$(basename "${CKPT}" .pth)_val_results.pkl}"
 mkdir -p "${OUT_DIR}"
@@ -72,7 +70,6 @@ echo "[INFO] OUT_PKL=${OUT_PKL}"
 echo "[INFO] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "[INFO] TEST_BATCH=${TEST_BATCH}, WORKERS=${WORKERS}"
 echo "[INFO] DISABLE_FP16=${DISABLE_FP16}"
-echo "[INFO] PROFILE_TEST=${PROFILE_TEST}, PROFILE_INTERVAL=${PROFILE_INTERVAL}"
 
 # tools/test.py 会在 cfg.fp16 存在时自动 wrap_fp16_model。
 # 这里默认写 fp16=None，避免 test/eval 与后续 ONNX/FP32 导出链路不一致。
@@ -80,6 +77,7 @@ CFG_OPTIONS=(
   data.test.ann_file="${VAL_PKL}"
   data.val.ann_file="${VAL_PKL}"
   data.test.samples_per_gpu="${TEST_BATCH}"
+  data.val.samples_per_gpu="${TEST_BATCH}"
   data.workers_per_gpu="${WORKERS}"
 )
 
@@ -87,13 +85,7 @@ if [ "${DISABLE_FP16}" = "1" ]; then
   CFG_OPTIONS+=(fp16=None)
 fi
 
-PROFILE_ARGS=()
-if [ "${PROFILE_TEST}" = "1" ]; then
-  PROFILE_ARGS+=(--profile-test --profile-interval "${PROFILE_INTERVAL}")
-fi
-
 python -u tools/test.py "${CONFIG}" "${CKPT}" \
   --out "${OUT_PKL}" \
   --eval 0.25 0.5 \
-  "${PROFILE_ARGS[@]}" \
   --cfg-options "${CFG_OPTIONS[@]}"

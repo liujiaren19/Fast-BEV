@@ -1666,22 +1666,13 @@ class RandomAugImageMultiViewImage(object):
     Args:
         scales
     """
-    def __init__(self, data_config=None, is_train=True, is_debug=False, is_exit=False, tmp='./figs', force_resize=False, force_resize_source_size=None):
+    def __init__(self, data_config=None, is_train=True, is_debug=False, is_exit=False, tmp='./figs', force_resize=False):
         self.data_config = data_config
         self.is_train = is_train
         self.is_debug = is_debug
         self.is_exit = is_exit
         self.tmp = tmp
         self.force_resize = force_resize
-        # force_resize_source_size 只是旧 pkl 的兜底配置。新 N7 pkl 会在每个
-        # camera 条目里写入 intrinsic_width/height 和 image_width/height：
-        # - intrinsic_*：cam_intrinsic / distortion 所在图像坐标系尺寸，可能是
-        #   2560x1440 原始标定，也可能是 1600x900 预处理标定；
-        # - image_*：data_path 当前指向图片的实际尺寸，例如 1600x900 或 704x256。
-        # force_resize=True 时，本 transform 用 intrinsic_* 计算到训练 input_size
-        # 的 post_rot/post_tran，因此离线缓存 704x256 和直接读取 1600x900 都能
-        # 保持几何一致。只有旧 pkl 缺少 intrinsic_* 时才使用该 fallback。
-        self.force_resize_source_size = force_resize_source_size
 
     def random_id(self, N=8, seed=None):
         if seed is not None:
@@ -1708,14 +1699,20 @@ class RandomAugImageMultiViewImage(object):
                 crop = (0, 0, target_w, target_h)
                 flip = False
                 rotate = 0.0
-                source_h = cam_aug.get('intrinsic_height')
-                source_w = cam_aug.get('intrinsic_width')
-                if source_h is None or source_w is None or source_h <= 0 or source_w <= 0:
-                    if self.force_resize_source_size is not None:
-                        # 配置顺序沿用 data_config['input_size'] 的 (H, W) 习惯。
-                        source_h, source_w = self.force_resize_source_size
-                    else:
-                        source_h, source_w = pil_img.height, pil_img.width
+                required_size_keys = ('intrinsic_height', 'intrinsic_width')
+                missing_size_keys = [
+                    key for key in required_size_keys if key not in cam_aug]
+                if missing_size_keys:
+                    raise KeyError(
+                        'RandomAugImageMultiViewImage requires {} in '
+                        'lidar2img_aug for force_resize'.format(
+                            ', '.join(missing_size_keys)))
+                source_h = int(cam_aug['intrinsic_height'])
+                source_w = int(cam_aug['intrinsic_width'])
+                if source_h <= 0 or source_w <= 0:
+                    raise ValueError(
+                        'intrinsic image size must be positive, got {}x{}'.format(
+                            source_w, source_h))
                 # source_* 是 cam_intrinsic 对应的图像尺寸；pil_img 可能已经是
                 # 704x256 缓存图，也可能是 1600x900/2560x1440 原图，所以这里
                 # 不能简单使用当前图片尺寸。

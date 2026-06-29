@@ -57,7 +57,6 @@ class CustomMultiViewDataset(Custom3DDataset):
         self.train_adj_ids = train_adj_ids
         self.test_adj_ids = test_adj_ids
         self.temporal_compensate = temporal_compensate
-        self._warned_missing_temporal_pose = False
         self.max_interval = max_interval
         self.min_interval = min_interval
         self.shuffle = shuffle
@@ -133,8 +132,8 @@ class CustomMultiViewDataset(Custom3DDataset):
         named "global" can be a clip reference frame; temporal compensation only
         needs relative transforms, so absolute world meaning is not required.
         """
-        rot = info.get('lidar2global_rotation', info.get('ego2global_rotation'))
-        tran = info.get('lidar2global_translation', info.get('ego2global_translation'))
+        rot = info.get('lidar2global_rotation')
+        tran = info.get('lidar2global_translation')
         if rot is None or tran is None:
             return None
         return cls._quat_wxyz_to_matrix(rot), np.asarray(tran, dtype=np.float32).reshape(3)
@@ -150,8 +149,7 @@ class CustomMultiViewDataset(Custom3DDataset):
             key_from_adj = inverse(global_from_key) @ global_from_adj
             key_lidar_from_adj_cam = key_from_adj @ adj_lidar_from_adj_cam
 
-        If pose is missing, the method falls back to the old direct transform so
-        legacy pkl files and ``n_times=1`` configs remain usable.
+        新版 N7 pkl 必须写入相邻帧位姿；缺失时直接报错，避免时序融合静默退化。
         """
         sensor2lidar_r = np.asarray(
             cam_info['sensor2lidar_rotation'], dtype=np.float32)
@@ -165,10 +163,9 @@ class CustomMultiViewDataset(Custom3DDataset):
         ref_pose = self._info_lidar2global(ref_info)
         frame_pose = self._info_lidar2global(frame_info)
         if ref_pose is None or frame_pose is None:
-            if not self._warned_missing_temporal_pose:
-                print('CustomMultiViewDataset: temporal pose missing; adjacent frames fall back to un-compensated sensor2lidar.')
-                self._warned_missing_temporal_pose = True
-            return sensor2lidar_r, sensor2lidar_t, False
+            raise KeyError(
+                'CustomMultiViewDataset requires lidar2global_rotation and '
+                'lidar2global_translation for temporal compensation in N7 pkl')
 
         ref_to_global_r, ref_to_global_t = ref_pose
         frame_to_global_r, frame_to_global_t = frame_pose
@@ -205,11 +202,23 @@ class CustomMultiViewDataset(Custom3DDataset):
         distortion = np.asarray(
             cam_info.get('distortion', []), dtype=np.float32).reshape(-1)
         # intrinsic_* 表示 cam_intrinsic 对应的图像坐标系；image_* 表示当前
-        # data_path 指向图片的实际尺寸。预 resize 训练时二者可能不同。
-        intrinsic_width = int(cam_info.get('intrinsic_width', cam_info.get('width', 0)) or 0)
-        intrinsic_height = int(cam_info.get('intrinsic_height', cam_info.get('height', 0)) or 0)
-        image_width = int(cam_info.get('image_width', intrinsic_width) or 0)
-        image_height = int(cam_info.get('image_height', intrinsic_height) or 0)
+        # data_path 指向图片的实际尺寸。新版 N7 pkl 必须显式提供这四个字段。
+        required_size_keys = (
+            'intrinsic_width', 'intrinsic_height', 'image_width', 'image_height')
+        missing_size_keys = [key for key in required_size_keys if key not in cam_info]
+        if missing_size_keys:
+            raise KeyError(
+                'N7 camera info missing required size fields: {}'.format(
+                    ', '.join(missing_size_keys)))
+        intrinsic_width = int(cam_info['intrinsic_width'])
+        intrinsic_height = int(cam_info['intrinsic_height'])
+        image_width = int(cam_info['image_width'])
+        image_height = int(cam_info['image_height'])
+        if min(intrinsic_width, intrinsic_height, image_width, image_height) <= 0:
+            raise ValueError(
+                'N7 camera size fields must be positive: '
+                'intrinsic={}x{}, image={}x{}'.format(
+                    intrinsic_width, intrinsic_height, image_width, image_height))
         lidar2img_aug = dict(
             intrin=intrinsic,
             rot=sensor2lidar_r,
