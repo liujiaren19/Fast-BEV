@@ -28,7 +28,7 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 
 # 优先使用内网全量训练配置；如果该文件不存在，则回退到已提交的 N7 704x256 配置。
-CONFIG="${CONFIG:-configs/fastbev/custom/custom_fastbev_6v_r18_dist_train_ljr.py}"
+CONFIG="${CONFIG:-configs/fastbev/custom/custom_fastbev_6v_r18_n7_704x256_dist_train.py}"
 if [ ! -f "${CONFIG}" ]; then
   CONFIG="configs/fastbev/custom/custom_fastbev_6v_r18_n7_704x256.py"
 fi

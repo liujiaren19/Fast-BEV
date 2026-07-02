@@ -1,15 +1,22 @@
 _base_ = './custom_fastbev_6v_r18.py'
 
-model = dict(n_images=1)
+model = dict(
+    n_images=1,
+    feature_resize_mode='nearest',
+)
 
 dataset_type = 'CustomMultiViewDataset'
 data_root = './data/nuscenes/'
+ann_dir = data_root + 'pkl/'
 ann_prefix = 'custom_fastbev'
+# 与 converter 输出命名规则保持一致：{tag}_{scope}_infos_{set}_{YYYYMMDD}.pkl。
+# 当前默认按样例单 clip pkl 配置；如果 converter 输出的是 dataset
+# 或 sequence scope，只需要同步修改 ann_scope。
+ann_scope = '20251203_151928_16'
+ann_date = '20260623'
+ann_file_prefix = f'{ann_prefix}_{ann_scope}'
 point_cloud_range = [-50, -50, -5, 50, 50, 3]
-class_names = [
-    'car', 'truck', 'trailer', 'bus', 'construction_vehicle', 'bicycle',
-    'motorcycle', 'pedestrian', 'traffic_cone', 'barrier'
-]
+class_names = ['car', 'truck']
 camera_types = ['cam0']
 input_modality = dict(
     use_lidar=False,
@@ -85,11 +92,12 @@ custom_dataset_common = dict(
     camera_types=camera_types,
     sequential=True,
     n_times=4,
-    train_adj_ids=[1, 3, 5],
-    test_adj_ids=[1, 3, 5],
+    train_adj_ids=[0, 1, 2],
+    test_adj_ids=[0, 1, 2],
     max_interval=10,
     min_interval=0,
     eval_iou_thr=[0.25, 0.5],
+    eval_range=point_cloud_range,
 )
 
 data = dict(
@@ -100,14 +108,14 @@ data = dict(
         **custom_dataset_common,
         pipeline=train_pipeline,
         test_mode=False,
-        ann_file=data_root + ann_prefix + '_infos_train.pkl'),
+        ann_file=ann_dir + ann_file_prefix + '_infos_train.pkl'),
     val=dict(
         **custom_dataset_common,
         pipeline=test_pipeline,
         test_mode=True,
-        ann_file=data_root + ann_prefix + '_infos_val.pkl'),
+        ann_file=ann_dir + ann_file_prefix + '_infos_val.pkl'),
     test=dict(
         **custom_dataset_common,
         pipeline=test_pipeline,
         test_mode=True,
-        ann_file=data_root + ann_prefix + '_infos_val.pkl'))
+        ann_file=ann_dir + ann_file_prefix + '_infos_val.pkl'))

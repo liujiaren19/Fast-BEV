@@ -27,11 +27,11 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3 # 使用第1、2块GPU（注意CUDA编号从
 # export CUDA_VISIBLE_DEVICES=0,2,4,6
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 
-CONFIG="${CONFIG:-configs/fastbev/custom/custom_fastbev_6v_r18_dist_train_ljr.py}"
-WORK_DIR="${WORK_DIR:-work_dirs/n7_6v_704_256/20251017_20251030_20251031_20251203_gpu4_batch24_work_8_260626}"
-TRAIN_BATCH="${TRAIN_BATCH:-1}"
+CONFIG="${CONFIG:-configs/fastbev/custom/custom_fastbev_6v_r18_n7_704x256_dist_train.py}"
+WORK_DIR="${WORK_DIR:-work_dirs/n7_6v_704_256/20251017_20251030_20251031_20251203_gpu4_batch24_work_8_260630}"
+TRAIN_BATCH="${TRAIN_BATCH:-24}"
 EVAL_BATCH="${EVAL_BATCH:-${TRAIN_BATCH}}"
-WORKERS="${WORKERS:-4}"
+WORKERS="${WORKERS:-8}"
 
 MASTER_PORT=$(comm -23 <(seq 29500 29600 | sort) <(ss -tan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 

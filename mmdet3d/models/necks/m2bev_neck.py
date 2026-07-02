@@ -104,7 +104,8 @@ class M2BevNeck(nn.Module):
         """Forward function.
 
         Args:
-            x (torch.Tensor): of shape (N, C_in, N_x, N_y, N_z).
+            x (torch.Tensor): 4D ``(N, C_in, N_x, N_y)`` or 5D
+                ``(N, C_in, N_x, N_y, N_z)`` BEV feature.
 
         Returns:
             list[torch.Tensor]: of shape (N, C_out, N_y, N_x).
@@ -115,12 +116,15 @@ class M2BevNeck(nn.Module):
             return out
 
         if x.dim() == 4:
-            # 板端 head ONNX 通常直接输入已经折叠 z 维后的 BEV 特征。
+            # N7 板端当前只打通 v1/R18，FastBEV.extract_feat 已经把
+            # z 维和时序维折进 channel，因此这里直接进入 2D neck。
             pass
         elif bool(os.getenv("DEPLOY", False)):
             N, X, Y, Z, C = x.shape
             x = x.reshape(N, X, Y, Z*C).permute(0, 3, 1, 2)
         else:
+            # 兼容 paper 原始 5D 输入路径；厂家 m2bev_neck_bst.py 直接删掉了
+            # 这段折叠逻辑，当前主线保留它以免影响非板端配置。
             # N, C*T, X, Y, Z -> N, X, Y, Z, C -> N, X, Y, Z*C*T -> N, Z*C*T, X, Y
             N, C, X, Y, Z = x.shape
             x = x.permute(0, 2, 3, 4, 1).reshape(N, X, Y, Z*C).permute(0, 3, 1, 2)

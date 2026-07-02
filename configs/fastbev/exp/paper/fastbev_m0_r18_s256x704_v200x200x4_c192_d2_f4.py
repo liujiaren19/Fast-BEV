@@ -8,14 +8,14 @@ model = dict(
         num_stages=4,
         out_indices=(0, 1, 2, 3),
         frozen_stages=1,
-        norm_cfg=dict(type='SyncBN', requires_grad=True),
+        norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=True,
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet18'),
         style='pytorch'
     ),
     neck=dict(
         type='FPN',
-        norm_cfg=dict(type='SyncBN', requires_grad=True),
+        norm_cfg=dict(type='BN', requires_grad=True),
         in_channels=[64, 128, 256, 512],
         out_channels=64,
         num_outs=4),
@@ -28,7 +28,7 @@ model = dict(
         stride=2,
         is_transpose=False,
         fuse=dict(in_channels=64*4*4, out_channels=64*4),
-        norm_cfg=dict(type='SyncBN', requires_grad=True)),
+        norm_cfg=dict(type='BN', requires_grad=True)),
     seg_head=None,
     bbox_head=dict(
         type='FreeAnchor3DHead',
@@ -102,6 +102,10 @@ model = dict(
         nms_thr_list=[0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.5, 0.5, 0.2],
         nms_radius_thr_list=[4, 12, 10, 10, 12, 0.85, 0.85, 0.175, 0.175, 1],
         nms_rescale_factor=[1.0, 0.7, 0.55, 0.4, 0.7, 1.0, 1.0, 4.5, 9.0, 1.0],
+
+        test_mode = 'test_pth',  # 'test_pth', 'test_onnx', 'test_custom'
+        backbone_onnx = 'simplified_export_2d_model.onnx',
+        head_onnx = 'simplified_export_3d_model.onnx'
     )
 )
 
@@ -143,11 +147,11 @@ data_config = {
     'pad_color': (0, 0, 0),
 }
 
-# file_client_args = dict(backend='disk')
-file_client_args = dict(
-    backend='petrel',
-    path_mapping=dict({
-        data_root: 'public-1424:s3://openmmlab/datasets/detection3d/nuscenes/'}))
+file_client_args = dict(backend='disk')
+# file_client_args = dict(
+#     backend='petrel',
+#     path_mapping=dict({
+#         data_root: 'public-1424:s3://openmmlab/datasets/detection3d/nuscenes/'}))
 
 train_pipeline = [
     dict(type='MultiViewPipeline', sequential=True, n_images=6, n_times=4, transforms=[
@@ -204,8 +208,8 @@ test_pipeline = [
     dict(type='Collect3D', keys=['img'])]
 
 data = dict(
-    samples_per_gpu=1,
-    workers_per_gpu=1,
+    samples_per_gpu=8,
+    workers_per_gpu=8,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
@@ -279,7 +283,7 @@ data = dict(
 )
 
 optimizer = dict(
-    type='AdamW2',
+    type='Adam',
     lr=0.0004,
     weight_decay=0.01,
     paramwise_cfg=dict(
@@ -315,4 +319,4 @@ resume_from = None
 workflow = [('train', 1)]
 
 # fp16 settings, the loss scale is specifically tuned to avoid Nan
-fp16 = dict(loss_scale='dynamic')
+# fp16 = dict(loss_scale='dynamic')

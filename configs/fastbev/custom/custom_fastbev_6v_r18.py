@@ -3,12 +3,15 @@ _base_ = '../exp/paper/fastbev_m0_r18_s256x704_v200x200x4_c192_d2_f4.py'
 model = dict(
     use_distortion=True,
     n_images=6,
+    feature_resize_mode='nearest',
     bbox_head=dict(num_classes=2),
 )
 
 dataset_type = 'CustomMultiViewDataset'
 data_root = './data/nuscenes/'
 ann_prefix = 'custom_fastbev'
+ann_dir = data_root + 'pkl/od_2k/'
+
 # 与 converter 输出命名规则保持一致：{tag}_{scope}_infos_{set}_{YYYYMMDD}.pkl。
 # 当前默认按样例单 clip pkl 配置；如果 converter 输出的是 dataset
 # 或 sequence scope，只需要同步修改 ann_scope。
@@ -34,6 +37,8 @@ img_norm_cfg = dict(
 
 data_config = {
     'input_size': (256, 704),
+    # 1600x900 原图训练默认沿用论文图像随机增强；离线 704x256
+    # 缓存图请使用 custom_fastbev_6v_r18_n7_704x256.py。
     'resize': (-0.06, 0.11),
     'crop': (-0.05, 0.05),
     'rot': (-5.4, 5.4),
@@ -67,8 +72,7 @@ train_pipeline = [
         update_img2lidar=True),
     dict(
         type='RandomAugImageMultiViewImage',
-        data_config=data_config,
-        force_resize=True),
+        data_config=data_config),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -83,8 +87,7 @@ test_pipeline = [
     dict(
         type='RandomAugImageMultiViewImage',
         data_config=data_config,
-        is_train=False,
-        force_resize=True),
+        is_train=False),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names, with_label=False),
@@ -110,24 +113,24 @@ custom_dataset_common = dict(
 
 data = dict(
     _delete_=True,
-    samples_per_gpu=1,
-    workers_per_gpu=1,
+    samples_per_gpu=24,
+    workers_per_gpu=8,
     train=dict(
         **custom_dataset_common,
         pipeline=train_pipeline,
         test_mode=False,
-        ann_file=data_root + f'{ann_file_prefix}_infos_train_{ann_date}.pkl'),
+        ann_file=ann_dir + f'{ann_file_prefix}_infos_train_{ann_date}.pkl'),
     val=dict(
         **custom_dataset_common,
         pipeline=test_pipeline,
         test_mode=True,
-        samples_per_gpu=8,
-        ann_file=data_root + f'{ann_file_prefix}_infos_val_{ann_date}.pkl'),
+        samples_per_gpu=24,
+        ann_file=ann_dir + f'{ann_file_prefix}_infos_val_{ann_date}.pkl'),
     test=dict(
         **custom_dataset_common,
         pipeline=test_pipeline,
         test_mode=True,
-        samples_per_gpu=8,
-        ann_file=data_root + f'{ann_file_prefix}_infos_val_{ann_date}.pkl'))
+        samples_per_gpu=24,
+        ann_file=ann_dir + f'{ann_file_prefix}_infos_test_{ann_date}.pkl'))
 
 evaluation = dict(interval=5, metric=[0.25, 0.5])
