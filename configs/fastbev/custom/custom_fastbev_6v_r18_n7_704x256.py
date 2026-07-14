@@ -22,8 +22,8 @@ ann_dir = data_root + 'pkl/'
 # 默认值仅用于示例；正式训练时按 converter 输出文件名修改 ann_scope/ann_date，
 # 或在训练脚本里用 --cfg-options 覆盖 ann_file。
 ann_prefix = 'custom_fastbev'
-ann_scope = '20251031_164821_1'
-ann_date = '20260624'
+ann_scope = '20251017-20251030-20251031-20251203'
+ann_date = '20260625'
 ann_file_prefix = f'{ann_prefix}_{ann_scope}'
 
 # 704x256 缓存图仍使用原始 1600x900 标定 K，因此这里显式覆盖

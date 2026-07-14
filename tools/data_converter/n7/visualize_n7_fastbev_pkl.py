@@ -45,26 +45,34 @@
 如果 pkl 中的图片路径是相对路径，``--data-root`` 必须和 converter 的
 ``--data-path`` 使用同一个根目录。默认先去畸变图片并用 OpenCV 返回的
 new_K 投影，这样更适合人工检查目标框贴合；如果需要检查板端原始畸变输入
-上的投影效果，可以显式添加 ``--raw-distorted``。
+上的投影效果，可以显式添加 ``--raw-distorted``。脚本会按 pkl 中实际存在的
+相机生成拼图；单目前视 pkl 只有 ``cam0`` 时，会默认使用前视 BEV 显示范围。
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
+import os
 import pickle
 import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 from tqdm import tqdm
 
 try:
+    from tools.n7_box_origin import boxes_to_numpy as n7_boxes_to_numpy
     from tools.data_converter.n7.fastbev_geometry import (
         camera_dimension_fields,
         choose_camera_order,
@@ -73,6 +81,12 @@ try:
     )
 except ModuleNotFoundError:
     # 支持从仓库根目录执行，也支持直接在 tools/data_converter/n7 目录附近调试脚本。
+    N7_TOOL_DIR = Path(__file__).resolve().parent
+    TOOL_DIR = Path(__file__).resolve().parents[2]
+    for module_dir in (N7_TOOL_DIR, TOOL_DIR):
+        if str(module_dir) not in sys.path:
+            sys.path.insert(0, str(module_dir))
+    from n7_box_origin import boxes_to_numpy as n7_boxes_to_numpy
     from fastbev_geometry import (
         camera_dimension_fields,
         choose_camera_order,
@@ -88,38 +102,70 @@ logger = logging.getLogger(__name__)
 class RawDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
     """保留 epilog 示例换行，同时继续展示 argparse 默认值。"""
 
-cv2.setNumThreads(4)
-
-USAGE_EXAMPLES = r"""示例：
-  # 抽帧生成 GT 视频，不保存逐帧 jpg/png。
+USAGE_EXAMPLES = r"""常用示例（先把 /path/to/... 替换为内网实际路径）：
+  # 1) 环视 6V，只看 GT：彩色为 used，灰色为 filtered。
+  # 环视口径只做类别和全车 ROI 过滤，不额外按相机可见性过滤。
   python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
---gt-pkl data/N7_704_256/pkl/custom_fastbev_20251031_infos_train_20260624.pkl \
---data-root data/N7_704_256 \
---output-dir work_dirs/vis_n7_704 \
---max-frames 300 --stride 5 --video-only --bev-range -50 -50 50 50
+    --gt-pkl /path/to/n7_6v_val.pkl \
+    --data-root /path/to/data_root \
+    --output-dir work_dirs/vis_n7_6v_gt \
+    --camera-ids cam9 cam0 cam11 cam8 cam3 cam10 \
+    --gt-view-mode split --gt-filter-range -50 -50 -5 50 50 3 \
+    --bev-range -50 -50 50 50 \
+    --video-only --video-group sequence --max-frames -1 \
+    --max-frames-per-video 2000 --fps 10 --workers 4
 
-  # test.py --out 生成预测 pkl 后，同时绘制 GT 和预测结果。
-  # --gt-pkl 必须和 test/eval 使用的是同一份 val/test pkl；预测结果按 index 对齐。
+  # 2) 环视 6V，同时看 used/filtered GT 和 Pred。
+  # --gt-pkl 必须是 test/eval 使用的同一份 pkl，Pred 按 info index 对齐。
   python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
---gt-pkl data/N7_704_256/pkl/custom_fastbev_20251017-20251030-20251031-20251203_infos_val_20260625.pkl \
---pred-pkl work_dirs/n7_6v_704_256/20251017_20251030_20251031_20251203_gpu4_batch24_work_8_260626/test_results/latest_val_results.pkl \
---data-root data/N7_704_256 \
---output-dir work_dirs/vis_n7_val_pred \
---max-frames 300 --stride 5 --score-thr 0.2 --max-preds 100 --video-only --bev-range -50 -50 50 50
+    --gt-pkl /path/to/n7_6v_val.pkl \
+    --pred-pkl /path/to/epoch_5_val_results.pkl \
+    --data-root /path/to/data_root \
+    --output-dir work_dirs/vis_n7_6v_gt_pred \
+    --camera-ids cam9 cam0 cam11 cam8 cam3 cam10 \
+    --gt-view-mode split --gt-filter-range -50 -50 -5 50 50 3 \
+    --score-thr 0.20 --max-preds 100 --box-label-mode compact \
+    --bev-range -50 -50 50 50 \
+    --video-only --video-group sequence --max-frames -1 \
+    --max-frames-per-video 2000 --fps 10 --workers 4
 
-  # 只在最终显示层把 704x256 相机图拉回 16:9，方便人眼查看。
+  # 3) 单目前视，只看 GT：彩色为 used，灰色为 filtered。
+  # 单目口径同时做 cam0 可见性和前视 ROI 过滤；1600x900 仅是最终相机面板尺寸。
   python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
---gt-pkl data/N7_704_256/pkl/custom_fastbev_20251031_infos_train_20260624.pkl \
---data-root data/N7_704_256 \
---output-dir work_dirs/vis_n7_704_display_16x9 \
---max-frames 100 --stride 10 --display-aspect 16:9 --no-video
+    --gt-pkl /path/to/n7_mono_front_val.pkl \
+    --data-root /path/to/data_root \
+    --output-dir work_dirs/vis_n7_mono_gt \
+    --camera-ids cam0 --camera-size 1600 900 --no-bev \
+    --gt-view-mode split --gt-filter-visible-camera cam0 \
+    --gt-filter-range 0 -35 -5 80 35 3 \
+    --video-only --video-group sequence --max-frames -1 \
+    --max-frames-per-video 2000 --fps 10 --workers 4
 
-  # 如果要检查原始畸变图上的投影效果，显式加 --raw-distorted。
+  # 4) 单目前视，同时看 used/filtered GT 和 Pred，并过滤低分预测框。
   python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
---gt-pkl data/N7_704_256/pkl/custom_fastbev_20251031_infos_train_20260624.pkl \
---data-root data/N7_704_256 \
---output-dir work_dirs/vis_n7_704_raw_distorted \
---max-frames 50 --stride 20 --raw-distorted --no-video
+    --gt-pkl /path/to/n7_mono_front_val.pkl \
+    --pred-pkl /path/to/epoch_5_val_results.pkl \
+    --data-root /path/to/data_root \
+    --output-dir work_dirs/vis_n7_mono_gt_pred \
+    --camera-ids cam0 --camera-size 1600 900 --no-bev \
+    --gt-view-mode split --gt-filter-visible-camera cam0 \
+    --gt-filter-range 0 -35 -5 80 35 3 \
+    --score-thr 0.20 --max-preds 100 --box-label-mode compact \
+    --video-only --video-group sequence --max-frames -1 \
+    --max-frames-per-video 2000 --fps 10 --workers 4
+
+  说明：
+    - 四个示例均使用 split：used GT 使用类别色，filtered GT 使用灰色；
+      如果只想显示训练/eval 实际使用的 GT，可改为 --gt-view-mode used。
+    - 已传 --pred-pkl 时追加 --hide-pred，可临时切回只看 GT。
+    - 默认用 CPU libx264；FFmpeg/NVIDIA 驱动支持时可追加
+      --video-encoder h264_nvenc 启用可选 GPU 编码。
+    - 若 3840x2160 原图的 K 也处于 3840x2160 像素坐标系，而缓存图为
+      1600x900，pkl 应分别保存 intrinsic_width/height=3840/2160 和
+      image_width/height=1600/900；脚本会自动缩放 K，且
+      --camera-size 1600 900 不会重复 resize。若 K 本身已对应其他尺寸，
+      intrinsic_width/height 必须填写 K 的实际坐标尺寸，不能照抄原图尺寸。
+    - 检查原始畸变图投影时可追加 --raw-distorted。
 """
 
 # 当前 converter pkl 仍使用 N7 标定中的 cam id 作为 key，避免影响 dataset/config。
@@ -147,6 +193,11 @@ PRED_COLORS = [
     (255, 255, 255),
     (0, 255, 255),
 ]
+FILTERED_GT_COLOR = (96, 96, 96)
+
+FULL_SURROUND_BEV_RANGE = (-50.0, -50.0, 50.0, 50.0)
+MONO_FRONT_BEV_RANGE = (0.0, -35.0, 80.0, 35.0)
+MONO_FRONT_GT_FILTER_RANGE = (0.0, -35.0, -5.0, 80.0, 35.0, 3.0)
 
 # corners_from_boxes 返回的角点顺序：
 #   底面：0--1      顶面：4--5
@@ -158,7 +209,412 @@ BOX_EDGES = [
     (0, 4), (1, 5), (2, 6), (3, 7),
 ]
 FRONT_EDGES = {(0, 1), (4, 5)}
-UNDISTORT_CACHE: Dict[Tuple, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+# 1600x900 的 CV_16SC2 去畸变 map 一套约占 8 MiB。条目数和总字节数双重
+# 限制可兼顾 704x256/1600x900 缓存图，也避免原始高分辨率调试时缓存失控。
+UNDISTORT_CACHE_MAX_ENTRIES = 16
+UNDISTORT_CACHE_MAX_BYTES = 256 * 1024 * 1024
+UNDISTORT_CACHE = OrderedDict()
+UNDISTORT_CACHE_LOCK = threading.Lock()
+UNDISTORT_CACHE_BYTES = 0
+UNDISTORT_CACHE_HITS = 0
+UNDISTORT_CACHE_MISSES = 0
+UNDISTORT_CACHE_EVICTIONS = 0
+
+
+def _undistort_cache_value_bytes(
+    value: Tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> int:
+    """统计一套 OpenCV 去畸变 map 的实际数组字节数。"""
+    return int(sum(array.nbytes for array in value))
+
+
+def clear_undistort_cache(reset_stats: bool = True) -> None:
+    """清空去畸变缓存；主要供长进程切换数据集和回归测试使用。"""
+    global UNDISTORT_CACHE_BYTES
+    global UNDISTORT_CACHE_HITS, UNDISTORT_CACHE_MISSES, UNDISTORT_CACHE_EVICTIONS
+    with UNDISTORT_CACHE_LOCK:
+        UNDISTORT_CACHE.clear()
+        UNDISTORT_CACHE_BYTES = 0
+        if reset_stats:
+            UNDISTORT_CACHE_HITS = 0
+            UNDISTORT_CACHE_MISSES = 0
+            UNDISTORT_CACHE_EVICTIONS = 0
+
+
+def undistort_cache_stats() -> Dict[str, int]:
+    """返回线程安全的去畸变缓存统计。"""
+    with UNDISTORT_CACHE_LOCK:
+        return {
+            'entries': len(UNDISTORT_CACHE),
+            'bytes': int(UNDISTORT_CACHE_BYTES),
+            'hits': int(UNDISTORT_CACHE_HITS),
+            'misses': int(UNDISTORT_CACHE_MISSES),
+            'evictions': int(UNDISTORT_CACHE_EVICTIONS),
+            'max_entries': int(UNDISTORT_CACHE_MAX_ENTRIES),
+            'max_bytes': int(UNDISTORT_CACHE_MAX_BYTES),
+        }
+
+
+def get_undistort_maps(
+    cache_key: Tuple,
+    intrinsic: np.ndarray,
+    distortion: np.ndarray,
+    image_size: Tuple[int, int],
+    alpha: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """线程安全地读取或创建去畸变 map，并按 LRU 约束内存。"""
+    global UNDISTORT_CACHE_BYTES
+    global UNDISTORT_CACHE_HITS, UNDISTORT_CACHE_MISSES, UNDISTORT_CACHE_EVICTIONS
+    with UNDISTORT_CACHE_LOCK:
+        cached = UNDISTORT_CACHE.get(cache_key)
+        if cached is not None:
+            UNDISTORT_CACHE.move_to_end(cache_key)
+            UNDISTORT_CACHE_HITS += 1
+            return cached
+
+        UNDISTORT_CACHE_MISSES += 1
+        new_k, _ = cv2.getOptimalNewCameraMatrix(
+            intrinsic, distortion, image_size, alpha, image_size)
+        map1, map2 = cv2.initUndistortRectifyMap(
+            intrinsic, distortion, None, new_k, image_size, cv2.CV_16SC2)
+        value = (map1, map2, new_k.astype(np.float32))
+        value_bytes = _undistort_cache_value_bytes(value)
+
+        while UNDISTORT_CACHE and (
+            len(UNDISTORT_CACHE) >= UNDISTORT_CACHE_MAX_ENTRIES or
+            UNDISTORT_CACHE_BYTES + value_bytes > UNDISTORT_CACHE_MAX_BYTES
+        ):
+            _, evicted = UNDISTORT_CACHE.popitem(last=False)
+            UNDISTORT_CACHE_BYTES -= _undistort_cache_value_bytes(evicted)
+            UNDISTORT_CACHE_EVICTIONS += 1
+
+        if (
+            UNDISTORT_CACHE_MAX_ENTRIES > 0 and
+            UNDISTORT_CACHE_MAX_BYTES > 0 and
+            value_bytes <= UNDISTORT_CACHE_MAX_BYTES
+        ):
+            UNDISTORT_CACHE[cache_key] = value
+            UNDISTORT_CACHE_BYTES += value_bytes
+        return value
+
+
+def ffmpeg_encoder_args(encoder: str, threads: int) -> List[str]:
+    """返回兼容 Ubuntu 20.04 常见 FFmpeg 版本的 H.264 编码参数。"""
+    if encoder == 'libx264':
+        return [
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '20',
+            '-threads', str(int(threads)),
+        ]
+    if encoder == 'h264_nvenc':
+        # 使用老版本 FFmpeg 也支持的 preset 名称，不依赖新版 p1-p7 参数。
+        return [
+            '-c:v', 'h264_nvenc',
+            '-preset', 'fast',
+            '-b:v', '8M',
+        ]
+    raise ValueError(f'Unsupported video encoder: {encoder}')
+
+
+def resolve_ffmpeg_binary(ffmpeg_bin: str) -> str:
+    """解析 FFmpeg 路径，并在渲染开始前报告缺失问题。"""
+    resolved = shutil.which(str(ffmpeg_bin))
+    if resolved is None:
+        raise FileNotFoundError(
+            f'Cannot find FFmpeg executable: {ffmpeg_bin!r}. '
+            'Install ffmpeg or pass its path with --ffmpeg-bin.')
+    return resolved
+
+
+def check_ffmpeg_encoder(ffmpeg_bin: str, encoder: str, threads: int) -> None:
+    """实际编码一个 64x64 原始帧，提前检查编码器和 NVENC 运行环境。"""
+    command = [
+        ffmpeg_bin,
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-f', 'rawvideo',
+        '-pixel_format', 'bgr24',
+        '-video_size', '64x64',
+        '-framerate', '1',
+        '-i', 'pipe:0',
+        '-frames:v', '1',
+        '-an',
+        *ffmpeg_encoder_args(encoder, threads),
+        '-pix_fmt', 'yuv420p',
+        '-f', 'null',
+        '-',
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            input=bytes(64 * 64 * 3),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f'FFmpeg encoder preflight timed out after 30 seconds: {encoder}') from exc
+    if completed.returncode != 0:
+        error_text = completed.stderr.decode('utf-8', errors='replace').strip()
+        raise RuntimeError(
+            f'FFmpeg encoder preflight failed for {encoder} (exit={completed.returncode}):\n'
+            f'{error_text or "no stderr output"}')
+
+
+class FfmpegVideoWriter:
+    """将 OpenCV BGR 帧通过 stdin 直接交给 FFmpeg 编码为 H.264 MP4。"""
+
+    def __init__(
+        self,
+        output_path: Path,
+        frame_size: Tuple[int, int],
+        fps: int,
+        encoder: str,
+        ffmpeg_bin: str,
+        threads: int,
+    ) -> None:
+        self.output_path = Path(output_path)
+        self.frame_size = (int(frame_size[0]), int(frame_size[1]))
+        self.fps = int(fps)
+        self.encoder = str(encoder)
+        self.frame_count = 0
+        self._closed = False
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        unique = f'{os.getpid()}-{time.time_ns()}'
+        self.temp_path = self.output_path.parent / (
+            f'.{self.output_path.stem}.ffmpeg-tmp-{unique}.mp4')
+        self.log_path = self.output_path.parent / (
+            f'.{self.output_path.stem}.ffmpeg-tmp-{unique}.log')
+        self._stderr = self.log_path.open('wb')
+
+        width, height = self.frame_size
+        command = [
+            ffmpeg_bin,
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-y',
+            '-f', 'rawvideo',
+            '-pixel_format', 'bgr24',
+            '-video_size', f'{width}x{height}',
+            '-framerate', str(self.fps),
+            '-i', 'pipe:0',
+            '-an',
+            *ffmpeg_encoder_args(self.encoder, threads),
+            '-pix_fmt', 'yuv420p',
+            '-g', str(max(self.fps * 2, 1)),
+            '-movflags', '+faststart',
+            str(self.temp_path),
+        ]
+        try:
+            self._process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr,
+                bufsize=0,
+            )
+        except BaseException:
+            self._stderr.close()
+            self.temp_path.unlink(missing_ok=True)
+            self.log_path.unlink(missing_ok=True)
+            raise
+        if self._process.stdin is None:
+            self.abort()
+            raise RuntimeError('FFmpeg process did not expose a stdin pipe')
+
+    def write(self, frame: np.ndarray) -> None:
+        """写入一帧；尺寸、通道或 dtype 变化时立即失败。"""
+        if self._closed:
+            raise RuntimeError(f'Cannot write to closed FFmpeg writer: {self.output_path}')
+        width, height = self.frame_size
+        if frame.shape != (height, width, 3):
+            raise ValueError(
+                f'Video frame size changed for {self.output_path}: '
+                f'got {frame.shape}, expected {(height, width, 3)}')
+        if frame.dtype != np.uint8:
+            raise TypeError(f'Expected uint8 BGR video frame, got {frame.dtype}')
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
+
+        payload = memoryview(frame).cast('B')
+        try:
+            while payload:
+                written = self._process.stdin.write(payload)
+                if written is None or written <= 0:
+                    raise BrokenPipeError('FFmpeg stdin accepted zero bytes')
+                payload = payload[written:]
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError(
+                f'FFmpeg stopped while writing {self.output_path}; '
+                f'see {self.log_path}') from exc
+        self.frame_count += 1
+
+    def _error_tail(self) -> str:
+        """读取 FFmpeg 日志尾部，避免异常消息吞掉真正原因。"""
+        try:
+            data = self.log_path.read_bytes()
+        except OSError:
+            return ''
+        return data[-8000:].decode('utf-8', errors='replace').strip()
+
+    def close(self) -> None:
+        """结束编码；成功后原子发布最终 MP4。"""
+        if self._closed:
+            return
+        self._closed = True
+        if self.frame_count <= 0:
+            self.abort()
+            raise RuntimeError(f'Refusing to publish empty video: {self.output_path}')
+
+        stdin_error = None
+        try:
+            self._process.stdin.close()
+        except (BrokenPipeError, OSError) as exc:
+            stdin_error = exc
+        try:
+            return_code = self._process.wait(timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=5)
+            self._stderr.close()
+            self.temp_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f'FFmpeg did not finish within 60 seconds for {self.output_path}; '
+                f'see {self.log_path}') from exc
+
+        self._stderr.close()
+        error_tail = self._error_tail()
+        if return_code != 0 or stdin_error is not None:
+            self.temp_path.unlink(missing_ok=True)
+            detail = error_tail or repr(stdin_error) or 'no stderr output'
+            raise RuntimeError(
+                f'FFmpeg failed for {self.output_path} (exit={return_code}):\n{detail}\n'
+                f'Full log: {self.log_path}')
+        if not self.temp_path.is_file() or self.temp_path.stat().st_size <= 0:
+            raise RuntimeError(
+                f'FFmpeg exited successfully but produced no video: {self.temp_path}')
+
+        os.replace(self.temp_path, self.output_path)
+        self.log_path.unlink(missing_ok=True)
+
+    def abort(self) -> None:
+        """异常路径清理子进程和临时 MP4；保留非空日志供排查。"""
+        self._closed = True
+        process = getattr(self, '_process', None)
+        if process is not None:
+            try:
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        stderr_handle = getattr(self, '_stderr', None)
+        if stderr_handle is not None and not stderr_handle.closed:
+            stderr_handle.close()
+        self.temp_path.unlink(missing_ok=True)
+        try:
+            if self.log_path.stat().st_size == 0:
+                self.log_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def pad_video_frame(frame: np.ndarray) -> np.ndarray:
+    """将奇数宽高补到偶数，满足 yuv420p/H.264 的尺寸要求。"""
+    height, width = frame.shape[:2]
+    pad_bottom = height % 2
+    pad_right = width % 2
+    if pad_bottom == 0 and pad_right == 0:
+        return frame
+    return cv2.copyMakeBorder(
+        frame, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+
+
+class VideoWriterManager:
+    """只维持一个活动 FFmpeg 进程，并按排序后的分组依次发布视频。"""
+
+    def __init__(self, fps: int, encoder: str, ffmpeg_bin: str, threads: int) -> None:
+        self.fps = int(fps)
+        self.encoder = str(encoder)
+        self.ffmpeg_bin = str(ffmpeg_bin)
+        self.threads = int(threads)
+        self.writer: Optional[FfmpegVideoWriter] = None
+        self.active_path: Optional[Path] = None
+        self.completed_paths = set()
+        self.video_count = 0
+        self.frame_count = 0
+        self.write_seconds = 0.0
+        self.close_seconds = 0.0
+        self._closed = False
+
+    def _close_active(self) -> None:
+        if self.writer is None:
+            return
+        start = time.monotonic()
+        self.writer.close()
+        self.close_seconds += time.monotonic() - start
+        self.completed_paths.add(self.active_path)
+        self.writer = None
+        self.active_path = None
+
+    def write(self, output_path: Path, frame: np.ndarray) -> None:
+        if self._closed:
+            raise RuntimeError('Cannot write to a closed VideoWriterManager')
+        output_path = Path(output_path)
+        frame = pad_video_frame(frame)
+        height, width = frame.shape[:2]
+        if output_path != self.active_path:
+            self._close_active()
+            if output_path in self.completed_paths:
+                raise RuntimeError(
+                    f'Video group is not contiguous after sorting: {output_path}')
+            self.writer = FfmpegVideoWriter(
+                output_path=output_path,
+                frame_size=(width, height),
+                fps=self.fps,
+                encoder=self.encoder,
+                ffmpeg_bin=self.ffmpeg_bin,
+                threads=self.threads,
+            )
+            self.active_path = output_path
+            self.video_count += 1
+            logger.info(
+                'FFmpeg writer: %s encoder=%s %dx%d @ %dfps',
+                output_path, self.encoder, width, height, self.fps)
+
+        start = time.monotonic()
+        assert self.writer is not None
+        self.writer.write(frame)
+        self.write_seconds += time.monotonic() - start
+        self.frame_count += 1
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._close_active()
+
+    def abort(self) -> None:
+        self._closed = True
+        if self.writer is not None:
+            self.writer.abort()
+            self.writer = None
+            self.active_path = None
 
 
 def load_fastbev_pkl(path: Path) -> Tuple[List[Dict], Dict]:
@@ -244,10 +700,148 @@ def count_boxes_in_bev_range(boxes: np.ndarray, bev_range: Tuple[float, float, f
     return int(mask.sum())
 
 
+def gt_filter_range_mask(boxes: np.ndarray, gt_filter_range: Optional[Sequence[float]]) -> np.ndarray:
+    """按训练/eval ROI 判断 GT 中心点是否保留。"""
+    boxes = np.asarray(boxes, dtype=np.float32)
+    if boxes.ndim != 2:
+        boxes = boxes.reshape(-1, boxes.shape[-1]) if boxes.size else np.zeros((0, 7), dtype=np.float32)
+    if boxes.shape[0] == 0:
+        return np.zeros((0,), dtype=np.bool_)
+    if gt_filter_range is None:
+        return np.ones((boxes.shape[0],), dtype=np.bool_)
+    values = np.asarray(gt_filter_range, dtype=np.float32).reshape(-1)
+    if values.size == 6:
+        x_min, y_min, z_min, x_max, y_max, z_max = values.tolist()
+        return ((boxes[:, 0] >= x_min) & (boxes[:, 0] <= x_max) &
+                (boxes[:, 1] >= y_min) & (boxes[:, 1] <= y_max) &
+                (boxes[:, 2] >= z_min) & (boxes[:, 2] <= z_max))
+    if values.size == 4:
+        x_min, y_min, x_max, y_max = values.tolist()
+        return ((boxes[:, 0] >= x_min) & (boxes[:, 0] <= x_max) &
+                (boxes[:, 1] >= y_min) & (boxes[:, 1] <= y_max))
+    raise ValueError('--gt-filter-range must contain 4 or 6 numbers')
+
+
+def camera_info_for_pkl_image_size(cam_info: Dict) -> Tuple[Dict, Tuple[int, int]]:
+    """把相机信息缩放到 pkl 记录的当前图片尺寸。"""
+    dims = camera_dimension_fields(cam_info)
+    sx = dims['image_width'] / float(dims['intrinsic_width'])
+    sy = dims['image_height'] / float(dims['intrinsic_height'])
+    scaled = scaled_camera_info(cam_info, sx, sy)
+    scaled['intrinsic_width'] = dims['image_width']
+    scaled['intrinsic_height'] = dims['image_height']
+    scaled['image_width'] = dims['image_width']
+    scaled['image_height'] = dims['image_height']
+    return scaled, (dims['image_height'], dims['image_width'])
+
+
+def points_visible_in_camera(
+    points: np.ndarray,
+    cam_info: Dict,
+    min_depth: float,
+) -> np.ndarray:
+    """判断 lidar 点是否投影到相机图像内。"""
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    if points.shape[0] == 0:
+        return np.zeros((0,), dtype=np.bool_)
+    draw_cam_info, image_shape = camera_info_for_pkl_image_size(cam_info)
+    lidar2img = compute_lidar2img(draw_cam_info)
+    uv, depth = project_lidar_points_pinhole(points, lidar2img)
+    height, width = image_shape
+    return ((depth > float(min_depth)) &
+            (uv[:, 0] >= 0) & (uv[:, 0] < width) &
+            (uv[:, 1] >= 0) & (uv[:, 1] < height))
+
+
+def gt_visible_camera_mask(
+    info: Dict,
+    boxes: np.ndarray,
+    camera_ids: Optional[Sequence[str]],
+    min_depth: float,
+) -> np.ndarray:
+    """按指定相机可见性判断 GT 是否保留。"""
+    boxes = np.asarray(boxes, dtype=np.float32)
+    if boxes.ndim != 2:
+        boxes = boxes.reshape(-1, boxes.shape[-1]) if boxes.size else np.zeros((0, 7), dtype=np.float32)
+    if boxes.shape[0] == 0:
+        return np.zeros((0,), dtype=np.bool_)
+    if not camera_ids:
+        return np.ones((boxes.shape[0],), dtype=np.bool_)
+    cams = info.get('cams', {}) or {}
+    missing = [cam_id for cam_id in camera_ids if cam_id not in cams]
+    if missing:
+        raise KeyError(f'GT filter requested missing cameras in token={info.get("token")}: {missing}')
+
+    keep = np.zeros((boxes.shape[0],), dtype=np.bool_)
+    centers = boxes[:, :3]
+    corners = corners_from_boxes(boxes)
+    for cam_id in camera_ids:
+        cam_info = cams[cam_id]
+        center_visible = points_visible_in_camera(centers, cam_info, min_depth)
+        corner_visible = points_visible_in_camera(
+            corners.reshape(-1, 3), cam_info, min_depth).reshape(boxes.shape[0], -1).any(axis=1)
+        keep |= center_visible | corner_visible
+    return keep
+
+
+def gt_used_mask(
+    info: Dict,
+    boxes: np.ndarray,
+    names: Sequence[str],
+    class_names: Sequence[str],
+    gt_filter_range: Optional[Sequence[float]],
+    visible_camera_ids: Optional[Sequence[str]],
+    min_depth: float,
+) -> np.ndarray:
+    """复现 dataset 训练/eval 前的 GT 类别、ROI 和可选可见性过滤口径。"""
+    boxes = np.asarray(boxes, dtype=np.float32)
+    if boxes.ndim != 2:
+        boxes = boxes.reshape(-1, boxes.shape[-1]) if boxes.size else np.zeros((0, 7), dtype=np.float32)
+    count = min(boxes.shape[0], len(names))
+    if count == 0:
+        return np.zeros((0,), dtype=np.bool_)
+    boxes = boxes[:count, :7]
+    class_mask = np.asarray([str(name) in class_names for name in names[:count]], dtype=np.bool_)
+    range_mask = gt_filter_range_mask(boxes, gt_filter_range)
+    visible_mask = gt_visible_camera_mask(info, boxes, visible_camera_ids, min_depth)
+    return class_mask & range_mask & visible_mask
+
+
 def info_output_dir(output_dir: Path, info: Dict) -> Path:
     """按 dataset/sequence/clip 层级生成当前帧的输出目录。"""
     dataset, sequence, clip = info_ref_parts(info)
     return output_dir / dataset / sequence / clip
+
+
+def video_output_path(output_dir: Path, info: Dict, video_group: str) -> Path:
+    """按分组名称生成视频路径，避免所有文件都叫 visualization.mp4。"""
+    dataset, sequence, clip = info_ref_parts(info)
+    if video_group == 'clip':
+        return output_dir / dataset / sequence / clip / f'{clip}.mp4'
+    if video_group == 'sequence':
+        return output_dir / dataset / sequence / f'{sequence}.mp4'
+    raise ValueError(f'Unsupported video_group: {video_group}')
+
+
+def video_frame_sort_key(
+    output_dir: Path,
+    video_group: str,
+    item: Tuple[int, Dict],
+) -> Tuple:
+    """先按目标视频聚合，再按时间戳排序，保证只需一个活动编码进程。"""
+    pkl_index, info = item
+    timestamp = info.get('timestamp')
+    try:
+        timestamp_key = int(timestamp)
+    except (TypeError, ValueError):
+        timestamp_key = int(pkl_index)
+    _, _, clip = info_ref_parts(info)
+    return (
+        str(video_output_path(output_dir, info, video_group)),
+        timestamp_key,
+        clip,
+        int(pkl_index),
+    )
 
 
 def frame_stem_from_info(info: Dict, fallback_index: int) -> str:
@@ -292,30 +886,14 @@ def tensor_like_to_numpy(value, dtype=None) -> np.ndarray:
     return arr
 
 
-def is_lidar_instance_boxes(value) -> bool:
-    """判断对象是否是 MMDetection3D 的 LiDARInstance3DBoxes。
-
-    这里不直接 import mmdet3d，避免离线可视化在轻量环境中因为 mmdet3d/cuda
-    扩展缺失而失败。test.py 保存的 pred pkl 会保留 boxes_3d 的 Python 类，
-    因此用类名判断足够稳定。
-    """
-    return value is not None and value.__class__.__name__ == 'LiDARInstance3DBoxes'
-
-
-def prediction_boxes_to_numpy(boxes) -> np.ndarray:
-    """把预测框转成可视化使用的 ``[x, y, z_center, l, w, h, yaw]``。
-
-    GT pkl 中的 ``gt_boxes`` 会在 CustomMultiViewDataset 中以
-    ``origin=(0.5, 0.5, 0.5)`` 包成 LiDARInstance3DBoxes，说明 pkl 里的 z
-    按 3D 框重心保存；而 test.py 的预测结果已经是 LiDARInstance3DBoxes，
-    其 ``tensor[:, 2]`` 是 MMDetection3D lidar 约定下的底中心 z。为了让 GT
-    和 Pred 共用同一套本地角点生成逻辑，预测框在这里补回 ``h/2``。
-    """
-    boxes_np = tensor_like_to_numpy(boxes, dtype=np.float32)
-    if is_lidar_instance_boxes(boxes) and boxes_np.ndim >= 2 and boxes_np.shape[-1] >= 6:
-        boxes_np = boxes_np.copy()
-        boxes_np[..., 2] += boxes_np[..., 5] * 0.5
-    return boxes_np
+def prediction_boxes_to_numpy(boxes, box_origin: Optional[str] = None) -> np.ndarray:
+    """把预测框统一成可视化使用的重心 origin numpy 数组。"""
+    return n7_boxes_to_numpy(
+        boxes,
+        target_origin='center',
+        source_origin=box_origin,
+        box_dim=None,
+        dtype=np.float32)
 
 
 def get_class_names(metadata: Dict, infos: Sequence[Dict]) -> List[str]:
@@ -328,6 +906,23 @@ def get_class_names(metadata: Dict, infos: Sequence[Dict]) -> List[str]:
             if name not in names:
                 names.append(name)
     return names or ['unknown']
+
+
+def metadata_camera_ids(metadata: Dict) -> List[str]:
+    """从 metadata 中读取 converter 记录的相机列表。"""
+    camera_ids = metadata.get('camera_ids')
+    if camera_ids is None:
+        output_summary = metadata.get('output_summary', {})
+        if isinstance(output_summary, dict):
+            camera_ids = output_summary.get('expected_camera_ids')
+    if not camera_ids:
+        return []
+    return [str(cam_id) for cam_id in camera_ids]
+
+
+def is_mono_front_metadata(metadata: Dict) -> bool:
+    """判断当前 pkl 是否是约定的 cam0 单目前视输出。"""
+    return metadata_camera_ids(metadata) == ['cam0']
 
 
 def class_color(name: str, class_names: Sequence[str]) -> Tuple[int, int, int]:
@@ -345,6 +940,26 @@ def pred_color(name: str, class_names: Sequence[str]) -> Tuple[int, int, int]:
     except ValueError:
         idx = len(class_names)
     return PRED_COLORS[idx % len(PRED_COLORS)]
+
+
+def video_legend_layout_items(
+    class_names: Sequence[str],
+    draw_gt: bool,
+    draw_pred: bool,
+    gt_view_mode: str,
+    box_label_mode: str,
+) -> List[Tuple[str, Tuple[int, int, int]]]:
+    """列出视频可能出现的图例项，仅用于预计算固定 Header 布局。"""
+    if box_label_mode != 'compact':
+        return []
+    items: List[Tuple[str, Tuple[int, int, int]]] = []
+    if draw_gt:
+        items.extend((f'GT {name}', class_color(name, class_names)) for name in class_names)
+        if gt_view_mode == 'split':
+            items.extend((f'Filtered {name}', FILTERED_GT_COLOR) for name in class_names)
+    if draw_pred:
+        items.extend((f'Pred {name}', pred_color(name, class_names)) for name in class_names)
+    return items
 
 
 def unwrap_prediction_result(result):
@@ -376,7 +991,7 @@ def prediction_result_to_draw_items(
     if boxes is None or scores is None or labels is None:
         return np.zeros((0, 7), dtype=np.float32), [], [], []
 
-    boxes_np = prediction_boxes_to_numpy(boxes)
+    boxes_np = prediction_boxes_to_numpy(boxes, result.get('box_origin'))
     if boxes_np.ndim == 0:
         return np.zeros((0, 7), dtype=np.float32), [], [], []
     if boxes_np.ndim == 1:
@@ -446,13 +1061,13 @@ def undistort_if_requested(
     dist_full = np.zeros(8, dtype=np.float64)
     dist_full[:min(distortion.size, dist_full.size)] = distortion[:dist_full.size]
     cache_key = (h, w, tuple(intrinsic.reshape(-1)), tuple(dist_full), float(alpha))
-
-    if cache_key not in UNDISTORT_CACHE:
-        new_k, _ = cv2.getOptimalNewCameraMatrix(intrinsic, dist_full, (w, h), alpha, (w, h))
-        map1, map2 = cv2.initUndistortRectifyMap(intrinsic, dist_full, None, new_k, (w, h), cv2.CV_16SC2)
-        UNDISTORT_CACHE[cache_key] = (map1, map2, new_k.astype(np.float32))
-
-    map1, map2, new_k = UNDISTORT_CACHE[cache_key]
+    map1, map2, new_k = get_undistort_maps(
+        cache_key=cache_key,
+        intrinsic=intrinsic,
+        distortion=dist_full,
+        image_size=(w, h),
+        alpha=float(alpha),
+    )
     return cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR), new_k
 
 
@@ -580,10 +1195,11 @@ def draw_corner_edges(
     inside = ((corner_uv[:, 0] >= 0) & (corner_uv[:, 0] < w) &
               (corner_uv[:, 1] >= 0) & (corner_uv[:, 1] < h))
     auto_max_edge = max(w, h) * 0.35 if max_edge_px <= 0 else max_edge_px
+    base_thickness = max(1, int(round(min(h, w) / 420.0)))
     for start, end in BOX_EDGES:
         if not (depth_valid[start] and depth_valid[end] and finite[start] and finite[end]):
             continue
-        thickness = 3 if (start, end) in FRONT_EDGES else 2
+        thickness = base_thickness + 1 if (start, end) in FRONT_EDGES else base_thickness
         if use_clipline:
             draw_plain_clipped_line(image, corner_uv[start], corner_uv[end], color, thickness)
             continue
@@ -632,7 +1248,11 @@ def draw_projected_box(
         return
     anchor = valid_uv[inside][np.argmin(valid_uv[inside][:, 1])]
     x, y = np.round(anchor).astype(int).tolist()
-    cv2.putText(image, label, (x, max(18, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+    label_scale = float(np.clip(min(h, w) / 850.0, 0.42, 0.62))
+    label_thickness = max(1, int(round(min(h, w) / 650.0)))
+    cv2.putText(
+        image, label, (x, max(18, y - 4)), cv2.FONT_HERSHEY_SIMPLEX,
+        label_scale, color, label_thickness, cv2.LINE_AA)
 
 
 def draw_boxes_on_camera(
@@ -772,8 +1392,13 @@ def camera_info_for_loaded_image(cam_info: Dict, image: np.ndarray) -> Dict:
 
 
 def pad_to_shape(image: np.ndarray, height: int, width: int) -> np.ndarray:
-    canvas = np.zeros((height, width, 3), dtype=np.uint8)
     h, w = image.shape[:2]
+    if (h, w) == (height, width):
+        return image
+    if h > height or w > width:
+        raise ValueError(
+            f'Cannot pad image {w}x{h} to smaller target {width}x{height}')
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
     canvas[:h, :w] = image
     return canvas
 
@@ -883,12 +1508,14 @@ def add_top_header(
     image: np.ndarray,
     text: str,
     legend_items: Optional[Sequence[Tuple[str, Tuple[int, int, int]]]] = None,
+    legend_layout_items: Optional[Sequence[Tuple[str, Tuple[int, int, int]]]] = None,
 ) -> np.ndarray:
     """给整张可视化图增加顶部标题栏，避免遮挡任何相机画面。
 
     预测可视化会把类别和 GT/Pred 来源放到顶部图例里，画面中的框只保留
-    必要文本，避免一帧里目标多时遮挡图像内容。图例优先和标题放在同一行，
-    只有宽度不足时才换行。
+    必要文本，避免一帧里目标多时遮挡图像内容。普通图片根据当前帧内容自动
+    排版；视频额外传入整批可能出现的 ``legend_layout_items``，只用它决定固定
+    Header 高度，实际仍只绘制当前帧 ``legend_items``。
     """
     _, w = image.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -901,16 +1528,57 @@ def add_top_header(
     legend_total_w = sum(legend_widths)
     title_gap = 28 if legend_items else 0
     title_full_w = cv2.getTextSize(str(text), font, title_scale, title_thickness)[0][0]
-    single_line = bool(legend_items) and title_full_w + title_gap + legend_total_w <= w - 24
 
-    if single_line:
-        title_max_w = w - 24 - title_gap - legend_total_w
-        legend_rows = [[(label, color, item_w) for (label, color), item_w in zip(legend_items, legend_widths)]]
-        header_h = 40
+    if legend_layout_items is None:
+        # 单帧图片保持原有行为：能放下就和标题同行，否则按当前图例自动换行。
+        single_line = (
+            bool(legend_items) and
+            title_full_w + title_gap + legend_total_w <= w - 24
+        )
+        if single_line:
+            title_max_w = w - 24 - title_gap - legend_total_w
+            legend_rows = [[
+                (label, color, item_w)
+                for (label, color), item_w in zip(legend_items, legend_widths)
+            ]]
+            header_h = 40
+        else:
+            title_max_w = w - 24
+            legend_rows = make_legend_rows(
+                legend_items, w, font, legend_scale, legend_thickness)
+            header_h = 40 + 24 * len(legend_rows)
     else:
-        title_max_w = w - 24
-        legend_rows = make_legend_rows(legend_items, w, font, legend_scale, legend_thickness)
-        header_h = 40 + 24 * len(legend_rows)
+        # 视频只固定布局，不固定内容。用最坏情况下的完整图例决定单/多行，
+        # 从而保证不同帧只改变图标内容，不改变画布高度。
+        layout_items = list(legend_layout_items)
+        if not layout_items:
+            single_line = False
+            title_max_w = w - 24
+            legend_rows = []
+            header_h = 40
+        else:
+            layout_total_w = sum(
+                legend_item_width(label, font, legend_scale, legend_thickness)
+                for label, _ in layout_items)
+            min_title_width = min(520, max(220, w // 3))
+            single_line = (
+                layout_total_w + 28 + min_title_width <= w - 24
+            )
+        if layout_items and single_line:
+            # 当前帧类别较少时把空余空间还给标题；标题过长只截断，不增高 Header。
+            title_max_w = max(80, w - 24 - title_gap - legend_total_w)
+            legend_rows = [[
+                (label, color, item_w)
+                for (label, color), item_w in zip(legend_items, legend_widths)
+            ]] if legend_items else []
+            header_h = 40
+        elif layout_items:
+            title_max_w = w - 24
+            layout_rows = make_legend_rows(
+                layout_items, w, font, legend_scale, legend_thickness)
+            legend_rows = make_legend_rows(
+                legend_items, w, font, legend_scale, legend_thickness)
+            header_h = 40 + 24 * len(layout_rows)
     header = np.full((header_h, w, 3), 24, dtype=np.uint8)
 
     title = fit_text_to_width(text, title_max_w, font, title_scale, title_thickness)
@@ -943,6 +1611,7 @@ def render_camera_panel(
     max_edge_px: float,
     draw_fullres: bool,
     display_aspect: str,
+    camera_size: Optional[Tuple[int, int]] = None,
 ) -> np.ndarray:
     cam_info = info['cams'][cam_id]
     image_path = resolve_image_path(data_root, cam_info['data_path'])
@@ -964,7 +1633,12 @@ def render_camera_panel(
             labels=labels, colors=colors)
         if draw_fullres:
             image = resize_to_width(image, camera_width)
-    image = resize_to_display_aspect(image, display_aspect)
+    if camera_size is not None:
+        target_w, target_h = [int(value) for value in camera_size]
+        if image.shape[:2] != (target_h, target_w):
+            image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        image = resize_to_display_aspect(image, display_aspect)
     draw_label_tag(image, display_name)
     return image
 
@@ -972,6 +1646,9 @@ def render_camera_panel(
 def make_camera_mosaic(panels: Sequence[np.ndarray]) -> np.ndarray:
     if not panels:
         return placeholder_image(960, 540, 'no cameras')
+    if len(panels) == 1:
+        # 单目路径无需 pad/concatenate，直接复用已经完成绘制的相机面板。
+        return panels[0]
     if len(panels) == 6:
         rows = [panels[:3], panels[3:]]
     else:
@@ -982,9 +1659,18 @@ def make_camera_mosaic(panels: Sequence[np.ndarray]) -> np.ndarray:
     for row in rows:
         max_h = max(img.shape[0] for img in row)
         max_w = max(img.shape[1] for img in row)
-        row_images.append(np.concatenate([pad_to_shape(img, max_h, max_w) for img in row], axis=1))
+        padded_row = [pad_to_shape(img, max_h, max_w) for img in row]
+        row_images.append(
+            padded_row[0] if len(padded_row) == 1 else
+            np.concatenate(padded_row, axis=1))
     max_row_w = max(img.shape[1] for img in row_images)
-    return np.concatenate([pad_to_shape(img, img.shape[0], max_row_w) for img in row_images], axis=0)
+    padded_rows = [
+        pad_to_shape(img, img.shape[0], max_row_w)
+        for img in row_images
+    ]
+    if len(padded_rows) == 1:
+        return padded_rows[0]
+    return np.concatenate(padded_rows, axis=0)
 
 
 def make_metric_bev_range(bev_range: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
@@ -1165,6 +1851,10 @@ def draw_bev_box_by_source(
         draw_dashed_polyline(image, pts, (245, 245, 245), thickness=3, dash_len=10, gap_len=6)
         draw_dashed_polyline(image, pts, color, thickness=2, dash_len=10, gap_len=6)
         return
+    if source == 'Filtered':
+        draw_dashed_polyline(image, pts, (55, 55, 55), thickness=3, dash_len=8, gap_len=8)
+        draw_dashed_polyline(image, pts, color, thickness=2, dash_len=8, gap_len=8)
+        return
     cv2.polylines(image, [pts], True, (245, 245, 245), 4, cv2.LINE_AA)
     cv2.polylines(image, [pts], True, color, 2, cv2.LINE_AA)
 
@@ -1224,6 +1914,12 @@ def render_info(
     no_bev: bool,
     box_label_mode: str,
     display_aspect: str,
+    gt_view_mode: str,
+    gt_filter_visible_camera: Optional[Sequence[str]],
+    gt_filter_range: Optional[Sequence[float]],
+    no_header: bool = False,
+    camera_size: Optional[Tuple[int, int]] = None,
+    legend_layout_items: Optional[Sequence[Tuple[str, Tuple[int, int, int]]]] = None,
 ) -> np.ndarray:
     box_layers: List[np.ndarray] = []
     name_layers: List[str] = []
@@ -1231,24 +1927,69 @@ def render_info(
     source_layers: List[str] = []
     color_layers: List[Tuple[int, int, int]] = []
 
-    raw_gt_boxes = to_numpy(info.get('gt_boxes', np.zeros((0, 7), dtype=np.float32)))
+    raw_gt_boxes = to_numpy(info.get('gt_boxes', np.zeros((0, 7), dtype=np.float32)), dtype=np.float32)
+    if raw_gt_boxes.size == 0:
+        raw_gt_boxes = np.zeros((0, 7), dtype=np.float32)
+    elif raw_gt_boxes.ndim == 1:
+        raw_gt_boxes = raw_gt_boxes.reshape(1, -1)
     raw_gt_names = [str(x) for x in list(info.get('gt_names', []))]
     gt_total_count = min(len(raw_gt_boxes), len(raw_gt_names)) if raw_gt_boxes.size else 0
     gt_stat_boxes = raw_gt_boxes[:gt_total_count] if gt_total_count > 0 else np.zeros((0, 7), dtype=np.float32)
     gt_in_bev_count = count_boxes_in_bev_range(gt_stat_boxes, bev_range)
     gt_boxes = gt_stat_boxes
     gt_names = raw_gt_names[:gt_total_count]
+    used_mask = gt_used_mask(
+        info, gt_boxes, gt_names, class_names, gt_filter_range,
+        gt_filter_visible_camera, min_depth)
+    used_count = int(used_mask.sum())
     if draw_gt and gt_total_count > 0:
-        box_layers.append(gt_boxes)
-        name_layers.extend(gt_names)
-        if box_label_mode == 'compact':
-            label_layers.extend(['' for _ in gt_names])
-        elif box_label_mode == 'none':
-            label_layers.extend(['' for _ in gt_names])
+        if gt_view_mode == 'used':
+            draw_gt_boxes = gt_boxes[used_mask]
+            draw_gt_names = [name for name, keep in zip(gt_names, used_mask) if keep]
+            box_layers.append(draw_gt_boxes)
+            name_layers.extend(draw_gt_names)
+            if box_label_mode in ('compact', 'none'):
+                label_layers.extend(['' for _ in draw_gt_names])
+            else:
+                label_layers.extend([f'U:{name}' for name in draw_gt_names])
+            source_layers.extend(['GT' for _ in draw_gt_names])
+            color_layers.extend([class_color(name, class_names) for name in draw_gt_names])
+        elif gt_view_mode == 'split':
+            used_boxes = gt_boxes[used_mask]
+            used_names = [name for name, keep in zip(gt_names, used_mask) if keep]
+            filtered_boxes = gt_boxes[~used_mask]
+            filtered_names = [name for name, keep in zip(gt_names, used_mask) if not keep]
+            if len(used_boxes):
+                box_layers.append(used_boxes)
+                name_layers.extend(used_names)
+                if box_label_mode in ('compact', 'none'):
+                    label_layers.extend(['' for _ in used_names])
+                else:
+                    label_layers.extend([f'U:{name}' for name in used_names])
+                source_layers.extend(['GT' for _ in used_names])
+                color_layers.extend([class_color(name, class_names) for name in used_names])
+            if len(filtered_boxes):
+                box_layers.append(filtered_boxes)
+                name_layers.extend(filtered_names)
+                if box_label_mode == 'none':
+                    label_layers.extend(['' for _ in filtered_names])
+                elif box_label_mode == 'compact':
+                    label_layers.extend(['' for _ in filtered_names])
+                else:
+                    label_layers.extend([f'F:{name}' for name in filtered_names])
+                source_layers.extend(['Filtered' for _ in filtered_names])
+                color_layers.extend([FILTERED_GT_COLOR for _ in filtered_names])
         else:
-            label_layers.extend([f'G:{name}' for name in gt_names])
-        source_layers.extend(['GT' for _ in gt_names])
-        color_layers.extend([class_color(name, class_names) for name in gt_names])
+            box_layers.append(gt_boxes)
+            name_layers.extend(gt_names)
+            if box_label_mode == 'compact':
+                label_layers.extend(['' for _ in gt_names])
+            elif box_label_mode == 'none':
+                label_layers.extend(['' for _ in gt_names])
+            else:
+                label_layers.extend([f'G:{name}' for name in gt_names])
+            source_layers.extend(['GT' for _ in gt_names])
+            color_layers.extend([class_color(name, class_names) for name in gt_names])
 
     pred_count = 0
     if draw_pred and pred_result is not None:
@@ -1286,22 +2027,37 @@ def render_info(
     panels = [
         render_camera_panel(
             info, cam_id, data_root, boxes, name_layers, label_layers, color_layers, class_names, camera_width,
-            undistort, undistort_alpha, min_depth, max_edge_px, draw_fullres, display_aspect)
+            undistort, undistort_alpha, min_depth, max_edge_px, draw_fullres,
+            display_aspect, camera_size)
         for cam_id in choose_camera_order(info, camera_ids)
     ]
     mosaic = make_camera_mosaic(panels)
     timestamp = info.get('timestamp', 'unknown')
     ref_text = compact_info_ref(info) if box_label_mode == 'compact' else '/'.join(info_ref_parts(info))
-    header_text = f'{ref_text} | ts={timestamp} | GT={gt_in_bev_count}/{gt_total_count}'
+    if gt_view_mode == 'raw':
+        header_text = f'{ref_text} | ts={timestamp} | GT={gt_in_bev_count}/{gt_total_count}'
+    else:
+        header_text = (
+            f'{ref_text} | ts={timestamp} | GT used={used_count}/{gt_total_count} '
+            f'filtered={gt_total_count - used_count}')
     if draw_pred:
         header_text += f' | Pred={pred_count} score>={pred_score_thr:.2f}'
     if no_bev:
-        return add_top_header(mosaic, header_text, legend_items=legend_items)
-    bev = render_bev_panel(
-        boxes, name_layers, class_names, bev_range, bev_size, bev_heading_style,
-        labels=label_layers, colors=color_layers, sources=source_layers)
-    bev = cv2.resize(bev, (mosaic.shape[0], mosaic.shape[0]), interpolation=cv2.INTER_AREA)
-    return add_top_header(np.concatenate([mosaic, bev], axis=1), header_text, legend_items=legend_items)
+        content = mosaic
+    else:
+        bev = render_bev_panel(
+            boxes, name_layers, class_names, bev_range, bev_size, bev_heading_style,
+            labels=label_layers, colors=color_layers, sources=source_layers)
+        bev = cv2.resize(bev, (mosaic.shape[0], mosaic.shape[0]), interpolation=cv2.INTER_AREA)
+        content = np.concatenate([mosaic, bev], axis=1)
+    if no_header:
+        return content
+    return add_top_header(
+        content,
+        header_text,
+        legend_items=legend_items,
+        legend_layout_items=legend_layout_items,
+    )
 
 
 def selected_infos(infos: Sequence[Dict], start_index: int, stride: int, max_frames: Optional[int]) -> Iterable[Tuple[int, Dict]]:
@@ -1313,9 +2069,48 @@ def selected_infos(infos: Sequence[Dict], start_index: int, stride: int, max_fra
         count += 1
 
 
+def ordered_thread_map(
+    function: Callable[[Tuple[int, Dict]], Tuple],
+    items: Sequence[Tuple[int, Dict]],
+    workers: int,
+    prefetch_factor: int = 2,
+) -> Iterator[Tuple]:
+    """有界并行渲染并按输入顺序返回，兼顾视频时序和内存占用。"""
+    if workers <= 1:
+        for item in items:
+            yield function(item)
+        return
+
+    item_iterator = iter(items)
+    pending = deque()
+    window_size = max(int(workers) * int(prefetch_factor), 1)
+
+    def submit_next(executor: ThreadPoolExecutor) -> bool:
+        try:
+            item = next(item_iterator)
+        except StopIteration:
+            return False
+        pending.append(executor.submit(function, item))
+        return True
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for _ in range(window_size):
+            if not submit_next(executor):
+                break
+        try:
+            while pending:
+                future = pending.popleft()
+                result = future.result()
+                submit_next(executor)
+                yield result
+        finally:
+            for future in pending:
+                future.cancel()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='可视化并校验 Fast-BEV CustomMultiViewDataset 使用的 pkl 真值。',
+        description='可视化并校验 Fast-BEV pkl，并通过 FFmpeg 直接输出 H.264 MP4。',
         formatter_class=RawDefaultsHelpFormatter,
         epilog=USAGE_EXAMPLES)
     parser.add_argument('--gt-pkl', '--pkl', dest='gt_pkl', required=True,
@@ -1323,7 +2118,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--pred-pkl', default=None, help='tools/test.py --out 保存的预测结果 pkl；按 index 和 --gt-pkl 中 infos 对齐')
     parser.add_argument('--data-root', required=True, help='converter --data-path 使用的数据根目录；相对图片路径会在该目录下解析')
     parser.add_argument('--output-dir', required=True, help='输出可视化图片帧和可选视频的目录')
-    parser.add_argument('--camera-ids', nargs='+', default=None, help='指定要绘制的相机 id；默认使用六目检查顺序')
+    parser.add_argument('--camera-ids', nargs='+', default=None,
+                        help='指定要绘制的相机 id；默认按 pkl 中实际存在的相机选择，6V 会使用六目检查顺序')
     parser.add_argument('--start-index', type=int, default=0, help='从第几个 info 开始可视化')
     parser.add_argument('--stride', type=int, default=1, help='每隔多少个 info 可视化一帧')
     parser.add_argument('--max-frames', type=int, default=100, help='最多渲染多少帧；设为 -1 表示全部渲染')
@@ -1333,16 +2129,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--hide-pred', action='store_true', help='读取 --pred-pkl 时不绘制预测框，仅保留 GT；用于快速对比')
     parser.add_argument('--box-label-mode', default='auto', choices=['auto', 'compact', 'full', 'none'],
                         help='框文字显示模式；auto 会在存在预测 pkl 时默认 compact，GT-only 时默认 full')
-    parser.add_argument('--camera-width', type=int, default=640, help='拼接前每个相机小图的宽度')
+    parser.add_argument('--gt-view-mode', default='raw', choices=['raw', 'used', 'split'],
+                        help='GT 显示模式：raw 画 pkl 原始 GT；used 只画训练/eval 口径 GT；split 用彩色/灰色区分 used/filtered')
+    parser.add_argument('--gt-filter-visible-camera', nargs='+', default=None,
+                        help='gt-view-mode=used/split 时用于判断 GT 可见性的相机；mono-front pkl 默认使用 cam0')
+    parser.add_argument('--gt-filter-range', nargs='+', type=float, default=None,
+                        help='gt-view-mode=used/split 时的 GT ROI，可填 4 维 x_min y_min x_max y_max 或 6 维 point_cloud_range；mono-front pkl 默认使用 0 -35 -5 80 35 3')
+    parser.add_argument('--camera-width', type=int, default=None,
+                        help='拼接前每个相机小图的宽度；默认单相机 1280，多相机 640')
+    parser.add_argument('--camera-size', nargs=2, type=int, metavar=('WIDTH', 'HEIGHT'), default=None,
+                        help='明确指定每个相机面板的最终宽高，例如 1600 900；不包含顶部信息栏和 BEV')
     parser.add_argument('--display-aspect', default='native', choices=['native', '16:9'],
                         help='最终显示层的相机小图比例；native 保持真实训练/缓存图比例，16:9 只拉伸输出画面')
     parser.add_argument('--draw-fullres', action='store_true', help='在原始分辨率上画框/去畸变后再缩放；速度慢，仅用于对比旧逻辑')
     parser.add_argument('--no-render', action='store_true', help='只执行 pkl 读取和参数解析，不生成可视化图片或视频')
     parser.add_argument('--bev-size', type=int, default=700, help='BEV 面板在缩放到拼图高度前的尺寸')
-    parser.add_argument('--bev-range-mode', default='fastbev', choices=['fastbev', 'auto'], help='BEV 显示范围来源；fastbev 使用 x/y 都为 ±50m，auto 根据 pkl 中所有 GT box 自动推断')
+    parser.add_argument('--bev-range-mode', default='fastbev', choices=['fastbev', 'front', 'auto'],
+                        help='BEV 显示范围来源；fastbev 对 cam0 单目 pkl 使用前视 ROI，否则使用 x/y ±50m；front 固定使用 mono-front ROI；auto 根据 pkl 中所有 GT box 自动推断')
     parser.add_argument('--bev-range', nargs=4, type=float, metavar=('X_MIN', 'Y_MIN', 'X_MAX', 'Y_MAX'), default=None, help='固定 BEV 显示范围；填写后优先级高于 --bev-range-mode')
     parser.add_argument('--bev-heading-style', default='front-edge', choices=['front-edge', 'arrow', 'none'], help='BEV 目标朝向显示方式；front-edge 用前边加粗，arrow 使用中心箭头，none 不画朝向')
     parser.add_argument('--no-bev', action='store_true', help='只保存相机拼图，不拼接 BEV 面板')
+    parser.add_argument('--no-header', action='store_true',
+                        help='不添加顶部信息栏；仅在需要无标题纯画面时使用')
     parser.add_argument('--undistort', dest='undistort', action='store_true', default=True, help='画框前先对图片去畸变，并使用 OpenCV 返回的新内参投影；默认开启')
     parser.add_argument('--raw-distorted', dest='undistort', action='store_false', default=argparse.SUPPRESS,
                         help='不去畸变，在原始畸变图上使用畸变投影；用于检查板端原始输入显示效果')
@@ -1350,14 +2158,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-corner-edge-px', type=float, default=0.0, help='原始畸变图中角点连线最大像素长度；0 表示按图像尺寸自动设置。默认去畸变时不使用该限制')
     parser.add_argument('--min-depth', type=float, default=0.1, help='不绘制深度小于该阈值的投影边')
     parser.add_argument('--fps', type=int, default=10, help='输出视频帧率')
-    parser.add_argument('--no-video', action='store_true', help='不输出 visualization.mp4 视频')
-    parser.add_argument('--video-only', action='store_true', help='只输出 visualization.mp4，不保存 frames 图片；不能和 --no-video 同时使用')
+    parser.add_argument('--video-encoder', default='libx264', choices=['libx264', 'h264_nvenc'],
+                        help='H.264 编码器；默认 CPU libx264，GPU NVENC 必须显式启用且失败时不会自动回退')
+    parser.add_argument('--ffmpeg-bin', default='ffmpeg',
+                        help='FFmpeg 可执行文件名称或完整路径')
+    parser.add_argument('--ffmpeg-threads', type=int, default=2,
+                        help='libx264 编码线程数；h264_nvenc 模式下忽略')
+    parser.add_argument('--no-video', action='store_true', help='不输出视频')
+    parser.add_argument('--video-only', action='store_true', help='只输出视频，不保存 frames 图片；不能和 --no-video 同时使用')
+    parser.add_argument('--video-group', default='clip', choices=['clip', 'sequence'],
+                        help='视频分组：clip 保持现有每 clip 一个视频；sequence 合并为每 sequence 一个视频')
+    parser.add_argument('--max-frames-per-video', type=int, default=-1,
+                        help='每个视频最多写入多少帧；<0 表示不限制，适合控制全量 sequence 视频长度')
     parser.add_argument('--workers', type=int, default=1, help='并行渲染帧数；视频模式下会按顺序写视频、并行预渲染，建议从 2 或 4 开始')
     parser.add_argument('--image-ext', default='jpg', choices=['jpg', 'png'], help='逐帧可视化图片格式')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
     if args.video_only and args.no_video:
         parser.error('--video-only 和 --no-video 不能同时使用')
+    if args.gt_filter_range is not None and len(args.gt_filter_range) not in (4, 6):
+        parser.error('--gt-filter-range 只能填写 4 个或 6 个数字')
+    if args.max_frames_per_video == 0:
+        parser.error('--max-frames-per-video 不能为 0；使用负数表示不限制')
+    if args.fps <= 0:
+        parser.error('--fps 必须大于 0')
+    if args.workers <= 0:
+        parser.error('--workers 必须大于 0')
+    if args.ffmpeg_threads <= 0:
+        parser.error('--ffmpeg-threads 必须大于 0')
+    if args.camera_size is not None:
+        if min(args.camera_size) <= 0:
+            parser.error('--camera-size 的 WIDTH/HEIGHT 必须大于 0')
+        if args.camera_width is not None:
+            parser.error('--camera-size 和 --camera-width 不能同时使用')
+        if args.display_aspect != 'native':
+            parser.error('--camera-size 已明确宽高，不能再同时使用非 native 的 --display-aspect')
     return args
 
 
@@ -1384,39 +2219,104 @@ def main() -> None:
     max_frames = None if args.max_frames is not None and args.max_frames < 0 else args.max_frames
     if args.bev_range:
         bev_range = make_metric_bev_range(tuple(args.bev_range))
+        bev_range_source = 'cli'
+    elif args.bev_range_mode == 'front':
+        bev_range = make_metric_bev_range(MONO_FRONT_BEV_RANGE)
+        bev_range_source = 'front'
     elif args.bev_range_mode == 'fastbev':
-        bev_range = make_metric_bev_range((-50.0, -50.0, 50.0, 50.0))
+        if is_mono_front_metadata(metadata):
+            bev_range = make_metric_bev_range(MONO_FRONT_BEV_RANGE)
+            bev_range_source = 'fastbev-mono-front-metadata'
+        else:
+            bev_range = make_metric_bev_range(FULL_SURROUND_BEV_RANGE)
+            bev_range_source = 'fastbev-full-surround'
     else:
         bev_range = infer_bev_range(infos)
+        bev_range_source = 'auto'
 
     draw_pred = pred_results is not None and not args.hide_pred
     if args.box_label_mode == 'auto':
         box_label_mode = 'compact' if draw_pred else 'full'
     else:
         box_label_mode = args.box_label_mode
+    single_camera_view = (
+        is_mono_front_metadata(metadata) or
+        (args.camera_ids is not None and len(args.camera_ids) == 1)
+    )
+    camera_size = tuple(args.camera_size) if args.camera_size is not None else None
+    camera_width = (
+        int(camera_size[0]) if camera_size is not None else
+        int(args.camera_width) if args.camera_width is not None else
+        1280 if single_camera_view else 640)
+    gt_filter_visible_camera = args.gt_filter_visible_camera
+    gt_filter_range = args.gt_filter_range
+    if args.gt_view_mode != 'raw' and is_mono_front_metadata(metadata):
+        if gt_filter_visible_camera is None:
+            gt_filter_visible_camera = ['cam0']
+        if gt_filter_range is None:
+            gt_filter_range = list(MONO_FRONT_GT_FILTER_RANGE)
 
     logger.info('Loaded %d infos from %s', len(infos), pkl_path)
     logger.info('metadata.coordinate=%s', metadata.get('coordinate', 'unknown'))
+    logger.info('metadata.camera_ids=%s', metadata_camera_ids(metadata) or 'unknown')
     logger.info('data_root=%s', data_root)
     logger.info('class_names=%s', class_names)
-    logger.info('bev_range=%s', bev_range)
+    logger.info('bev_range=%s source=%s', bev_range, bev_range_source)
     logger.info('draw_gt=%s draw_pred=%s score_thr=%.3f max_preds=%d',
                 not args.hide_gt, draw_pred,
                 args.score_thr, args.max_preds)
     logger.info('box_label_mode=%s', box_label_mode)
-    logger.info('camera_width=%d display_aspect=%s', args.camera_width, args.display_aspect)
+    logger.info('gt_view_mode=%s gt_filter_visible_camera=%s gt_filter_range=%s',
+                args.gt_view_mode, gt_filter_visible_camera, gt_filter_range)
+    logger.info('camera_width=%d camera_size=%s display_aspect=%s single_camera_view=%s',
+                camera_width, camera_size, args.display_aspect, single_camera_view)
     logger.info('undistort=%s undistort_alpha=%.3f', args.undistort, args.undistort_alpha)
     if args.no_render:
         logger.info('Skip rendering because --no-render is set.')
         return
 
-    writers: Dict[Path, Tuple[cv2.VideoWriter, Tuple[int, int]]] = {}
-    rendered = 0
-    saved_frame_dirs = set()
-    iterator = list(selected_infos(infos, args.start_index, args.stride, max_frames))
+    workers = int(args.workers)
+    # 多 worker 时关闭 OpenCV 内部线程池，避免每帧再嵌套开启多个 CPU 线程。
+    cv2.setNumThreads(1 if workers > 1 else 4)
 
-    def render_and_save_frame(item, need_canvas=False):
-        """渲染并保存单帧；多线程模式下不返回大图，减少内存占用。"""
+    ffmpeg_binary = None
+    if not args.no_video:
+        ffmpeg_binary = resolve_ffmpeg_binary(args.ffmpeg_bin)
+        logger.info(
+            'Checking FFmpeg encoder: binary=%s encoder=%s',
+            ffmpeg_binary, args.video_encoder)
+        check_ffmpeg_encoder(ffmpeg_binary, args.video_encoder, args.ffmpeg_threads)
+        logger.info('FFmpeg encoder preflight passed: %s', args.video_encoder)
+
+    iterator = list(selected_infos(infos, args.start_index, args.stride, max_frames))
+    if not args.no_video:
+        iterator.sort(
+            key=lambda item: video_frame_sort_key(
+                output_dir, args.video_group, item))
+    if not args.no_video and args.max_frames_per_video > 0:
+        group_counts: Dict[Path, int] = {}
+        limited_iterator = []
+        for item in iterator:
+            group_path = video_output_path(output_dir, item[1], args.video_group)
+            count = group_counts.get(group_path, 0)
+            if count >= args.max_frames_per_video:
+                continue
+            group_counts[group_path] = count + 1
+            limited_iterator.append(item)
+        iterator = limited_iterator
+
+    video_legend_layout = None
+    if not args.no_video and not args.no_header:
+        video_legend_layout = video_legend_layout_items(
+            class_names=class_names,
+            draw_gt=not args.hide_gt,
+            draw_pred=draw_pred,
+            gt_view_mode=args.gt_view_mode,
+            box_label_mode=box_label_mode,
+        )
+
+    def render_and_save_frame(item):
+        """渲染一帧；逐帧图片可并行保存，视频始终由主线程顺序写入。"""
         pkl_index, info = item
         pred_result = None
         if pred_results is not None and pkl_index < len(pred_results):
@@ -1429,9 +2329,9 @@ def main() -> None:
             pred_score_thr=args.score_thr,
             max_preds=args.max_preds,
             draw_gt=not args.hide_gt,
-            draw_pred=pred_results is not None and not args.hide_pred,
+            draw_pred=draw_pred,
             camera_ids=args.camera_ids,
-            camera_width=args.camera_width,
+            camera_width=camera_width,
             bev_range=bev_range,
             bev_size=args.bev_size,
             bev_heading_style=args.bev_heading_style,
@@ -1443,90 +2343,89 @@ def main() -> None:
             no_bev=args.no_bev,
             box_label_mode=box_label_mode,
             display_aspect=args.display_aspect,
+            gt_view_mode=args.gt_view_mode,
+            gt_filter_visible_camera=gt_filter_visible_camera,
+            gt_filter_range=gt_filter_range,
+            no_header=args.no_header,
+            camera_size=camera_size,
+            legend_layout_items=video_legend_layout,
         )
-        ref_output_dir = info_output_dir(output_dir, info)
-        frame_dir = ref_output_dir / 'frames'
+        current_video_path = video_output_path(output_dir, info, args.video_group)
         saved_frame_dir = None
-        if args.video_only:
-            # 只生成视频时不落逐帧图片，避免内网批量检查时产生大量小文件。
-            ref_output_dir.mkdir(parents=True, exist_ok=True)
-        else:
+        if not args.video_only:
+            frame_dir = info_output_dir(output_dir, info) / 'frames'
             frame_dir.mkdir(parents=True, exist_ok=True)
             frame_path = frame_dir / f'{frame_stem_from_info(info, pkl_index)}.{args.image_ext}'
-            cv2.imwrite(str(frame_path), canvas)
+            if not cv2.imwrite(str(frame_path), canvas):
+                raise OSError(f'OpenCV failed to write visualization frame: {frame_path}')
             saved_frame_dir = frame_dir
-        if need_canvas:
-            return saved_frame_dir, ref_output_dir, canvas
-        return saved_frame_dir, ref_output_dir, None
+        return (
+            saved_frame_dir,
+            current_video_path,
+            canvas if not args.no_video else None,
+        )
 
-    def write_video_frame(ref_output_dir: Path, canvas: np.ndarray) -> None:
-        """按输出目录顺序写视频帧；VideoWriter 只在主线程使用。"""
-        video_path = ref_output_dir / 'visualization.mp4'
-        h, w = canvas.shape[:2]
-        if ref_output_dir not in writers:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writers[ref_output_dir] = (cv2.VideoWriter(str(video_path), fourcc, args.fps, (w, h)), (w, h))
-            logger.info('Video writer: %s %dx%d @ %dfps', video_path, w, h, args.fps)
-        writer, writer_size = writers[ref_output_dir]
-        if writer_size == (w, h):
-            writer.write(canvas)
-        else:
-            logger.warning('Skip video frame with changed size for %s: got %dx%d expected %dx%d',
-                           ref_output_dir, w, h, writer_size[0], writer_size[1])
+    video_writer = None
+    if not args.no_video:
+        assert ffmpeg_binary is not None
+        video_writer = VideoWriterManager(
+            fps=args.fps,
+            encoder=args.video_encoder,
+            ffmpeg_bin=ffmpeg_binary,
+            threads=args.ffmpeg_threads,
+        )
 
-    workers = max(int(args.workers), 1)
-    if args.no_video and workers > 1:
-        logger.info('Parallel rendering enabled: workers=%d', workers)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(render_and_save_frame, item, False) for item in iterator]
-            for future in tqdm(as_completed(futures), total=len(futures), desc='visualizing'):
-                frame_dir, _, _ = future.result()
-                if frame_dir is not None:
-                    saved_frame_dirs.add(frame_dir)
-                rendered += 1
-    elif (not args.no_video) and workers > 1:
-        logger.info('Parallel rendering with ordered video writing enabled: workers=%d', workers)
-        # 视频必须按帧顺序写入，但渲染可以并行预取。窗口限制为 workers*2，
-        # 避免长序列时把大量 canvas 堆在内存里。
-        pending = deque()
-        iterator_iter = iter(iterator)
-        window_size = max(workers * 2, 1)
-
-        def submit_next(executor) -> bool:
-            try:
-                next_item = next(iterator_iter)
-            except StopIteration:
-                return False
-            pending.append(executor.submit(render_and_save_frame, next_item, True))
-            return True
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            for _ in range(window_size):
-                if not submit_next(executor):
-                    break
-            with tqdm(total=len(iterator), desc='visualizing') as progress:
-                while pending:
-                    future = pending.popleft()
-                    frame_dir, ref_output_dir, canvas = future.result()
-                    if frame_dir is not None:
-                        saved_frame_dirs.add(frame_dir)
-                    write_video_frame(ref_output_dir, canvas)
-                    rendered += 1
-                    progress.update(1)
-                    submit_next(executor)
-    else:
-        for item in tqdm(iterator, total=len(iterator), desc='visualizing'):
-            frame_dir, ref_output_dir, canvas = render_and_save_frame(item, need_canvas=not args.no_video)
+    if workers > 1:
+        logger.info(
+            'Bounded ordered parallel rendering enabled: workers=%d prefetch=%d',
+            workers, workers * 2)
+    rendered = 0
+    saved_frame_dirs = set()
+    started_at = time.monotonic()
+    try:
+        results = ordered_thread_map(render_and_save_frame, iterator, workers)
+        for frame_dir, video_path, canvas in tqdm(
+            results, total=len(iterator), desc='visualizing'):
             if frame_dir is not None:
                 saved_frame_dirs.add(frame_dir)
-
-            if not args.no_video:
-                write_video_frame(ref_output_dir, canvas)
+            if video_writer is not None:
+                assert canvas is not None
+                video_writer.write(video_path, canvas)
             rendered += 1
+        if video_writer is not None:
+            video_writer.close()
+    except BaseException:
+        if video_writer is not None:
+            video_writer.abort()
+        raise
 
-    for writer, _ in writers.values():
-        writer.release()
-    logger.info('Rendered %d frames under %s', rendered, output_dir)
+    elapsed = time.monotonic() - started_at
+    throughput = rendered / elapsed if elapsed > 0 else 0.0
+    logger.info(
+        'Rendered %d frames under %s in %.2fs (%.2f frames/s)',
+        rendered, output_dir, elapsed, throughput)
+    if video_writer is not None:
+        logger.info(
+            'FFmpeg summary: encoder=%s videos=%d frames=%d pipe_wait=%.2fs close_wait=%.2fs',
+            args.video_encoder,
+            video_writer.video_count,
+            video_writer.frame_count,
+            video_writer.write_seconds,
+            video_writer.close_seconds,
+        )
+    if args.undistort:
+        cache_stats = undistort_cache_stats()
+        logger.info(
+            'Undistort cache: entries=%d memory=%.1fMiB hits=%d misses=%d evictions=%d '
+            'limits=%d entries/%.0fMiB',
+            cache_stats['entries'],
+            cache_stats['bytes'] / (1024.0 * 1024.0),
+            cache_stats['hits'],
+            cache_stats['misses'],
+            cache_stats['evictions'],
+            cache_stats['max_entries'],
+            cache_stats['max_bytes'] / (1024.0 * 1024.0),
+        )
     for frame_dir in sorted(saved_frame_dirs):
         logger.info('Frame directory: %s', frame_dir)
 

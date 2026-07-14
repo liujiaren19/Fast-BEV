@@ -79,10 +79,9 @@ class KittiSetOrigin:
         return results
 
 
-
 @PIPELINES.register_module()
 class FrontCameraVisibleObjectFilter:
-    """Keep 3D GT boxes whose centers or corners project into selected views."""
+    """按相机可见性过滤 3D GT。"""
 
     def __init__(self, n_images=1, min_depth=0.1, keep_if_no_boxes=True):
         self.n_images = n_images
@@ -122,21 +121,27 @@ class FrontCameraVisibleObjectFilter:
             keep = np.zeros(num_boxes, dtype=np.bool_)
             for projection, image_shape in zip(projections, image_shapes):
                 projection = np.asarray(projection[:3, :4], dtype=np.float32)
-                center_visible = self._project_visible(centers, projection, image_shape)
+                center_visible = self._project_visible(
+                    centers, projection, image_shape)
                 corner_points = corners.reshape(-1, 3)
                 corner_visible = self._project_visible(
-                    corner_points, projection, image_shape).reshape(num_boxes, -1).any(axis=1)
+                    corner_points, projection, image_shape).reshape(
+                        num_boxes, -1).any(axis=1)
                 keep |= center_visible | corner_visible
 
-        mask = gt_bboxes_3d.tensor.new_tensor(keep, dtype=gt_bboxes_3d.tensor.dtype).bool()
+        mask = gt_bboxes_3d.tensor.new_tensor(
+            keep, dtype=gt_bboxes_3d.tensor.dtype).bool()
         results['gt_bboxes_3d'] = gt_bboxes_3d[mask]
         results['gt_labels_3d'] = results['gt_labels_3d'][keep]
         if 'gt_bboxes' in results:
-            results['gt_bboxes'] = [b for b, k in zip(results['gt_bboxes'], keep) if k]
+            results['gt_bboxes'] = [
+                b for b, k in zip(results['gt_bboxes'], keep) if k]
         if 'gt_labels' in results:
-            results['gt_labels'] = [l for l, k in zip(results['gt_labels'], keep) if k]
+            results['gt_labels'] = [
+                l for l, k in zip(results['gt_labels'], keep) if k]
         if 'gt_bboxes_ignore' in results:
-            results['gt_bboxes_ignore'] = [b for b, k in zip(results['gt_bboxes_ignore'], keep) if k]
+            results['gt_bboxes_ignore'] = [
+                b for b, k in zip(results['gt_bboxes_ignore'], keep) if k]
         return results
 
     def __repr__(self):

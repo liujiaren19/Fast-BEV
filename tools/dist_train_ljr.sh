@@ -32,12 +32,19 @@ WORK_DIR="${WORK_DIR:-work_dirs/n7_6v_704_256/20251017_20251030_20251031_2025120
 TRAIN_BATCH="${TRAIN_BATCH:-24}"
 EVAL_BATCH="${EVAL_BATCH:-${TRAIN_BATCH}}"
 WORKERS="${WORKERS:-8}"
+NO_VALIDATE="${NO_VALIDATE:-0}"
+
+TRAIN_EXTRA_ARGS=()
+if [[ "${NO_VALIDATE}" == "1" ]]; then
+    TRAIN_EXTRA_ARGS+=(--no-validate)
+fi
 
 MASTER_PORT=$(comm -23 <(seq 29500 29600 | sort) <(ss -tan | awk '{print $4}' | cut -d':' -f2 | sort -u) | shuf | head -n 1)
 
 echo "[INFO] CONFIG=${CONFIG}"
 echo "[INFO] WORK_DIR=${WORK_DIR}"
 echo "[INFO] TRAIN_BATCH=${TRAIN_BATCH}, EVAL_BATCH=${EVAL_BATCH}, WORKERS=${WORKERS}"
+echo "[INFO] NO_VALIDATE=${NO_VALIDATE}"
 echo "[INFO] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 # 使用适合PyTorch 1.10.0的启动方式
@@ -47,6 +54,7 @@ setsid python -m torch.distributed.launch \
     tools/train.py \
     "${CONFIG}" \
     --work-dir="${WORK_DIR}" \
+    "${TRAIN_EXTRA_ARGS[@]}" \
     --launcher=pytorch \
     --cfg-options \
     data.samples_per_gpu="${TRAIN_BATCH}" \

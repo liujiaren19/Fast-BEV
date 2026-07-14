@@ -23,8 +23,10 @@
     <data-root>/manifests/<dataset>_<set>_clips.txt
     <data-root>/<dataset>/<dataset>_<set>_clips.txt
 
-manifest 中每个非空、非注释行都必须是 ``dataset/sequence/clip``。如果没有
-找到 manifest，脚本会在 ``--data-path`` 下递归发现 clip。
+manifest 中每个非空、非注释行都必须是 ``dataset/sequence/clip``。正式转换
+默认要求每个 dataset/set 都存在 manifest；只有显式传
+``--allow-auto-discovery --allow-partial`` 的 debug 任务才会递归发现 clip，且
+输出 sidecar 会保持 FAIL 状态，不能直接作为正式训练数据。
 
 坐标系约定
 ----------
@@ -53,9 +55,12 @@ N7 3D_OD 标签按如下原始 lidar 坐标系理解：
 -------------
 pkl 结构是 ``{"infos": infos, "metadata": metadata}``。脚本会同时在同目录写入
 ``*.summary.json``，只包含 metadata 和统计信息，便于不打开大 pkl 时快速核对。
+converter 默认启用 strict data gate：关键 clip/frame/camera/label 字段错误时，
+只写带失败原因的 summary 并非零退出，不写 pkl。``--allow-partial`` 仅供定位
+脏数据，不能用于正式训练。
 每个 info 包含：
 
-    - 六目图像路径
+    - 按 ``--camera-ids`` 选择的图像路径，默认六目，单目示例只包含 ``cam0``
     - 相机内参和 camera-to-lidar 外参
     - 3D boxes、类别、速度、track id
     - 当前帧 lidar pose
@@ -82,6 +87,22 @@ key frame lidar 坐标系，从而尽量复刻原 Fast-BEV nuScenes 时序输入
         --info-json data/info_json/2025_04_18_2k_byd_info.json \
         --output-dir data/N7_704_256/pkl \
         --extra-tag custom_fastbev \
+        --image-size 256 704
+
+    # 单目前视 cam0：只生成前视相机 pkl，用于
+    # configs/fastbev/custom/custom_fastbev_mono_front_r18.py。
+    # 关键参数是 --camera-ids cam0；输出文件名仍为
+    # {tag}_{scope}_infos_{set}_{YYYYMMDD}.pkl，训练配置中的
+    # ann_scope/ann_date 必须与实际输出文件名保持一致。
+    python tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py \
+        --data-path data/N7_704_256 \
+        --datasets 20251203_151928_16 \
+        --sets train val test \
+        --info-json data/info_json/2025_04_18_2k_byd_info.json \
+        --output-dir data/N7_704_256/mono_front_pkl \
+        --extra-tag custom_fastbev \
+        --camera-ids cam0 \
+        --require-pose \
         --image-size 256 704
 
     # 原始 1600x900 图：可以不传 --image-size，让脚本读取图片 header；
@@ -114,6 +135,7 @@ import os
 import os.path as osp
 import pickle
 import re
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -125,6 +147,11 @@ from PIL import Image
 from pyquaternion import Quaternion
 from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
+
+try:
+    from tools.data_converter.n7.fastbev_pkl_data_gate import audit_fastbev_payload
+except ModuleNotFoundError:
+    from fastbev_pkl_data_gate import audit_fastbev_payload
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -281,6 +308,7 @@ class ConversionStats:
     clips_total: int = 0
     clips_missing_paths: int = 0
     labels_total: int = 0
+    image_frames_total: int = 0
     labels_without_frame: int = 0
     labels_without_cameras: int = 0
     labels_without_gt: int = 0
@@ -294,12 +322,21 @@ class ConversionStats:
     clips_with_pose_file: int = 0
     labels_with_pose: int = 0
     labels_without_pose: int = 0
+    labels_failed: int = 0
+    failure_counts: Dict[str, int] = field(default_factory=dict)
+    failure_examples: Dict[str, List[str]] = field(default_factory=dict)
 
     def as_dict(self) -> Dict:
         data = dict(self.__dict__)
         # dict 字段复制一份，避免调用方误改 stats 内部状态。
-        for key in ('raw_class_counts', 'mapped_class_counts', 'kept_class_counts'):
+        for key in (
+                'raw_class_counts', 'mapped_class_counts', 'kept_class_counts',
+                'failure_counts'):
             data[key] = dict(data.get(key, {}))
+        data['failure_examples'] = {
+            str(key): list(values)
+            for key, values in data.get('failure_examples', {}).items()
+        }
         return data
 
     def merge(self, other: 'ConversionStats') -> None:
@@ -307,13 +344,27 @@ class ConversionStats:
             current = getattr(self, key)
             if isinstance(current, dict):
                 for sub_key, sub_value in value.items():
-                    current[sub_key] = current.get(sub_key, 0) + sub_value
+                    if isinstance(sub_value, list):
+                        merged = list(current.get(sub_key, [])) + list(sub_value)
+                        current[sub_key] = merged[:20]
+                    else:
+                        current[sub_key] = current.get(sub_key, 0) + sub_value
             else:
                 setattr(self, key, current + value)
 
     @staticmethod
     def count(mapping: Dict[str, int], key: str) -> None:
         mapping[key] = mapping.get(key, 0) + 1
+
+    def record_failure(self, category: str, sample: str, *, label_failed: bool = False) -> None:
+        """分类记录 converter 失败原因和少量可追溯样本。"""
+        category = str(category)
+        self.count(self.failure_counts, category)
+        examples = self.failure_examples.setdefault(category, [])
+        if len(examples) < 20:
+            examples.append(str(sample))
+        if label_failed:
+            self.labels_failed += 1
 
 
 class TimestampMatcher:
@@ -949,16 +1000,46 @@ def discover_refs(data_root: Path, dataset_name: str) -> List[ClipRef]:
     )
 
 
-def load_refs_for_set(data_root: Path, dataset_name: str, set_name: str) -> List[ClipRef]:
+def load_refs_for_set(
+    data_root: Path,
+    dataset_name: str,
+    set_name: str,
+    allow_auto_discovery: bool,
+) -> Tuple[List[ClipRef], Optional[Path], bool]:
+    """加载一个 split 的 clip 列表，并返回 manifest/自动发现 provenance。"""
     for manifest in manifest_candidates(data_root, dataset_name, set_name):
         if manifest.exists():
             refs = parse_manifest(manifest)
+            if not refs:
+                raise ValueError('manifest contains no clips: {}'.format(manifest))
+            duplicates = [ref for ref, count in Counter(refs).items() if count > 1]
+            if duplicates:
+                raise ValueError(
+                    'manifest contains duplicate clips {}: {}'.format(
+                        manifest, duplicates[:10]))
+            foreign_datasets = sorted({ref.dataset for ref in refs if ref.dataset != dataset_name})
+            if foreign_datasets:
+                # ``--datasets`` 也允许传 manifest 前缀，因此这里不能要求前缀与
+                # manifest 内记录的真实 dataset 名完全一致。跨 split 污染仍由
+                # 后续基于 (dataset, sequence, clip) 的重叠门禁负责拦截。
+                logger.warning(
+                    'Manifest prefix %s differs from contained dataset names=%s: %s',
+                    dataset_name, foreign_datasets, manifest)
             logger.info('Loaded %d clips from %s', len(refs), manifest)
-            return refs
+            return refs, manifest, False
+    if not allow_auto_discovery:
+        candidates = ', '.join(str(path) for path in manifest_candidates(
+            data_root, dataset_name, set_name))
+        raise FileNotFoundError(
+            'No manifest for dataset={} set={}. Expected one of: {}. '
+            'Automatic discovery is debug-only; pass --allow-auto-discovery explicitly.'.format(
+                dataset_name, set_name, candidates))
     refs = discover_refs(data_root, dataset_name)
     if refs:
-        logger.info('Discovered %d clips under %s for dataset %s', len(refs), data_root, dataset_name)
-    return refs
+        logger.warning(
+            'Debug auto-discovery selected %d clips under %s for dataset=%s set=%s',
+            len(refs), data_root, dataset_name, set_name)
+    return refs, None, True
 
 
 def adjacent_view(
@@ -1104,6 +1185,7 @@ def build_info_for_label(
     image_size_override: Optional[Tuple[int, int]],
     pose_index: Optional[OdomPoseIndex],
     max_pose_match_us: int,
+    require_pose: bool,
     stats: ConversionStats,
 ) -> Optional[Dict]:
     """根据单个 label 和匹配到的图像帧构建一个 Fast-BEV info。
@@ -1113,13 +1195,15 @@ def build_info_for_label(
     时序补偿就只需要做刚体变换组合。
     """
     ann = parse_label(label_path, classes, stats)
-    if len(ann['gt_names']) == 0 and not keep_empty:
+    if len(ann['gt_names']) == 0:
         stats.labels_without_gt += 1
-        return None
+        if not keep_empty:
+            return None
 
     image_map = collect_frame_images(frame_dir, camera_ids)
     if image_map is None:
         stats.labels_without_cameras += 1
+        stats.record_failure('missing_cameras', str(label_path))
         return None
 
     cams = {}
@@ -1135,6 +1219,8 @@ def build_info_for_label(
         max_pose_match_us=max_pose_match_us)
     if pose_info is None:
         stats.labels_without_pose += 1
+        if require_pose:
+            stats.record_failure('missing_pose', str(label_path))
         pose_info = {}
     else:
         stats.labels_with_pose += 1
@@ -1180,12 +1266,16 @@ def process_clip(
     adjacent_mode: str,
     adjacent_time_offsets_us: Sequence[int],
     keep_empty: bool,
+    require_pose: bool,
     image_size_override: Optional[Tuple[int, int]],
 ) -> Tuple[List[Dict], ConversionStats]:
     stats = ConversionStats(clips_total=1)
     paths = resolve_clip_paths(data_root, ref)
     if paths is None:
         stats.clips_missing_paths += 1
+        stats.record_failure(
+            'missing_clip_paths',
+            '{}/{}/{}'.format(ref.dataset, ref.sequence, ref.clip))
         return [], stats
     label_dir, frames_dir = paths
     # N7 parsed_data/frames 使用 lidar 时间戳作为目录名，且该时间戳已经和
@@ -1193,6 +1283,9 @@ def process_clip(
     # 关联到相邻 lidar 帧。最近邻匹配仅作为旧数据导出的兼容选项保留。
     matcher = TimestampMatcher(frames_dir) if frame_match_mode == 'nearest' else None
     frame_index = build_frame_index(frames_dir) if frame_match_mode == 'exact' else None
+    stats.image_frames_total = (
+        len(frame_index) if frame_index is not None else
+        len(matcher.items) if matcher is not None else 0)
 
     odom_path = resolve_odom_path(data_root, ref, frames_dir)
     pose_index = OdomPoseIndex(odom_path) if odom_path is not None else None
@@ -1206,18 +1299,30 @@ def process_clip(
         try:
             label_ts = timestamp_from_path(label_path)
         except ValueError:
-            payload = annotation_payload(load_json(label_path))
-            label_ts = int(payload.get('frame_timestamp', 0))
+            try:
+                payload = annotation_payload(load_json(label_path))
+                label_ts = int(payload.get('frame_timestamp', 0))
+                if label_ts <= 0:
+                    raise ValueError('missing/invalid frame_timestamp')
+            except Exception as exc:
+                stats.record_failure(
+                    'invalid_label_timestamp',
+                    '{}: {}'.format(label_path, exc),
+                    label_failed=True)
+                logger.warning('Skip invalid label timestamp %s: %s', label_path, exc)
+                continue
         if frame_match_mode == 'exact':
             frame_dir = frame_index.get(label_ts) if frame_index is not None else None
             if frame_dir is None:
                 stats.labels_without_frame += 1
+                stats.record_failure('missing_frame', str(label_path))
                 continue
             frame_ts = label_ts
         else:
             matched = matcher.closest(label_ts, max_match_us)
             if matched is None:
                 stats.labels_without_frame += 1
+                stats.record_failure('missing_frame', str(label_path))
                 continue
             frame_ts, frame_dir = matched
         try:
@@ -1234,10 +1339,15 @@ def process_clip(
                 image_size_override=image_size_override,
                 pose_index=pose_index,
                 max_pose_match_us=max_pose_match_us,
+                require_pose=require_pose,
                 stats=stats,
             )
         except Exception as exc:
-            logger.debug('Skip %s: %s', label_path, exc)
+            stats.record_failure(
+                exc.__class__.__name__,
+                '{}: {}'.format(label_path, exc),
+                label_failed=True)
+            logger.warning('Skip %s because %s: %s', label_path, exc.__class__.__name__, exc)
             continue
         if info is not None:
             infos.append(info)
@@ -1267,16 +1377,25 @@ def make_metadata(
     output_scope: str,
     name_date: str,
     image_size_override: Optional[Tuple[int, int]],
+    data_root: Path,
+    keep_empty: bool,
+    require_pose: bool,
+    strict_conversion: bool,
+    manifest_sources: Sequence[Path],
+    auto_discovery_used: bool,
 ) -> Dict:
     return {
         'version': 'custom-fastbev-n7-od',
         'created': datetime.now().isoformat(),
         'set': set_name,
         'datasets': list(datasets),
+        'data_root': str(data_root),
         'classes': list(classes),
         'camera_ids': list(camera_ids),
         'coordinate': 'mmdet3d_lidar:x_front_y_left_z_up; origin=N7_top_lidar',
         'source_coordinate': 'custom_lidar:x_left_y_rear_z_up; origin=N7_top_lidar',
+        'gt_box_origin': 'center',
+        'gt_box_layout': '[x,y,z_center,l,w,h,yaw]',
         'pose_coordinate': 'clip_reference_from_lidar in mmdet3d_lidar axes; clip reference is usually first odom row',
         'pose_sources': ['odom_lidar_reference', 'label_lidar_pose'],
         'temporal_compensation': 'CustomMultiViewDataset composes adjacent lidar2global with key lidar2global',
@@ -1290,6 +1409,11 @@ def make_metadata(
         'adjacent_time_offsets_us': list(adjacent_time_offsets_us),
         'output_scope': output_scope,
         'output_name_date': name_date,
+        'keep_empty': bool(keep_empty),
+        'require_pose': bool(require_pose),
+        'strict_conversion': bool(strict_conversion),
+        'manifest_sources': [str(path) for path in manifest_sources],
+        'auto_discovery_used': bool(auto_discovery_used),
         'image_size_override': list(image_size_override) if image_size_override is not None else None,
         'camera_intrinsic_sizes': camera_intrinsic_size_summary(calib, camera_ids),
         'camera_image_size': (
@@ -1345,24 +1469,162 @@ def output_pkl_path(out_dir: Path, extra_tag: str, scope: str, set_name: str, na
     return out_dir / f'{tag}_{scope}_infos_{set_part}_{date_part}.pkl'
 
 
-def save_pkl(infos: List[Dict], metadata: Dict, out_path: Path, dry_run: bool) -> None:
-    summary_path = out_path.with_suffix('.summary.json')
-    summary = {
-        'pkl_path': str(out_path),
-        'infos': len(infos),
-        'metadata': metadata,
+def summarize_output_infos(infos: List[Dict], metadata: Dict) -> Dict:
+    """生成 pkl 契约摘要，便于快速确认单目/时序输出是否符合配置。"""
+    expected_camera_ids = [str(x) for x in metadata.get('camera_ids', [])]
+    expected_prev_count = len(metadata.get('adjacent_time_offsets_us', []) or [])
+    camera_count_hist: Dict[str, int] = {}
+    camera_id_frame_counts: Dict[str, int] = {}
+    frames_with_camera_mismatch = 0
+    frames_with_prev_less_than_expected = 0
+    min_prev_count = None
+    max_prev_count = 0
+
+    for info in infos:
+        cams = info.get('cams', {}) or {}
+        cam_ids = [str(x) for x in cams.keys()]
+        camera_count_key = str(len(cam_ids))
+        camera_count_hist[camera_count_key] = camera_count_hist.get(camera_count_key, 0) + 1
+        for cam_id in cam_ids:
+            camera_id_frame_counts[cam_id] = camera_id_frame_counts.get(cam_id, 0) + 1
+        if expected_camera_ids and cam_ids != expected_camera_ids:
+            frames_with_camera_mismatch += 1
+
+        prev_infos = info.get('prev') or []
+        if isinstance(prev_infos, dict):
+            prev_infos = [prev_infos]
+        prev_count = len(prev_infos)
+        min_prev_count = prev_count if min_prev_count is None else min(min_prev_count, prev_count)
+        max_prev_count = max(max_prev_count, prev_count)
+        if expected_prev_count and prev_count < expected_prev_count:
+            frames_with_prev_less_than_expected += 1
+
+    return dict(
+        num_infos=len(infos),
+        expected_camera_ids=expected_camera_ids,
+        camera_count_hist=camera_count_hist,
+        camera_id_frame_counts=camera_id_frame_counts,
+        frames_with_camera_mismatch=frames_with_camera_mismatch,
+        expected_prev_count=expected_prev_count,
+        min_prev_count=0 if min_prev_count is None else min_prev_count,
+        max_prev_count=max_prev_count,
+        frames_with_prev_less_than_expected=frames_with_prev_less_than_expected,
+    )
+
+
+def save_pkl(
+    infos: List[Dict],
+    metadata: Dict,
+    out_path: Path,
+    dry_run: bool,
+    strict_conversion: bool,
+) -> None:
+    metadata = dict(metadata)
+    output_summary = summarize_output_infos(infos, metadata)
+    metadata['output_summary'] = output_summary
+    if output_summary['frames_with_camera_mismatch']:
+        logger.warning(
+            'output camera mismatch frames=%d expected=%s hist=%s',
+            output_summary['frames_with_camera_mismatch'],
+            output_summary['expected_camera_ids'],
+            output_summary['camera_count_hist'])
+    if output_summary['frames_with_prev_less_than_expected']:
+        log_fn = logger.warning if metadata.get('require_pose') else logger.info
+        log_fn(
+            'output temporal prev shortage frames=%d expected_prev=%d min_prev=%d max_prev=%d require_pose=%s',
+            output_summary['frames_with_prev_less_than_expected'],
+            output_summary['expected_prev_count'],
+            output_summary['min_prev_count'],
+            output_summary['max_prev_count'],
+            bool(metadata.get('require_pose')))
+    logger.info('output summary=%s', output_summary)
+
+    camera_image_size = metadata.get('camera_image_size') or {}
+    expected_image_size = None
+    if camera_image_size:
+        expected_image_size = (
+            int(camera_image_size.get('height', 0)),
+            int(camera_image_size.get('width', 0)))
+        if min(expected_image_size) <= 0:
+            expected_image_size = None
+    data_gate = audit_fastbev_payload(
+        infos,
+        metadata,
+        source_path=out_path,
+        split_name=str(metadata.get('set', 'unknown')),
+        expected_camera_ids=metadata.get('camera_ids'),
+        mode='temporal' if metadata.get('require_pose') else 'single-frame',
+        expected_image_size=expected_image_size,
+        visibility_camera_id=(
+            'cam0' if 'cam0' in metadata.get('camera_ids', []) else None),
+        check_image_files=False,
+        data_root=Path(metadata['data_root']) if metadata.get('data_root') else None)
+    metadata['data_gate'] = {
+        'schema_version': 1,
+        'status': data_gate['status'],
+        'failed_checks': data_gate['failed_checks'],
+        'warning_checks': data_gate['warning_checks'],
+        'mode': data_gate['mode'],
     }
+    logger.info(
+        'converter data gate status=%s failures=%d warnings=%d',
+        data_gate['status'], data_gate['failed_checks'], data_gate['warning_checks'])
+    for message in data_gate['failures'][:10]:
+        logger.error('converter data gate failure: %s', message)
+    for message in data_gate['warnings'][:10]:
+        logger.warning('converter data gate warning: %s', message)
+
+    summary_path = out_path.with_suffix('.summary.json')
+    summary = dict(
+        pkl_path=str(out_path),
+        infos=len(infos),
+        metadata=metadata,
+        data_gate=data_gate,
+    )
     if dry_run:
         logger.info('Dry-run: would write %d infos to %s', len(infos), out_path)
         logger.info('Dry-run: would write summary to %s', summary_path)
+        if strict_conversion and data_gate['status'] != 'PASS':
+            raise RuntimeError(
+                'strict converter data gate failed during dry-run: {} failures'.format(
+                    data_gate['failed_checks']))
         return
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open('wb') as f:
-        pickle.dump({'infos': infos, 'metadata': metadata}, f)
     with summary_path.open('w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+    if strict_conversion and data_gate['status'] != 'PASS':
+        raise RuntimeError(
+            'strict converter data gate failed: {} failures; summary={}'.format(
+                data_gate['failed_checks'], summary_path))
+    with out_path.open('wb') as f:
+        pickle.dump({'infos': infos, 'metadata': metadata}, f)
     logger.info('Wrote %d infos to %s', len(infos), out_path)
     logger.info('Wrote summary to %s', summary_path)
+
+
+def register_split_tokens(
+    infos: Sequence[Dict],
+    set_name: str,
+    seen_tokens: Dict[str, str],
+    strict_conversion: bool,
+) -> None:
+    """在写 pkl 前检查本轮转换不同 split 的 token 零重叠。"""
+    tokens = [str(info.get('token', '')) for info in infos if info.get('token')]
+    duplicates = [token for token, count in Counter(tokens).items() if count > 1]
+    overlaps = sorted({token for token in tokens if token in seen_tokens})
+    if duplicates:
+        message = 'set={} contains duplicate tokens: {}'.format(set_name, duplicates[:20])
+        if strict_conversion:
+            raise RuntimeError(message)
+        logger.error(message)
+    if overlaps:
+        message = 'set={} overlaps previous splits on {} tokens: {}'.format(
+            set_name, len(overlaps), overlaps[:20])
+        if strict_conversion:
+            raise RuntimeError(message)
+        logger.error(message)
+    for token in tokens:
+        seen_tokens.setdefault(token, set_name)
 
 
 def convert_one_set(
@@ -1383,20 +1645,31 @@ def convert_one_set(
     adjacent_time_offsets_us: Sequence[int],
     name_date: str,
     keep_empty: bool,
+    require_pose: bool,
     image_size_override: Optional[Tuple[int, int]],
     separate: bool,
     dry_run: bool,
+    strict_conversion: bool,
+    selections: Dict[str, Tuple[List[ClipRef], Optional[Path], bool]],
+    seen_tokens: Dict[str, str],
 ) -> None:
     per_dataset: Dict[str, List[Dict]] = {}
     per_dataset_stats: Dict[str, ConversionStats] = {}
     per_dataset_refs: Dict[str, List[ClipRef]] = {}
+    per_dataset_manifests: Dict[str, Optional[Path]] = {}
+    per_dataset_auto_discovery: Dict[str, bool] = {}
 
     for dataset_name in dataset_names:
-        refs = load_refs_for_set(data_root, dataset_name, set_name)
+        refs, manifest_path, auto_discovery_used = selections[dataset_name]
         if not refs:
-            logger.warning('No clips found for dataset=%s set=%s', dataset_name, set_name)
+            message = 'No clips found for dataset={} set={}'.format(dataset_name, set_name)
+            if strict_conversion:
+                raise RuntimeError(message)
+            logger.warning(message)
             continue
         per_dataset_refs[dataset_name] = refs
+        per_dataset_manifests[dataset_name] = manifest_path
+        per_dataset_auto_discovery[dataset_name] = auto_discovery_used
         infos: List[Dict] = []
         stats = ConversionStats()
         for ref in tqdm(refs, desc=f'{dataset_name}/{set_name}'):
@@ -1413,6 +1686,7 @@ def convert_one_set(
                 adjacent_mode=adjacent_mode,
                 adjacent_time_offsets_us=adjacent_time_offsets_us,
                 keep_empty=keep_empty,
+                require_pose=require_pose,
                 image_size_override=image_size_override,
             )
             infos.extend(clip_infos)
@@ -1423,12 +1697,20 @@ def convert_one_set(
         logger.info('dataset=%s set=%s infos=%d stats=%s', dataset_name, set_name, len(infos), stats.as_dict())
 
         if separate:
+            register_split_tokens(infos, set_name, seen_tokens, strict_conversion)
             output_scope = output_scope_from_refs(refs, [dataset_name])
             metadata = make_metadata(
                 classes, camera_ids, calib, stats, set_name, [dataset_name],
                 frame_match_mode, max_match_us, max_pose_match_us, max_adjacent,
-                adjacent_mode, adjacent_time_offsets_us, output_scope, name_date, image_size_override)
-            save_pkl(infos, metadata, output_pkl_path(out_dir, extra_tag, output_scope, set_name, name_date), dry_run)
+                adjacent_mode, adjacent_time_offsets_us, output_scope, name_date,
+                image_size_override, data_root, keep_empty, require_pose,
+                strict_conversion,
+                [manifest_path] if manifest_path is not None else [],
+                auto_discovery_used)
+            save_pkl(
+                infos, metadata,
+                output_pkl_path(out_dir, extra_tag, output_scope, set_name, name_date),
+                dry_run, strict_conversion)
 
     if separate:
         return
@@ -1442,15 +1724,24 @@ def convert_one_set(
         if dataset_name in per_dataset_stats:
             merged_stats.merge(per_dataset_stats[dataset_name])
     merged_infos.sort(key=lambda x: x['timestamp'])
+    register_split_tokens(merged_infos, set_name, seen_tokens, strict_conversion)
     output_scope = output_scope_from_refs(merged_refs, dataset_names)
+    manifest_sources = [
+        path for path in per_dataset_manifests.values() if path is not None
+    ]
     metadata = make_metadata(
         classes, camera_ids, calib, merged_stats, set_name, dataset_names,
         frame_match_mode, max_match_us, max_pose_match_us, max_adjacent,
-        adjacent_mode, adjacent_time_offsets_us, output_scope, name_date, image_size_override)
+        adjacent_mode, adjacent_time_offsets_us, output_scope, name_date,
+        image_size_override, data_root, keep_empty, require_pose,
+        strict_conversion, manifest_sources,
+        any(per_dataset_auto_discovery.values()))
     if not merged_infos:
-        logger.warning('set=%s produced no infos; skipping output', set_name)
-        return
-    save_pkl(merged_infos, metadata, output_pkl_path(out_dir, extra_tag, output_scope, set_name, name_date), dry_run)
+        logger.error('set=%s produced no infos; data gate will reject this output', set_name)
+    save_pkl(
+        merged_infos, metadata,
+        output_pkl_path(out_dir, extra_tag, output_scope, set_name, name_date),
+        dry_run, strict_conversion)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1466,6 +1757,17 @@ def parse_args() -> argparse.Namespace:
             '--info-json data/info_json/2025_04_18_2k_byd_info.json '
             '--output-dir data/N7_704_256/pkl '
             '--extra-tag custom_fastbev '
+            '--image-size 256 704\n\n'
+            '  # 单目前视 cam0：用于 custom_fastbev_mono_front_r18.py，配置中的 ann_scope/ann_date 需与输出文件名一致\n'
+            '  python tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py '
+            '--data-path data/N7_704_256 '
+            '--datasets 20251203_151928_16 '
+            '--sets train val test '
+            '--info-json data/info_json/2025_04_18_2k_byd_info.json '
+            '--output-dir data/N7_704_256/pkl '
+            '--extra-tag custom_fastbev '
+            '--camera-ids cam0 '
+            '--require-pose '
             '--image-size 256 704\n\n'
             '  # 原始 1600x900 图：可省略 --image-size，或为了减少 header IO 显式填写\n'
             '  python tools/data_converter/n7/n7_raw_3dod_to_fastbev_pkl.py '
@@ -1500,6 +1802,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--camera-ids', nargs='+', default=CAMERA_ORDER, choices=CAMERA_ORDER)
     parser.add_argument('--classes', nargs='+', default=FASTBEV_CLASSES)
     parser.add_argument('--keep-empty', action='store_true', help='保留没有有效 3D box 的帧。')
+    parser.add_argument('--require-pose', action='store_true',
+                        help='时序 B0 转换要求每个 key/adjacent frame 都有 pose；单帧 S0 不需要开启')
+    parser.add_argument('--allow-auto-discovery', action='store_true',
+                        help='仅调试：manifest 缺失时允许递归发现 clip；正式转换默认禁止')
+    parser.add_argument('--allow-partial', action='store_true',
+                        help='仅调试：即使数据门禁失败仍写 pkl；默认 strict，失败只写 summary 并非零退出')
     parser.add_argument('--image-size', nargs=2, type=int, metavar=('HEIGHT', 'WIDTH'), default=None, help='当前 data_path 指向图片的实际尺寸，例如 704 缓存图传 --image-size 256 704。若不传则逐张读取图片 header。')
     parser.add_argument('--separate', '-s', action='store_true', help='每个 dataset/set 单独写一个 pkl，而不是按 set 合并多个数据集。')
     parser.add_argument('--dry-run', action='store_true')
@@ -1530,6 +1838,7 @@ def main() -> None:
     camera_templates = build_camera_templates(calib, args.camera_ids)
     adjacent_time_offsets_us = normalize_adjacent_time_offsets(args.adjacent_time_offsets_us)
     image_size_override = tuple(args.image_size) if args.image_size is not None else None
+    strict_conversion = not args.allow_partial
     name_date = datetime.now().strftime('%Y%m%d')
     logger.info('data_root=%s', data_root)
     logger.info('datasets=%s sets=%s', args.datasets, args.sets)
@@ -1537,13 +1846,49 @@ def main() -> None:
     logger.info('coordinate=mmdet3d_lidar:x_front_y_left_z_up origin=N7_top_lidar')
     logger.info('frame matching mode=%s max_match_us=%s', args.frame_match_mode, args.max_match_us)
     logger.info('pose matching max_pose_match_us=%s', args.max_pose_match_us)
+    logger.info(
+        'strict_conversion=%s require_pose=%s allow_auto_discovery=%s keep_empty=%s',
+        strict_conversion, args.require_pose, args.allow_auto_discovery, args.keep_empty)
     logger.info('adjacent mode=%s time_offsets_us=%s max_adjacent=%s', args.adjacent_mode, adjacent_time_offsets_us, args.max_adjacent)
     logger.info('output name date=%s', name_date)
     logger.info('image_size_override=%s', image_size_override)
     if image_size_override is None:
         logger.warning('未设置 --image-size，converter 会逐帧读取图片 header；22W 帧全量转换建议显式传入图片尺寸。')
 
-    for set_name in args.sets:
+    set_names = [str(value) for value in args.sets]
+    if len(set(set_names)) != len(set_names):
+        raise ValueError('--sets contains duplicates: {}'.format(set_names))
+
+    selections_by_set: Dict[
+        str, Dict[str, Tuple[List[ClipRef], Optional[Path], bool]]
+    ] = {}
+    clip_keys_by_set: Dict[str, set] = {}
+    for set_name in set_names:
+        selections = {}
+        clip_keys = set()
+        for dataset_name in args.datasets:
+            selection = load_refs_for_set(
+                data_root, dataset_name, set_name,
+                allow_auto_discovery=args.allow_auto_discovery)
+            selections[dataset_name] = selection
+            refs, _, _ = selection
+            clip_keys.update((ref.dataset, ref.sequence, ref.clip) for ref in refs)
+        selections_by_set[set_name] = selections
+        clip_keys_by_set[set_name] = clip_keys
+
+    for left_index, left_name in enumerate(set_names):
+        for right_name in set_names[left_index + 1:]:
+            overlaps = sorted(clip_keys_by_set[left_name] & clip_keys_by_set[right_name])
+            if not overlaps:
+                continue
+            message = '{} vs {} manifest clip overlap={} examples={}'.format(
+                left_name, right_name, len(overlaps), overlaps[:20])
+            if strict_conversion:
+                raise RuntimeError(message)
+            logger.error(message)
+
+    seen_tokens: Dict[str, str] = {}
+    for set_name in set_names:
         convert_one_set(
             data_root=data_root,
             dataset_names=args.datasets,
@@ -1562,9 +1907,13 @@ def main() -> None:
             adjacent_time_offsets_us=adjacent_time_offsets_us,
             name_date=name_date,
             keep_empty=args.keep_empty,
+            require_pose=args.require_pose,
             image_size_override=image_size_override,
             separate=args.separate,
             dry_run=args.dry_run,
+            strict_conversion=strict_conversion,
+            selections=selections_by_set[set_name],
+            seen_tokens=seen_tokens,
         )
 
 
