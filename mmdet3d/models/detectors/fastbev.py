@@ -680,10 +680,10 @@ class FastBEV(BaseDetector):
     def onnx_export_3d(self, x, _):
         """导出 3D neck + bbox head。
 
-        输入可以是 4 个时序 BEV tensor 的 list/tuple，也可以是已经 concat
-        好的 4D tensor。厂家 demo 明确解包 ``x_0..x_3``，因此只适配 v1/R18
-        4 时序；当前写法让导出脚本负责传入正确输入列表，函数内部只按
-        channel 维拼接。
+        输入可以是一个原生单帧或多个时序 BEV tensor 的 list/tuple，也可以
+        是已经 concat 好的 4D tensor。导出脚本负责按 config 传入正确数量的
+        输入，函数内部只按 channel 维拼接；当前产品约束正式支持 n_times=1
+        和 n_times=4。
 
         注意这里返回的是 bbox head 原始输出，不对 ``cls_score`` 做 sigmoid。
         PyTorch 后处理 ``bbox_head.get_bboxes`` 和厂家板端后处理都会自己做
