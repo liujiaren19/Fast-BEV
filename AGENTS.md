@@ -7,7 +7,7 @@ Stable project rules for Codex sessions in this repository.
 - Canonical root: `/workspace/Fast-BEV_test_custom-fastbev-adapter`.
 - Start new project sessions from this root, read `AGENTS.md` and `CODEX_HANDOFF.md`, then inspect `git status --short` before editing.
 - Do not resume long historical Codex sessions unless the user explicitly asks. Treat old JSONL sessions as provenance only.
-- Use normal shell commands available in the environment. Do not rely on Headroom or `rtk`; they are not project requirements.
+- Use normal shell commands available in the environment.
 
 ## Communication
 
@@ -65,5 +65,7 @@ Stable project rules for Codex sessions in this repository.
 - The worktree may contain pre-existing dirty files. Do not revert changes you did not make.
 - Show `git diff --stat` before focused diffs.
 - Stage or discuss only task-relevant files.
+- All commits must use the user's GitHub identity `liujiaren19 <1334282612@qq.com>` for both author and committer. Never create a commit as `Codex`, `codex@openai.local`, or another assistant identity.
+- Before every commit, show the exact file scope and commit message to the user and wait for explicit approval. Then verify `git var GIT_AUTHOR_IDENT` and `git var GIT_COMMITTER_IDENT` before running `git commit`.
 - Before treating changes as complete, run targeted `py_compile` or smoke checks plus `git diff --check` when practical.
 - Update `CODEX_HANDOFF.md` after major debugging, conversion, or validation milestones.
