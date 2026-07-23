@@ -295,19 +295,174 @@ def project_points_with_distortion(points_homo: np.ndarray, projection: np.ndarr
         z = np.maximum(z_depth, 1e-5)
         x_c = cam_points[0] / z
         y_c = cam_points[1] / z
-        r2 = x_c * x_c + y_c * y_c
-        radial_num = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
-        radial_den = 1 + k4 * r2 + k5 * r2 ** 2 + k6 * r2 ** 3
-        x_distorted = x_c * radial_num / radial_den + (2 * p1 * x_c * y_c + p2 * (r2 + 2 * x_c ** 2))
-        y_distorted = y_c * radial_num / radial_den + (p1 * (r2 + 2 * y_c ** 2) + 2 * p2 * x_c * y_c)
+        # ROI 中相机背后的点会因 z clamp 产生极大的归一化坐标，后续 valid
+        # 会将这些点全部排除。这里仅屏蔽预期的浮点告警，不改变投影或筛选语义。
+        with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+            r2 = x_c * x_c + y_c * y_c
+            radial_num = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+            radial_den = 1 + k4 * r2 + k5 * r2 ** 2 + k6 * r2 ** 3
+            x_distorted = x_c * radial_num / radial_den + (
+                2 * p1 * x_c * y_c + p2 * (r2 + 2 * x_c ** 2))
+            y_distorted = y_c * radial_num / radial_den + (
+                p1 * (r2 + 2 * y_c ** 2) + 2 * p2 * x_c * y_c)
 
-        distorted = np.stack((x_distorted, y_distorted, np.ones_like(x_distorted)), axis=0)
-        pixel = intrinsic @ distorted
-        pixel = pixel / np.maximum(pixel[2:3], 1e-5)
+            distorted = np.stack(
+                (x_distorted, y_distorted, np.ones_like(x_distorted)), axis=0)
+            pixel = intrinsic @ distorted
+            pixel = pixel / np.maximum(pixel[2:3], 1e-5)
         pixel = post_rot @ pixel + post_tran
         pixel_xy = pixel[:2] / float(stride)
         outputs.append(np.stack((pixel_xy[0] * z_depth, pixel_xy[1] * z_depth, z_depth), axis=0))
     return np.stack(outputs, axis=0).astype(np.float32)
+
+
+def project_points_with_distortion_torch(
+    points_homo: np.ndarray,
+    projection: np.ndarray,
+    img_meta: Dict[str, Any],
+    stride: int,
+    device_text: str,
+):
+    """使用和 ``fastbev.py`` 动态投影相同的 Torch 运算顺序。"""
+    import torch
+
+    device = torch.device(device_text)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError(
+            f'--projection-backend=torch 请求 {device}，但 torch.cuda.is_available()=False')
+
+    points = torch.as_tensor(points_homo, device=device, dtype=torch.float32)
+    projection_tensor = torch.as_tensor(
+        projection, device=device, dtype=torch.float32)
+    aug_infos = img_meta.get('lidar2img', {}).get('lidar2img_aug', [])
+    n_images = points.shape[0]
+    if not isinstance(aug_infos, list) or len(aug_infos) < n_images:
+        raise KeyError(
+            'Torch distortion LUT 要求每个相机都包含 lidar2img_aug；'
+            f'n_images={n_images}, aug_count={len(aug_infos) if isinstance(aug_infos, list) else None}')
+
+    eye3 = torch.eye(3, device=device, dtype=points.dtype)
+    zero3 = torch.zeros(3, device=device, dtype=points.dtype)
+    sensor2lidar_rs = []
+    sensor2lidar_ts = []
+    intrinsics = []
+    post_rots = []
+    post_trans = []
+    distortions = []
+    for cam_id in range(n_images):
+        aug = aug_infos[cam_id]
+        distortion = camera_distortion(img_meta, cam_id)
+        if (not isinstance(aug, dict) or
+                any(key not in aug for key in ('rot', 'tran', 'intrin')) or
+                distortion is None):
+            # 精确对齐模式不能静默回退，否则会生成看似有效但与动态畸变路径
+            # 不同的 LUT。N7 正式资产必须补齐这些字段。
+            raise KeyError(
+                f'Torch distortion LUT 的 cam{cam_id} 缺少 rot/tran/intrin/distortion')
+
+        sensor2lidar_rs.append(torch.as_tensor(
+            aug['rot'], device=device, dtype=points.dtype).reshape(3, 3))
+        sensor2lidar_ts.append(torch.as_tensor(
+            aug['tran'], device=device, dtype=points.dtype).reshape(3, 1))
+        intrinsics.append(torch.as_tensor(
+            aug['intrin'], device=device, dtype=points.dtype).reshape(3, 3))
+        post_rots.append(torch.as_tensor(
+            aug.get('post_rot', eye3), device=device, dtype=points.dtype).reshape(3, 3))
+        post_trans.append(torch.as_tensor(
+            aug.get('post_tran', zero3), device=device, dtype=points.dtype).reshape(3, 1))
+
+        distortion_tensor = torch.as_tensor(
+            distortion, device=device, dtype=points.dtype).reshape(-1)
+        padded = torch.zeros(8, device=device, dtype=points.dtype)
+        if distortion_tensor.numel() >= 8:
+            padded[:] = distortion_tensor[:8]
+        else:
+            padded[:min(distortion_tensor.numel(), 5)] = distortion_tensor[
+                :min(distortion_tensor.numel(), 5)]
+        distortions.append(padded)
+
+    sensor2lidar_r = torch.stack(sensor2lidar_rs)
+    sensor2lidar_t = torch.stack(sensor2lidar_ts)
+    intrinsic = torch.stack(intrinsics)
+    post_rot = torch.stack(post_rots)
+    post_tran = torch.stack(post_trans)
+    distortion = torch.stack(distortions)
+
+    lidar2cam_r = torch.inverse(sensor2lidar_r)
+    cam_points = torch.bmm(
+        lidar2cam_r, points[:, :3] - sensor2lidar_t)
+    z_depth = cam_points[:, 2]
+    z = z_depth.clamp(min=1e-5)
+    x_c = cam_points[:, 0] / z
+    y_c = cam_points[:, 1] / z
+    r2 = x_c * x_c + y_c * y_c
+
+    k1 = distortion[:, 0:1]
+    k2 = distortion[:, 1:2]
+    p1 = distortion[:, 2:3]
+    p2 = distortion[:, 3:4]
+    k3 = distortion[:, 4:5]
+    k4 = distortion[:, 5:6]
+    k5 = distortion[:, 6:7]
+    k6 = distortion[:, 7:8]
+    radial_num = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+    radial_den = 1 + k4 * r2 + k5 * r2 ** 2 + k6 * r2 ** 3
+    x_distorted = x_c * radial_num / radial_den + (
+        2 * p1 * x_c * y_c + p2 * (r2 + 2 * x_c ** 2))
+    y_distorted = y_c * radial_num / radial_den + (
+        p1 * (r2 + 2 * y_c ** 2) + 2 * p2 * x_c * y_c)
+
+    distorted = torch.stack(
+        (x_distorted, y_distorted, torch.ones_like(x_distorted)), dim=1)
+    pixel = torch.bmm(intrinsic, distorted)
+    pixel = pixel / pixel[:, 2:3].clamp(min=1e-5)
+    pixel = torch.bmm(post_rot, pixel) + post_tran
+    pixel_xy = pixel[:, :2] / float(stride)
+    return torch.stack(
+        (pixel_xy[:, 0] * z_depth, pixel_xy[:, 1] * z_depth, z_depth),
+        dim=1)
+
+
+def compute_lut_indices_torch(
+    flat_points: np.ndarray,
+    projection: np.ndarray,
+    img_meta: Dict[str, Any],
+    stride: int,
+    use_distortion: bool,
+    height: int,
+    width: int,
+    device_text: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """用 Torch 完成投影、round 和 valid，避免跨后端像素边界差异。"""
+    import torch
+
+    device = torch.device(device_text)
+    points = torch.as_tensor(flat_points, device=device, dtype=torch.float32)
+    projection_tensor = torch.as_tensor(
+        projection, device=device, dtype=torch.float32)
+    if use_distortion:
+        points_homo = torch.cat(
+            (points, torch.ones_like(points[:, :1])), dim=1)
+        points_2d_3 = project_points_with_distortion_torch(
+            points_homo.detach().cpu().numpy(), projection, img_meta, stride,
+            device_text=device_text)
+    else:
+        points_2d_3 = torch.bmm(
+            projection_tensor[:, :, :3], points) + projection_tensor[:, :, 3:4]
+
+    x = (points_2d_3[:, 0] / points_2d_3[:, 2]).round().long()
+    y = (points_2d_3[:, 1] / points_2d_3[:, 2]).round().long()
+    z = points_2d_3[:, 2]
+    valid = (
+        (x >= 0) & (y >= 0) &
+        (x < int(width)) & (y < int(height)) & (z > 0))
+    return (
+        points_2d_3.detach().cpu().numpy().astype(np.float32),
+        x.detach().cpu().numpy().astype(np.int64),
+        y.detach().cpu().numpy().astype(np.int64),
+        z.detach().cpu().numpy().astype(np.float32),
+        valid.detach().cpu().numpy().astype(bool),
+    )
 
 
 def compute_lut(
@@ -319,24 +474,41 @@ def compute_lut(
     use_distortion: bool,
     camera_overwrite_order: Sequence[int],
     dump_debug_volume: bool,
+    projection_backend: str = 'numpy',
+    torch_device: str = 'cuda:0',
 ) -> Dict[str, np.ndarray]:
     n_images, n_channels, height, width = features_shape
     flat_points = points.reshape(1, 3, -1).repeat(n_images, axis=0)
-    if use_distortion:
-        points_homo = np.concatenate(
-            [flat_points, np.ones((n_images, 1, flat_points.shape[-1]), dtype=np.float32)],
-            axis=1)
-        points_2d_3 = project_points_with_distortion(points_homo, projection, img_meta, stride)
+    if projection_backend == 'torch':
+        points_2d_3, x, y, z, valid = compute_lut_indices_torch(
+            flat_points=flat_points,
+            projection=projection,
+            img_meta=img_meta,
+            stride=stride,
+            use_distortion=use_distortion,
+            height=height,
+            width=width,
+            device_text=torch_device,
+        )
     else:
-        points_2d_3 = projection[:, :, :3] @ flat_points + projection[:, :, 3:4]
+        if use_distortion:
+            points_homo = np.concatenate(
+                [flat_points, np.ones(
+                    (n_images, 1, flat_points.shape[-1]), dtype=np.float32)],
+                axis=1)
+            points_2d_3 = project_points_with_distortion(
+                points_homo, projection, img_meta, stride)
+        else:
+            points_2d_3 = (
+                projection[:, :, :3] @ flat_points + projection[:, :, 3:4])
 
-    z = points_2d_3[:, 2].astype(np.float32)
-    denom = np.where(np.abs(z) > 1e-8, z, np.nan)
-    x_float = np.rint(points_2d_3[:, 0] / denom)
-    y_float = np.rint(points_2d_3[:, 1] / denom)
-    x = np.where(np.isfinite(x_float), x_float, -1).astype(np.int64)
-    y = np.where(np.isfinite(y_float), y_float, -1).astype(np.int64)
-    valid = (x >= 0) & (y >= 0) & (x < width) & (y < height) & (z > 0)
+        z = points_2d_3[:, 2].astype(np.float32)
+        denom = np.where(np.abs(z) > 1e-8, z, np.nan)
+        x_float = np.rint(points_2d_3[:, 0] / denom)
+        y_float = np.rint(points_2d_3[:, 1] / denom)
+        x = np.where(np.isfinite(x_float), x_float, -1).astype(np.int64)
+        y = np.where(np.isfinite(y_float), y_float, -1).astype(np.int64)
+        valid = (x >= 0) & (y >= 0) & (x < width) & (y < height) & (z > 0)
 
     gather_index_dense = np.full_like(x, -1, dtype=np.int64)
     gather_index_dense[valid] = y[valid] * width + x[valid]
@@ -415,26 +587,43 @@ def save_board_bin_outputs(out_dir: Path, arrays: Dict[str, np.ndarray]) -> List
     return lengths
 
 
-def save_lut_outputs(out_dir: Path, arrays: Dict[str, np.ndarray], metadata: Dict[str, Any]) -> None:
+def save_lut_outputs(
+    out_dir: Path,
+    arrays: Dict[str, np.ndarray],
+    metadata: Dict[str, Any],
+    compact_output: bool = False,
+) -> None:
+    """保存 LUT 输出。
+
+    ``compact_output=False`` 保持原诊断工具的完整输出，包含 projection、
+    valid、camera_choice 等中间数组。正式板端运行只需要 ``LUT``、
+    ``LUT_arr`` 和 ``metadata.json``，因此可显式传 ``compact_output=True``
+    避免为每辆车重复保存较大的稠密调试数组。
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    for name, value in arrays.items():
-        np.save(out_dir / f'{name}.npy', value)
+    if not compact_output:
+        for name, value in arrays.items():
+            np.save(out_dir / f'{name}.npy', value)
 
-    # 兼容旧脚本命名：旧逻辑直接读取 features.npy 和 volume.npy。
-    if 'features' not in arrays:
-        (out_dir / 'features.npy').unlink(missing_ok=True)
-    if 'volume' not in arrays:
-        (out_dir / 'volume.npy').unlink(missing_ok=True)
+        # 兼容旧脚本命名：旧逻辑直接读取 features.npy 和 volume.npy。
+        if 'features' not in arrays:
+            (out_dir / 'features.npy').unlink(missing_ok=True)
+        if 'volume' not in arrays:
+            (out_dir / 'volume.npy').unlink(missing_ok=True)
 
-    per_camera_dir = out_dir / 'per_camera'
-    per_camera_dir.mkdir(exist_ok=True)
-    valid = arrays['valid']
-    gather_dense = arrays['gather_index_dense']
-    scatter_dense = arrays['scatter_index_dense']
-    for cam_id in range(valid.shape[0]):
-        cam_valid = valid[cam_id]
-        np.save(per_camera_dir / f'cam{cam_id}_gather_index.npy', gather_dense[cam_id, cam_valid])
-        np.save(per_camera_dir / f'cam{cam_id}_scatter_index.npy', scatter_dense[cam_id, cam_valid])
+        per_camera_dir = out_dir / 'per_camera'
+        per_camera_dir.mkdir(exist_ok=True)
+        valid = arrays['valid']
+        gather_dense = arrays['gather_index_dense']
+        scatter_dense = arrays['scatter_index_dense']
+        for cam_id in range(valid.shape[0]):
+            cam_valid = valid[cam_id]
+            np.save(
+                per_camera_dir / f'cam{cam_id}_gather_index.npy',
+                gather_dense[cam_id, cam_valid])
+            np.save(
+                per_camera_dir / f'cam{cam_id}_scatter_index.npy',
+                scatter_dense[cam_id, cam_valid])
 
     board_lengths = save_board_bin_outputs(out_dir, arrays)
     metadata['board_bin_dir'] = str(out_dir / 'LUT')
@@ -543,7 +732,10 @@ def export_one_sequence(
     camera_overwrite_order: Sequence[int],
     feature_channels: int,
     dump_debug_volume: bool,
+    projection_backend: str,
+    torch_device: str,
     common_metadata: Dict[str, Any],
+    compact_output: bool = False,
 ) -> None:
     start = seq_id * n_images
     end = (seq_id + 1) * n_images
@@ -569,7 +761,9 @@ def export_one_sequence(
         stride=stride,
         use_distortion=use_distortion,
         camera_overwrite_order=camera_overwrite_order,
-        dump_debug_volume=dump_debug_volume)
+        dump_debug_volume=dump_debug_volume,
+        projection_backend=projection_backend,
+        torch_device=torch_device)
     arrays['points'] = points.astype(np.float32)
     arrays['projection'] = projection.astype(np.float32)
     arrays['camera_overwrite_order'] = np.asarray(camera_overwrite_order, dtype=np.int64)
@@ -589,8 +783,14 @@ def export_one_sequence(
         volume_shape=list(arrays['volume'].shape) if 'volume' in arrays else None,
         valid_count_per_camera=arrays['valid'].sum(axis=1).astype(int).tolist(),
         assigned_bev_points=int(arrays['assigned'].sum()),
+        projection_backend=projection_backend,
+        torch_device=torch_device if projection_backend == 'torch' else None,
     ))
-    save_lut_outputs(out_dir, arrays, metadata)
+    save_lut_outputs(
+        out_dir,
+        arrays,
+        metadata,
+        compact_output=compact_output)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -599,7 +799,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('config', help='Fast-BEV config 路径')
     parser.add_argument('--pkl', default=None, help='输入 pkl；默认使用 config.data.<split>.ann_file')
     parser.add_argument('--split', default='test', choices=['train', 'val', 'test'], help='从 config.data 哪个 split 取数据配置')
-    parser.add_argument('--sample-index', type=int, default=0, help='按 timestamp 排序后的样本下标')
+    sample_group = parser.add_mutually_exclusive_group()
+    sample_group.add_argument('--sample-index', type=int, default=None,
+                              help='按 timestamp 排序后的样本下标；未传 --token 时默认 0')
+    sample_group.add_argument('--token', default=None, help='按 token 精确选择样本，推荐真实数值对齐使用')
     parser.add_argument('--seq-id', type=int, default=0, help='导出第几个时序片段，默认 0')
     parser.add_argument('--all-seqs', action='store_true', help='导出样本内所有时序片段到 seq_0/seq_1/... 子目录')
     parser.add_argument('--out-dir', required=True, help='输出目录')
@@ -609,6 +812,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--dump-debug-volume', action='store_true', help='额外生成 features.npy 和 volume.npy')
     parser.add_argument('--use-distortion', dest='use_distortion', action='store_true', default=None, help='强制使用动态畸变投影')
     parser.add_argument('--no-use-distortion', dest='use_distortion', action='store_false', help='强制使用 pinhole 投影')
+    parser.add_argument(
+        '--projection-backend', choices=('numpy', 'torch'), default='numpy',
+        help='LUT 投影/round 后端；严格复现 GPU PTH 动态 backproject 时使用 torch')
+    parser.add_argument(
+        '--torch-device', default='cuda:0',
+        help='--projection-backend=torch 使用的设备；应与黄金 PTH 推理设备一致')
     return parser
 
 
@@ -625,9 +834,17 @@ def main() -> None:
         raise ValueError('请通过 --pkl 或 config.data.<split>.ann_file 指定 pkl')
     pkl_path = Path(pkl_text)
     infos, pkl_metadata = load_infos(pkl_path)
-    if not (0 <= args.sample_index < len(infos)):
-        raise IndexError(f'--sample-index={args.sample_index} 超出 infos 数量 {len(infos)}')
-    info = infos[args.sample_index]
+    if args.token is not None:
+        matches = [index for index, item in enumerate(infos)
+                   if str(item.get('token')) == str(args.token)]
+        if len(matches) != 1:
+            raise ValueError(f'--token={args.token!r} 匹配数量应为 1，实际 {len(matches)}')
+        sample_index = matches[0]
+    else:
+        sample_index = 0 if args.sample_index is None else int(args.sample_index)
+        if not (0 <= sample_index < len(infos)):
+            raise IndexError(f'--sample-index={sample_index} 超出 infos 数量 {len(infos)}')
+    info = infos[sample_index]
 
     pipeline = dataset_cfg.get('pipeline') or cfg.get('test_pipeline') or []
     aug_step = find_pipeline_step(pipeline, 'RandomAugImageMultiViewImage')
@@ -680,7 +897,8 @@ def main() -> None:
         pkl=str(pkl_path),
         pkl_metadata=pkl_metadata,
         split=args.split,
-        sample_index=args.sample_index,
+        sample_index=sample_index,
+        sample_selection='token' if args.token is not None else 'sample_index',
         sample_token=info.get('token'),
         sample_timestamp=info.get('timestamp'),
         frame_records=frame_records,
@@ -697,6 +915,8 @@ def main() -> None:
         data_config=data_config,
         camera_overwrite_order=camera_overwrite_order,
         dump_debug_volume=bool(args.dump_debug_volume),
+        projection_backend=args.projection_backend,
+        torch_device=args.torch_device if args.projection_backend == 'torch' else None,
     )
 
     out_dir = Path(args.out_dir)
@@ -716,6 +936,8 @@ def main() -> None:
                 camera_overwrite_order=camera_overwrite_order,
                 feature_channels=args.feature_channels,
                 dump_debug_volume=args.dump_debug_volume,
+                projection_backend=args.projection_backend,
+                torch_device=args.torch_device,
                 common_metadata=common_metadata)
     else:
         if not (0 <= args.seq_id < seq_count):
@@ -733,6 +955,8 @@ def main() -> None:
             camera_overwrite_order=camera_overwrite_order,
             feature_channels=args.feature_channels,
             dump_debug_volume=args.dump_debug_volume,
+            projection_backend=args.projection_backend,
+            torch_device=args.torch_device,
             common_metadata=common_metadata)
 
     print(f'LUT npy 已输出到: {out_dir}')

@@ -912,8 +912,11 @@ def project_points_for_camera(
     image: np.ndarray,
     undistort: bool,
     undistort_alpha: float,
+    undistort_new_k: str = 'optimal',
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    image, intrinsic = undistort_if_requested(image, cam_info, undistort, undistort_alpha)
+    image, intrinsic = undistort_if_requested(
+        image, cam_info, undistort, undistort_alpha,
+        new_k_mode=undistort_new_k)
     if undistort:
         lidar2img = compute_lidar2img(cam_info, intrinsic_override=intrinsic)
         uv, depth = project_lidar_points_pinhole(points, lidar2img)
@@ -970,6 +973,7 @@ def render_camera_diagnostic(
     max_point_depth: float,
     undistort: bool,
     undistort_alpha: float,
+    undistort_new_k: str,
     min_depth: float,
     max_edge_px: float,
     rng: np.random.Generator,
@@ -991,7 +995,9 @@ def render_camera_diagnostic(
     draw_cam_info = camera_info_for_loaded_image(cam_info, image)
     image, sx, sy = resize_to_width_with_scale(image, camera_width)
     draw_cam_info = scaled_camera_info(draw_cam_info, sx, sy)
-    image, intrinsic = undistort_if_requested(image, draw_cam_info, undistort, undistort_alpha)
+    image, intrinsic = undistort_if_requested(
+        image, draw_cam_info, undistort, undistort_alpha,
+        new_k_mode=undistort_new_k)
 
     if undistort:
         lidar2img = compute_lidar2img(draw_cam_info, intrinsic_override=intrinsic)
@@ -1022,7 +1028,8 @@ def render_camera_diagnostic(
             image, corners, project_fn, label, color,
             min_depth, max_edge_px, use_corner_clipline=bool(undistort))
 
-    draw_label_tag(image, f'{display_name} pc={projected_count}')
+    projection_mode = f'undist={undistort_new_k}' if undistort else 'raw-distorted'
+    draw_label_tag(image, f'{display_name} pc={projected_count} {projection_mode}')
     legend = [
         ('used GT', class_color(class_names[0], class_names)),
         ('filtered GT', FILTERED_GT_COLOR),
@@ -1084,6 +1091,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--raw-distorted', dest='undistort', action='store_false', default=argparse.SUPPRESS,
                         help='不去畸变，在原始畸变图上使用畸变投影')
     parser.add_argument('--undistort-alpha', type=float, default=0.0, help='OpenCV 去畸变 alpha')
+    parser.add_argument(
+        '--undistort-new-k', choices=['original', 'optimal'], default='optimal',
+        help=('去畸变输出 K；original 等价于 cv2.undistort(image,K,D,None,K)，'
+              'optimal 保持历史行为并使用 getOptimalNewCameraMatrix；alpha 仅对 optimal 生效'))
     parser.add_argument('--min-depth', type=float, default=0.1, help='相机几何可见和画框的最小深度')
     parser.add_argument('--max-corner-edge-px', type=float, default=0.0, help='原始畸变图角点连线最大像素长度；0 表示自动')
     parser.add_argument('--image-ext', default='jpg', choices=['jpg', 'png'], help='输出图片格式')
@@ -1227,6 +1238,7 @@ def main() -> None:
                 max_point_depth=args.max_point_depth,
                 undistort=args.undistort,
                 undistort_alpha=args.undistort_alpha,
+                undistort_new_k=args.undistort_new_k,
                 min_depth=args.min_depth,
                 max_edge_px=args.max_corner_edge_px,
                 rng=rng)
@@ -1261,6 +1273,9 @@ def main() -> None:
         'pointcloud_root': str(pointcloud_root) if pointcloud_root is not None else '',
         'pointcloud_glob': args.pointcloud_glob,
         'camera_id': args.camera_id,
+        'undistort': bool(args.undistort),
+        'undistort_new_k': args.undistort_new_k if args.undistort else 'not_applicable',
+        'undistort_alpha': float(args.undistort_alpha) if args.undistort else None,
         'class_names': class_names,
         'bev_range_cli': list(args.bev_range),
         'bev_range_display': list(display_bev_range),

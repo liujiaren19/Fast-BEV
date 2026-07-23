@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""使用 mono-front Fast-BEV 权重对生产前视单目图片做推理。
+"""使用 canonical PC 前后处理对生产前视单目图片做推理。
 
 输入是 N7 格式 ``info.json`` 和前视图片路径。脚本只读取 ``front_wide``
 相机，构造与 ``CustomMultiViewDataset`` 测试 pipeline 等价的临时 sample，
-然后支持两种推理方式：
+支持 ``pth | onnx-fp | onnx-int8`` backend 和 ``dynamic | fixed`` geometry。
+PTH/ONNX 的最终框始终由项目 ``bbox_head.get_bboxes`` 解码，并统一输出
+center-origin；复杂 tensor diff 和 first-divergence trace 不属于本入口。
+
+首次运行前先执行 tools/build_mono_front_board_assets.py 初始化模型和车辆资产。
+
+三种模型后端：
 
 - PTH：加载 Fast-BEV checkpoint 后走 PyTorch backbone/3D head；
-- ONNX：使用当前项目的 split ONNX 约定，即 2D backbone ONNX + 3D head
+- ONNX FP/INT8：使用当前项目的 split ONNX 约定，即 2D backbone ONNX + 3D head
   ONNX，后处理仍走项目内 ``bbox_head.get_bboxes``。
 
-当前 mono-front baseline 是 temporal mono：``n_images=1, n_times=4``。
-生产侧只有一张前视图时，默认把同一张图重复为 4 个时序输入。
+当前产品主线是原生 S0：``n_images=1, n_times=1``。若显式使用历史 temporal
+config，必须提供完整 ``--temporal-images``；本入口不会把一张图自动复制四份。
 
 完整使用示例：
 
@@ -22,7 +28,7 @@
    .. code-block:: bash
 
       python tools/infer_mono_front_image.py \
-        --config configs/fastbev/custom/custom_fastbev_mono_front_r18.py \
+        --config configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18.py \
         --checkpoint work_dirs/mono_front/epoch_5.pth \
         --info-json data/info_json/2025_04_18_2k_byd_info_9797_UKEF.json \
         --intrinsic-size 1600 900 \
@@ -88,13 +94,15 @@
         --display-aspect native \
         --output-dir outputs/mono_front_batch
 
-5. Split ONNX 推理。``export_metadata.json`` 中的 2D output layout 必须是
-   NCHW；若是 NHWC，本脚本会报错，因为当前后处理按项目 ``test_onnx`` 的
-   NCHW 约定连接 2D backbone 和 3D head。
+5. Split ONNX 推理。权重目录必须先由 asset builder 写入统一
+   ``board_model_spec.json``。dynamic canonical geometry 要求 2D feature 为
+   NCHW；fixed geometry 可按 manifest 处理 NCHW/NHWC。
 
    .. code-block:: bash
 
       python tools/infer_mono_front_image.py \
+        --backend onnx-fp \
+        --geometry dynamic \
         --onnx-dir output/onnx_mono_front \
         --info-json data/info_json/2025_04_18_2k_byd_info.json \
         --intrinsic-size 1600 900 \
@@ -102,7 +110,7 @@
         --output-dir outputs/mono_front_onnx
 
 注意：
-- 没有 pose/车辆位姿时，不建议传真实历史帧做时序；默认重复当前图更稳。
+- 没有 pose/车辆位姿时，不建议用本入口模拟时序；生产默认只接受原生 S0。
 - ``--raw-distorted`` 会直接在原始畸变图上画框；如果边缘框明显飘，去掉该
   参数，改用默认去畸变可视化。
 - 输出包括 ``infos.pkl``、portable ``pred_results.pkl``、
@@ -122,7 +130,7 @@ import pickle
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -146,8 +154,11 @@ RAW_TO_FASTBEV = np.array([
 ], dtype=np.float32)
 
 MONO_FRONT_ROI = (0.0, -35.0, 80.0, 35.0)
-DEFAULT_CONFIG = "configs/fastbev/custom/custom_fastbev_mono_front_r18.py"
+DEFAULT_CONFIG = (
+    "configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18.py")
 DEFAULT_CLASSES = ["car", "truck"]
+ASSET_INIT_HINT = (
+    "首次运行前先执行 tools/build_mono_front_board_assets.py 初始化模型和车辆资产。")
 
 
 class RawDefaultsHelpFormatter(
@@ -162,9 +173,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=RawDefaultsHelpFormatter,
         epilog="""
 示例：
+  首次运行前先执行 tools/build_mono_front_board_assets.py 初始化模型和车辆资产。
+
   # PTH checkpoint 推理，使用 info.json 中 front_wide，输出预测 pkl/json 和可视化。
   python tools/infer_mono_front_image.py \\
-    --config configs/fastbev/custom/custom_fastbev_mono_front_r18.py \\
+    --config configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18.py \\
     --checkpoint work_dirs/mono_front/epoch_5.pth \\
     --info-json data/info_json/2025_04_18_2k_byd_info.json \\
     --image /path/to/front_wide.jpg \\
@@ -196,8 +209,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-onnx", default=None, help="3D head ONNX 路径")
     parser.add_argument("--onnx-custom-op-path", default=None,
                         help="ONNXRuntime custom op so；普通 ONNX 不需要")
-    parser.add_argument("--mode", choices=["auto", "pth", "onnx"], default="auto",
-                        help="推理模式；auto 按权重参数判断")
+    parser.add_argument(
+        "--backend", choices=["pth", "onnx-fp", "onnx-int8"], default=None,
+        help="模型后端；未传时仅为兼容旧命令按权重参数推导")
+    parser.add_argument(
+        "--geometry", choices=["dynamic", "fixed"], default="dynamic",
+        help="dynamic 使用 canonical PC backprojection；fixed 使用预构建车辆 LUT")
+    parser.add_argument(
+        "--lut-dir", default=None,
+        help="geometry=fixed 时的车辆 LUT 目录；推理时不会自动生成")
+    parser.add_argument(
+        "--asset-root", default="data/board_lut",
+        help="board_model_spec 引用的公共 anchors/points 根目录")
+    parser.add_argument(
+        "--provider", choices=["auto", "cpu", "cuda"], default="auto",
+        help="ONNX Runtime provider；显式 cuda 时禁止静默回退 CPU")
+    parser.add_argument(
+        "--mode", choices=["auto", "pth", "onnx"], default="auto",
+        help=argparse.SUPPRESS)
     parser.add_argument("--info-json", default=None,
                         help="N7 格式标定 info.json；未使用 --vehicle-id 时必填")
     parser.add_argument("--vehicle-id", nargs="+", default=None,
@@ -224,15 +253,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temporal-images", nargs="+", default=None,
                         help=("单样本完整时序图片，数量必须等于 n_times，顺序为 current prev1 prev2 ...；"
                               "真实历史帧会直接使用，不做 ego-motion compensation（没有 pose 输入），"
-                              "不同于训练时 prev frames；不传则重复 --image，匹配训练中 clip-start 样本的 fallback 分布"))
-    parser.add_argument("--temporal-policy", choices=["repeat", "error"], default="repeat",
-                        help="只有单张图但模型需要多时序时的处理方式")
+                              "不同于训练时 prev frames；不传时只允许原生 S0 n_times=1，绝不复制当前图"))
+    parser.add_argument("--temporal-policy", choices=["error"], default="error",
+                        help="单图绝不自动复制；历史模型必须显式给完整 temporal images")
     parser.add_argument("--output-dir", required=True, help="输出目录")
     parser.add_argument("--device", default=None, help="推理设备，默认优先 cuda:0，否则 cpu")
     parser.add_argument("--cfg-options", nargs="+", default=None,
                         help="覆盖 config，格式 key=value；支持 model.xxx=... 形式")
     parser.add_argument("--fuse-conv-bn", action="store_true", help="PTH 推理前 fuse conv/bn")
     parser.add_argument("--score-thr", type=float, default=0.2, help="可视化和 summary 使用的分数阈值")
+    parser.add_argument(
+        "--output-classes", nargs="+", default=["car"],
+        help="完整 canonical decode/NMS 后写入业务 JSONL 的类别；all 表示全部")
     parser.add_argument("--max-preds", type=int, default=100, help="每帧最多写入 summary/可视化的预测框数；<=0 不限制")
     parser.add_argument("--no-visualization", action="store_true", help="只保存预测结果，不输出可视化")
     parser.add_argument("--visualization-stride", type=int, default=1,
@@ -251,12 +283,20 @@ def parse_args() -> argparse.Namespace:
                         help="BEV 可视化范围")
     parser.add_argument("--raw-distorted", dest="undistort", action="store_false",
                         default=True, help="可视化不去畸变，直接在原始畸变图上画框")
-    parser.add_argument("--undistort-alpha", type=float, default=0.0, help="OpenCV 去畸变 alpha")
+    parser.add_argument(
+        "--undistort-new-k", choices=("original", "optimal"), default="original",
+        help=("去畸变输出内参；original 等价于 cv2.undistort(image,K,D,None,K)，"
+              "optimal 使用 getOptimalNewCameraMatrix"))
+    parser.add_argument(
+        "--undistort-alpha", type=float, default=0.0,
+        help="仅 --undistort-new-k optimal 使用的 OpenCV alpha")
     parser.add_argument("--min-depth", type=float, default=0.1, help="画框最小相机深度")
     parser.add_argument("--image-ext", choices=["jpg", "png"], default="jpg",
                         help="visualization-name=token 时的可视化图片格式；image 模式保留原图文件名")
     parser.add_argument("--intrinsic-size", nargs=2, type=int, metavar=("WIDTH", "HEIGHT"),
-                        default=None, help="cam_intrinsic/K 对应的图像尺寸；9797_UKEF 建议填 1600 900")
+                        default=None,
+                        help=("cam_intrinsic/K 对应的图像尺寸；必须和所选 info.json 一致，"
+                              "9797 原生 4K 标定填 3840 2160，2k 标定填 1600 900"))
     parser.add_argument("--intrinsic-size-source", choices=["auto", "info", "image"], default="auto",
                         help="未显式传 --intrinsic-size 时的尺寸来源")
     parser.add_argument("--aspect-tolerance", type=float, default=0.02,
@@ -272,11 +312,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     args = parser.parse_args()
     if args.vehicle_id and args.temporal_images:
-        parser.error("--vehicle-id 批量模式暂不支持 --temporal-images；当前会按 repeat 使用单图时序")
+        parser.error("--vehicle-id 批量模式只支持原生 S0，不支持 --temporal-images")
     if not args.vehicle_id and not args.info_json:
         parser.error("未使用 --vehicle-id 时必须传 --info-json")
     if args.temporal_images and (args.image_dir or args.image_list or len(args.image) != 1):
         parser.error("--temporal-images 只支持和单个 --image 一起使用")
+    if args.geometry == "fixed" and not args.lut_dir and not args.vehicle_id:
+        parser.error(
+            "--geometry fixed 必须传 --lut-dir；首次运行前先执行 "
+            "tools/build_mono_front_board_assets.py 初始化模型和车辆资产。")
+    if args.geometry == "fixed" and (args.backend or "").startswith("pth"):
+        parser.error("PTH 不支持 fixed LUT；请使用 --geometry dynamic")
     return args
 
 
@@ -721,7 +767,7 @@ def patch_test_pipeline(cfg: Any, n_images: int, n_times: int,
         if not isinstance(step, dict):
             continue
         if step.get("type") == "MultiViewPipeline":
-            step["sequential"] = True
+            step["sequential"] = bool(n_times > 1)
             step["n_images"] = int(n_images)
             step["n_times"] = int(n_times)
         elif step.get("type") == "RandomAugImageMultiViewImage":
@@ -795,25 +841,36 @@ def resolve_weight_args(args: argparse.Namespace) -> Tuple[str, Optional[Path], 
             if candidates_3d:
                 head_onnx = candidates_3d[-1]
 
-    mode = args.mode
-    if mode == "auto":
-        mode = "onnx" if (backbone_onnx or head_onnx or onnx_dir) else "pth"
+    backend = args.backend
+    if backend is None:
+        mode = args.mode
+        if mode == "auto":
+            mode = "onnx" if (backbone_onnx or head_onnx or onnx_dir) else "pth"
+        backend = "pth" if mode == "pth" else "onnx-fp"
 
-    if mode == "pth":
+    if backend == "pth":
         if checkpoint is None:
-            raise ValueError("PTH 模式需要 --checkpoint 或 --weights *.pth")
+            raise ValueError(
+                f"PTH 模式需要 --checkpoint 或 --weights *.pth。{ASSET_INIT_HINT}")
         if not checkpoint.exists():
-            raise FileNotFoundError(f"checkpoint 不存在: {checkpoint}")
-    elif mode == "onnx":
+            raise FileNotFoundError(
+                f"checkpoint 不存在: {checkpoint}。{ASSET_INIT_HINT}")
+    elif backend in ("onnx-fp", "onnx-int8"):
+        # 显式新后端以唯一 board_model_spec 为准；模型路径稍后从 manifest
+        # 精确解析并核对 SHA，不能在这里因旧 export_metadata/glob 失败。
+        if args.backend is not None and onnx_dir is not None:
+            return backend, checkpoint, backbone_onnx, head_onnx
         if backbone_onnx is None or head_onnx is None:
             raise ValueError("ONNX 模式需要 --backbone-onnx 和 --head-onnx，或 --onnx-dir")
         if not backbone_onnx.exists():
-            raise FileNotFoundError(f"2D backbone ONNX 不存在: {backbone_onnx}")
+            raise FileNotFoundError(
+                f"2D backbone ONNX 不存在: {backbone_onnx}。{ASSET_INIT_HINT}")
         if not head_onnx.exists():
-            raise FileNotFoundError(f"3D head ONNX 不存在: {head_onnx}")
+            raise FileNotFoundError(
+                f"3D head ONNX 不存在: {head_onnx}。{ASSET_INIT_HINT}")
     else:
-        raise ValueError(f"Unknown mode: {mode}")
-    return mode, checkpoint, backbone_onnx, head_onnx
+        raise ValueError(f"Unknown backend: {backend}")
+    return backend, checkpoint, backbone_onnx, head_onnx
 
 
 def add_mmdet3d_root_to_path() -> None:
@@ -823,7 +880,7 @@ def add_mmdet3d_root_to_path() -> None:
         LOGGER.info("using mmdet3d: %s", mmdet3d_root)
 
 
-def build_cfg_and_model(args: argparse.Namespace, mode: str,
+def build_cfg_and_model(args: argparse.Namespace, backend: str,
                         checkpoint: Optional[Path],
                         backbone_onnx: Optional[Path],
                         head_onnx: Optional[Path],
@@ -856,7 +913,7 @@ def build_cfg_and_model(args: argparse.Namespace, mode: str,
 
     cfg.model.pretrained = None
     cfg.model.train_cfg = None
-    if mode == "onnx":
+    if backend != "pth":
         cfg.model.test_cfg.test_mode = "test_onnx"
         cfg.model.test_cfg.backbone_onnx = str(backbone_onnx)
         cfg.model.test_cfg.head_onnx = str(head_onnx)
@@ -868,7 +925,7 @@ def build_cfg_and_model(args: argparse.Namespace, mode: str,
     model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
     fp16_cfg = cfg.get("fp16", None)
     if fp16_cfg is not None:
-        if mode == "pth" and str(device_str).lower().startswith("cpu"):
+        if backend == "pth" and str(device_str).lower().startswith("cpu"):
             LOGGER.warning(
                 "PTH CPU 推理跳过 wrap_fp16_model；mmcv auto_fp16 会把 img cast 到 fp16，"
                 "CPU half conv 不支持。")
@@ -974,14 +1031,221 @@ def make_temporal_paths(image_path: Path, n_times: int,
         return temporal
     if n_times == 1:
         return [image_path]
-    if args.temporal_policy == "error":
-        raise ValueError(
-            f"当前 config 需要 n_times={n_times}，但只提供了一张图片；"
-            "请传 --temporal-images 或使用 --temporal-policy repeat")
-    return [image_path for _ in range(n_times)]
+    raise ValueError(
+        f"当前 config 需要 n_times={n_times}，但只提供了一张图片；"
+        "禁止自动复制当前图，请传完整 --temporal-images 或改用原生 S0 config")
 
 
-def run_one_sample(model, pipeline, sample_results: Dict, device) -> Tuple[Dict, Dict]:
+def _quant_params(
+    tensor_contract: Mapping[str, Any],
+    ndim: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    quant = tensor_contract["quantization"]
+    scale = np.asarray(quant["scale"], dtype=np.float32)
+    zero = np.asarray(quant["zero_point"], dtype=np.float32)
+    if scale.size == 1:
+        return scale.reshape(()), zero.reshape(())
+    axis = int(quant["channel_axis"])
+    if axis < 0:
+        axis += ndim
+    if axis < 0 or axis >= ndim:
+        raise RuntimeError(f"per-channel channel_axis={axis} 超出 ndim={ndim}")
+    shape = [1] * ndim
+    shape[axis] = scale.size
+    if zero.size == 1:
+        zero = np.full(scale.shape, zero.item(), dtype=np.float32)
+    return scale.reshape(shape), zero.reshape(shape)
+
+
+def _encode_onnx_tensor(
+    value: np.ndarray,
+    tensor_contract: Mapping[str, Any],
+) -> np.ndarray:
+    dtype = str(tensor_contract["dtype"])
+    if dtype not in ("int8", "uint8"):
+        return np.ascontiguousarray(value, dtype=np.dtype(dtype))
+    quant = tensor_contract["quantization"]
+    scale, zero = _quant_params(tensor_contract, value.ndim)
+    raw = np.rint(np.asarray(value, dtype=np.float32) / scale + zero)
+    raw = np.clip(raw, quant["clamp_min"], quant["clamp_max"])
+    return np.ascontiguousarray(raw, dtype=np.dtype(dtype))
+
+
+def _decode_onnx_tensor(
+    value: np.ndarray,
+    tensor_contract: Mapping[str, Any],
+) -> np.ndarray:
+    dtype = str(tensor_contract["dtype"])
+    if dtype not in ("int8", "uint8"):
+        return np.ascontiguousarray(value, dtype=np.float32)
+    scale, zero = _quant_params(tensor_contract, value.ndim)
+    return np.ascontiguousarray(
+        (np.asarray(value, dtype=np.float32) - zero) * scale,
+        dtype=np.float32)
+
+
+def _fixed_lut_bev(
+    feature: np.ndarray,
+    gather: np.ndarray,
+    scatter: np.ndarray,
+    geometry: Mapping[str, Any],
+    fill_value: Any,
+) -> np.ndarray:
+    layout_shape = tuple(int(v) for v in geometry["feature_shape_nchw"])
+    if feature.shape != layout_shape:
+        raise ValueError(f"fixed LUT feature={feature.shape}，expected={layout_shape}")
+    _, channels, height, width = layout_shape
+    n_voxels = tuple(int(v) for v in geometry["n_voxels"])
+    flat = feature.reshape(1, channels, height * width)
+    fill = np.asarray(fill_value, dtype=feature.dtype)
+    if fill.size == 1:
+        volume = np.full(
+            (channels, int(np.prod(n_voxels))), fill.item(), dtype=feature.dtype)
+    else:
+        volume = np.broadcast_to(
+            fill.reshape(channels, 1),
+            (channels, int(np.prod(n_voxels)))).copy()
+    volume[:, scatter] = flat[0][:, gather]
+    return np.ascontiguousarray(
+        volume.reshape(channels, *n_voxels)
+        .transpose(3, 0, 1, 2)
+        .reshape(tuple(int(v) for v in geometry["bev_shape_nchw"])))
+
+
+class FixedOnnxCanonicalRunner:
+    """固定 LUT 只替换几何；最终 decode 仍调用 bbox_head.get_bboxes。"""
+
+    def __init__(
+        self,
+        spec: Mapping[str, Any],
+        backend_contract: Mapping[str, Any],
+        model_2d: Path,
+        model_3d: Path,
+        gather: np.ndarray,
+        scatter: np.ndarray,
+        provider: str,
+    ) -> None:
+        import onnxruntime as ort
+
+        available = ort.get_available_providers()
+        if provider == "cuda":
+            if "CUDAExecutionProvider" not in available:
+                raise RuntimeError(
+                    f"请求 CUDAExecutionProvider，但 available={available}")
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        elif provider == "cpu":
+            providers = ["CPUExecutionProvider"]
+        else:
+            providers = (
+                ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                if "CUDAExecutionProvider" in available else ["CPUExecutionProvider"])
+        self.session_2d = ort.InferenceSession(str(model_2d), providers=providers)
+        self.session_3d = ort.InferenceSession(str(model_3d), providers=providers)
+        primary = [self.session_2d.get_providers()[0], self.session_3d.get_providers()[0]]
+        if len(set(primary)) != 1:
+            raise RuntimeError(f"2D/3D ORT provider 不一致: {primary}")
+        if provider == "cuda" and primary[0] != "CUDAExecutionProvider":
+            raise RuntimeError(
+                f"显式 CUDA 请求静默回退到 {primary[0]}，拒绝继续")
+        self.spec = spec
+        self.contract = backend_contract
+        self.gather = np.asarray(gather, dtype=np.int64)
+        self.scatter = np.asarray(scatter, dtype=np.int64)
+        self.provider = primary[0]
+
+    def run(self, input_tensor: np.ndarray) -> Dict[str, np.ndarray]:
+        contract_2d = self.contract["2d"]
+        input_raw = _encode_onnx_tensor(input_tensor, contract_2d["input"])
+        feature_raw = self.session_2d.run(
+            [contract_2d["output"]["name"]],
+            {contract_2d["input"]["name"]: input_raw})[0]
+        feature_spec = contract_2d["output"]
+        if self.contract["feature_to_bev_bridge"] == "raw-quantized-direct":
+            feature = np.asarray(feature_raw)
+            fill_value = feature_spec["quantization"]["zero_point"]
+        else:
+            feature = _decode_onnx_tensor(feature_raw, feature_spec)
+            fill_value = 0.0
+        if feature_spec["layout"] == "nhwc":
+            feature = feature.transpose(0, 3, 1, 2)
+        elif feature_spec["layout"] != "nchw":
+            raise RuntimeError(f"未知 2D output layout={feature_spec['layout']}")
+        bev = _fixed_lut_bev(
+            np.ascontiguousarray(feature), self.gather, self.scatter,
+            self.spec["geometry"], fill_value)
+        contract_3d = self.contract["3d"]
+        bev_raw = _encode_onnx_tensor(bev, contract_3d["input"])
+        names = contract_3d["semantic_output_names"]
+        requested = [names[key] for key in ("head_cls", "head_bbox", "head_dir")]
+        values = self.session_3d.run(
+            requested, {contract_3d["input"]["name"]: bev_raw})
+        by_name = dict(zip(requested, values))
+        return {
+            key: _decode_onnx_tensor(
+                by_name[name], contract_3d["outputs"][key])
+            for key, name in names.items()
+        }
+
+
+def configure_dynamic_onnx_provider(
+    model: Any,
+    model_2d: Path,
+    model_3d: Path,
+    provider: str,
+    custom_op_path: Optional[str],
+) -> str:
+    """让 dynamic ONNX 也遵守 CLI provider，并拒绝显式 CUDA 静默回退。"""
+    import onnxruntime as ort
+
+    available = ort.get_available_providers()
+    if provider == "cuda":
+        if "CUDAExecutionProvider" not in available:
+            raise RuntimeError(
+                f"请求 CUDAExecutionProvider，但 available={available}")
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    elif provider == "cpu":
+        providers = ["CPUExecutionProvider"]
+    else:
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if "CUDAExecutionProvider" in available else
+            ["CPUExecutionProvider"])
+
+    session_options = None
+    if custom_op_path:
+        session_options = ort.SessionOptions()
+        session_options.register_custom_ops_library(custom_op_path)
+
+    def create(path: Path):
+        if session_options is None:
+            return ort.InferenceSession(str(path), providers=providers)
+        return ort.InferenceSession(
+            str(path), session_options, providers=providers)
+
+    model.backbone_session = create(model_2d)
+    model.head_session = create(model_3d)
+    primary = (
+        model.backbone_session.get_providers()[0],
+        model.head_session.get_providers()[0],
+    )
+    if primary[0] != primary[1]:
+        raise RuntimeError(f"2D/3D ORT provider 不一致: {primary}")
+    if provider == "cuda" and primary[0] != "CUDAExecutionProvider":
+        raise RuntimeError(
+            f"显式 CUDA 请求静默回退到 {primary[0]}，拒绝继续")
+    if provider == "cpu" and primary[0] != "CPUExecutionProvider":
+        raise RuntimeError(
+            f"显式 CPU 请求实际使用 {primary[0]}，拒绝继续")
+    return primary[0]
+
+
+def run_one_sample(
+    model,
+    pipeline,
+    sample_results: Dict,
+    device,
+    fixed_runner: Optional[FixedOnnxCanonicalRunner] = None,
+) -> Tuple[Dict, Dict]:
     import torch
 
     data = pipeline(sample_results)
@@ -992,7 +1256,22 @@ def run_one_sample(model, pipeline, sample_results: Dict, device) -> Tuple[Dict,
     img = img.to(device)
     inference_context = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
     with inference_context():
-        result = model(img=img, img_metas=[img_metas], return_loss=False)
+        if fixed_runner is None:
+            result = model(img=img, img_metas=[img_metas], return_loss=False)
+        else:
+            if img.shape[1] != 1:
+                raise RuntimeError(
+                    f"fixed geometry 只支持 S0 单图，实际 views={img.shape[1]}")
+            logits_np = fixed_runner.run(
+                img[:, 0].detach().cpu().numpy().astype(np.float32))
+            # bbox_head 接口按 FPN level 接收 list；S0 导出模型只有一个 level。
+            logits = tuple(
+                [torch.from_numpy(logits_np[name]).to(device)]
+                for name in ("head_cls", "head_bbox", "head_dir"))
+            bbox_list = model.bbox_head.get_bboxes(
+                *logits, [img_metas], valid=None)
+            from mmdet3d.core import bbox3d2result
+            result = [bbox3d2result(*bbox_list[0])]
     if not isinstance(result, list) or len(result) != 1:
         raise RuntimeError(f"unexpected model result type/len: {type(result)} / {len(result) if isinstance(result, list) else 'n/a'}")
     return result[0], img_metas
@@ -1136,6 +1415,7 @@ def render_visualization(
         gt_view_mode="raw",
         gt_filter_visible_camera=None,
         gt_filter_range=None,
+        undistort_new_k_mode=args.undistort_new_k,
     )
     frame_output.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(frame_output), image):
@@ -1181,7 +1461,7 @@ def run_inference_job(
     all_candidate_paths: Sequence[Path],
     output_dir: Path,
     args: argparse.Namespace,
-    mode: str,
+    backend: str,
     checkpoint: Optional[Path],
     backbone_onnx: Optional[Path],
     head_onnx: Optional[Path],
@@ -1192,6 +1472,7 @@ def run_inference_job(
     model: Any,
     pipeline: Any,
     device: Any,
+    fixed_runner: Optional[FixedOnnxCanonicalRunner] = None,
     image_base_dir: Optional[Path] = None,
     vehicle_id: Optional[str] = None,
 ) -> Dict:
@@ -1210,6 +1491,22 @@ def run_inference_job(
     calib = read_json(info_json_path)
     sensor = find_sensor(calib, args.sensor_name)
     camera_template = build_camera_template(sensor, first_image_size, args)
+    if fixed_runner is not None:
+        lut_metadata = getattr(fixed_runner, "lut_metadata", {})
+        expected_size = lut_metadata.get("source_image_size")
+        if expected_size != list(first_image_size):
+            raise RuntimeError(
+                f"fixed LUT 图片尺寸={expected_size}，当前首图={list(first_image_size)}；"
+                "禁止跨图片坐标系复用 LUT")
+        recorded_info_sha = lut_metadata.get("info_json_sha256")
+        if recorded_info_sha:
+            import hashlib
+
+            digest = hashlib.sha256(info_json_path.read_bytes()).hexdigest()
+            if digest != recorded_info_sha:
+                raise RuntimeError(
+                    "fixed LUT 对应 info.json SHA256 与当前标定不一致，"
+                    "禁止跨车辆或标定版本复用")
     LOGGER.info(
         "[%s] effective intrinsic size for %s: %sx%s (%s); first image=%sx%s",
         job_name,
@@ -1223,10 +1520,17 @@ def run_inference_job(
     all_infos: List[Dict] = []
     all_results: List[Dict] = []
     all_summaries: List[Dict] = []
+    business_records: List[Dict] = []
     visualized_count = 0
     visualization_names = set()
 
     for index, image_path in enumerate(image_paths):
+        if fixed_runner is not None:
+            expected_size = fixed_runner.lut_metadata["source_image_size"]
+            actual_size = list(read_image_size(image_path))
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"图片 {image_path} 尺寸={actual_size}，fixed LUT={expected_size}")
         temporal_paths = make_temporal_paths(image_path, n_times, args)
         token = image_path.stem if len(image_paths) == 1 else f"{index:06d}_{image_path.stem}"
         # 没有真实同步时间戳时用 index 占位，保持 pkl 字段类型稳定。
@@ -1234,10 +1538,27 @@ def run_inference_job(
         sample_results, info = build_sample_results(
             temporal_paths, camera_template, args.camera_id, token, timestamp,
             box_type_3d, box_mode_3d, args)
-        result, img_meta = run_one_sample(model, pipeline, sample_results, device)
+        result, img_meta = run_one_sample(
+            model, pipeline, sample_results, device, fixed_runner)
         all_infos.append(info)
         all_results.append(result)
         predictions = result_to_summary(result, class_names, args.score_thr, args.max_preds)
+        requested_classes = set(args.output_classes)
+        if "all" not in requested_classes:
+            unknown = requested_classes - set(class_names)
+            if unknown:
+                raise ValueError(f"模型不存在业务类别: {sorted(unknown)}")
+            business_predictions = [
+                row for row in predictions
+                if row["class_name"] in requested_classes]
+        else:
+            business_predictions = list(predictions)
+        business_records.append({
+            "token": token,
+            "box_origin": "center",
+            "count": len(business_predictions),
+            "targets": business_predictions,
+        })
         all_summaries.append({
             "token": token,
             "image": str(image_path.resolve()),
@@ -1247,6 +1568,7 @@ def run_inference_job(
             "temporal_images": [str(path.resolve()) for path in temporal_paths],
             "num_predictions": len(predictions),
             "predictions": predictions,
+            "business_predictions": business_predictions,
         })
 
         if should_render_visualization(index, visualized_count, args):
@@ -1268,7 +1590,8 @@ def run_inference_job(
         vehicle_id=vehicle_id,
         info_json=str(info_json_path),
         image_base_dir=str(image_base_dir) if image_base_dir is not None else None,
-        mode=mode,
+        backend=backend,
+        geometry=args.geometry,
         config=str(Path(args.config)),
         checkpoint=str(checkpoint) if checkpoint else None,
         backbone_onnx=str(backbone_onnx) if backbone_onnx else None,
@@ -1290,13 +1613,15 @@ def run_inference_job(
         visualization_stride=max(int(args.visualization_stride), 1),
         max_visualizations=int(args.max_visualizations),
         display_aspect=args.display_aspect,
+        undistort=bool(args.undistort),
+        undistort_new_k=args.undistort_new_k,
+        undistort_alpha=float(args.undistort_alpha),
         no_bev=bool(args.no_bev),
         visualization_name=args.visualization_name,
         visualization_count=visualized_count,
         temporal_note=(
-            "Real --temporal-images history frames are used without ego-motion compensation "
-            "because no pose input is provided; this differs from training-time prev frames. "
-            "The repeat fallback matches the training distribution for clip-start samples."
+            "Native S0 uses one current image. Explicit --temporal-images are used without "
+            "ego-motion compensation; current images are never auto-repeated."
         ),
         temporal_images_without_ego_motion_compensation=bool(args.temporal_images),
         calibration=json_ready(camera_template),
@@ -1308,9 +1633,16 @@ def run_inference_job(
     (output_dir / "prediction_summary.json").write_text(
         json.dumps({"metadata": metadata, "frames": all_summaries}, ensure_ascii=False, indent=2),
         encoding="utf-8")
+    (output_dir / "business_predictions.jsonl").write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False) + "\n"
+            for record in business_records),
+        encoding="utf-8")
     LOGGER.info("wrote infos: %s", output_dir / "infos.pkl")
     LOGGER.info("wrote predictions: %s", output_dir / "pred_results.pkl")
     LOGGER.info("wrote summary: %s", output_dir / "prediction_summary.json")
+    LOGGER.info(
+        "wrote business JSONL: %s", output_dir / "business_predictions.jsonl")
     return dict(
         job_name=job_name,
         vehicle_id=vehicle_id,
@@ -1329,7 +1661,73 @@ def main() -> None:
         level=getattr(logging, args.log_level),
         format="%(levelname)s:%(name)s:%(message)s")
 
-    mode, checkpoint, backbone_onnx, head_onnx = resolve_weight_args(args)
+    backend, checkpoint, backbone_onnx, head_onnx = resolve_weight_args(args)
+    if backend == "pth" and args.geometry != "dynamic":
+        raise ValueError("PTH backend 只支持 --geometry dynamic")
+    board_spec = None
+    backend_contract = None
+    manifest_weights_dir = None
+    if backend != "pth":
+        from tools.mono_front_board_assets import (
+            file_sha256,
+            load_board_model_assets,
+        )
+
+        if args.onnx_dir:
+            manifest_weights_dir = Path(args.onnx_dir)
+        elif args.weights and Path(args.weights).is_dir():
+            manifest_weights_dir = Path(args.weights)
+        elif backbone_onnx is not None:
+            manifest_weights_dir = backbone_onnx.parent
+        else:
+            raise ValueError("ONNX backend 无法确定 board_model_spec.json 所在目录")
+        board_spec = load_board_model_assets(
+            manifest_weights_dir, Path(args.asset_root))
+        config_path = Path(args.config).expanduser().resolve()
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"config 不存在: {config_path}。{ASSET_INIT_HINT}")
+        if file_sha256(config_path) != board_spec["config_sha256"]:
+            raise RuntimeError(
+                f"config SHA256 与 board_model_spec 不一致: {config_path}")
+        backend_contract = board_spec["onnx_contracts"].get(backend)
+        if not isinstance(backend_contract, dict) or not backend_contract.get("available"):
+            raise RuntimeError(
+                f"board_model_spec 不包含可用 {backend} contract；首次运行前先执行 "
+                "tools/build_mono_front_board_assets.py 初始化模型和车辆资产。")
+
+        def resolve_manifest_model(part: str) -> Path:
+            value = backend_contract["models"][part]["file"]
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = manifest_weights_dir / path
+            if not path.is_file():
+                fallback = manifest_weights_dir / path.name
+                if fallback.is_file():
+                    path = fallback
+                else:
+                    raise FileNotFoundError(
+                        f"manifest {backend} {part} ONNX 不存在: {path}。"
+                        "首次运行前先执行 tools/build_mono_front_board_assets.py "
+                        "初始化模型和车辆资产。")
+            return path.resolve()
+
+        backbone_onnx = resolve_manifest_model("2d")
+        head_onnx = resolve_manifest_model("3d")
+        if (
+            args.geometry == "dynamic" and
+            backend_contract.get("manual_external_quantization")
+        ):
+            raise RuntimeError(
+                "dynamic canonical 路径当前只接受外部 float I/O 的 QDQ INT8 图；"
+                "raw INT8/UINT8 外部 I/O 请使用 --geometry fixed 或 analyzer")
+        if (
+            args.geometry == "dynamic" and
+            backend_contract["2d"]["output"].get("layout") != "nchw"
+        ):
+            raise RuntimeError(
+                "dynamic canonical ONNX 路径要求 2D feature layout=nchw；"
+                "NHWC 请使用 --geometry fixed 或 analyzer")
     root_output_dir = Path(args.output_dir)
     root_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1340,12 +1738,52 @@ def main() -> None:
     import torch
     device = torch.device(device_str)
     cfg, model, n_times, class_names, box_type_3d, box_mode_3d = build_cfg_and_model(
-        args, mode, checkpoint, backbone_onnx, head_onnx, device_str)
+        args, backend, checkpoint, backbone_onnx, head_onnx, device_str)
+    if board_spec is not None:
+        expected_n_times = int(board_spec["geometry"]["n_times"])
+        expected_classes = list(board_spec["head"]["class_names"])
+        if n_times != expected_n_times:
+            raise RuntimeError(
+                f"config n_times={n_times} 与 manifest={expected_n_times} 不一致")
+        if list(class_names) != expected_classes:
+            raise RuntimeError(
+                f"config class_names={class_names} 与 manifest="
+                f"{expected_classes} 不一致")
     model = model.to(device)
     model.eval()
+    if backend != "pth" and args.geometry == "dynamic":
+        actual_provider = configure_dynamic_onnx_provider(
+            model, backbone_onnx, head_onnx, args.provider,
+            args.onnx_custom_op_path)
+        LOGGER.info("dynamic ONNX actual provider: %s", actual_provider)
 
     from mmdet3d.datasets.pipelines import Compose
     pipeline = Compose(copy.deepcopy(cfg.data.test.pipeline))
+
+    def make_fixed_runner(vehicle_id: Optional[str] = None):
+        if args.geometry != "fixed":
+            return None
+        from tools.mono_front_board_assets import load_board_vehicle_lut
+
+        assert board_spec is not None and backend_contract is not None
+        asset_root = Path(args.asset_root).expanduser().resolve()
+        if vehicle_id is None:
+            lut_path = Path(args.lut_dir).expanduser().resolve()
+            if lut_path.name == "LUT":
+                lut_path = lut_path.parent
+            if lut_path.parent != asset_root:
+                raise RuntimeError(
+                    f"--lut-dir={lut_path} 不在 --asset-root={asset_root} 下")
+            resolved_vehicle_id = lut_path.name
+        else:
+            resolved_vehicle_id = vehicle_id
+        gather, scatter, lut_record = load_board_vehicle_lut(
+            resolved_vehicle_id, board_spec, asset_root)
+        runner = FixedOnnxCanonicalRunner(
+            board_spec, backend_contract, backbone_onnx, head_onnx,
+            gather, scatter, args.provider)
+        runner.lut_metadata = lut_record["metadata"]
+        return runner
 
     if args.vehicle_id:
         if args.image or args.image_dir or args.image_list:
@@ -1367,7 +1805,7 @@ def main() -> None:
                 all_candidate_paths=all_candidate_paths,
                 output_dir=job_output_dir,
                 args=args,
-                mode=mode,
+                backend=backend,
                 checkpoint=checkpoint,
                 backbone_onnx=backbone_onnx,
                 head_onnx=head_onnx,
@@ -1378,6 +1816,7 @@ def main() -> None:
                 model=model,
                 pipeline=pipeline,
                 device=device,
+                fixed_runner=make_fixed_runner(vehicle_id),
                 image_base_dir=image_base_dir))
         batch_summary = dict(
             version="mono-front-production-image-infer-batch",
@@ -1401,7 +1840,7 @@ def main() -> None:
         all_candidate_paths=all_candidate_paths,
         output_dir=root_output_dir,
         args=args,
-        mode=mode,
+        backend=backend,
         checkpoint=checkpoint,
         backbone_onnx=backbone_onnx,
         head_onnx=head_onnx,
@@ -1412,6 +1851,7 @@ def main() -> None:
         model=model,
         pipeline=pipeline,
         device=device,
+        fixed_runner=make_fixed_runner(),
         image_base_dir=None)
 
 

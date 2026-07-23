@@ -262,6 +262,7 @@ def get_undistort_maps(
     distortion: np.ndarray,
     image_size: Tuple[int, int],
     alpha: float,
+    new_k_mode: str,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """线程安全地读取或创建去畸变 map，并按 LRU 约束内存。"""
     global UNDISTORT_CACHE_BYTES
@@ -274,8 +275,13 @@ def get_undistort_maps(
             return cached
 
         UNDISTORT_CACHE_MISSES += 1
-        new_k, _ = cv2.getOptimalNewCameraMatrix(
-            intrinsic, distortion, image_size, alpha, image_size)
+        if new_k_mode == 'original':
+            new_k = np.asarray(intrinsic, dtype=np.float64).copy()
+        elif new_k_mode == 'optimal':
+            new_k, _ = cv2.getOptimalNewCameraMatrix(
+                intrinsic, distortion, image_size, alpha, image_size)
+        else:
+            raise ValueError(f'Unsupported undistort new K mode: {new_k_mode}')
         map1, map2 = cv2.initUndistortRectifyMap(
             intrinsic, distortion, None, new_k, image_size, cv2.CV_16SC2)
         value = (map1, map2, new_k.astype(np.float32))
@@ -1042,16 +1048,21 @@ def undistort_if_requested(
     cam_info: Dict,
     enabled: bool,
     alpha: float,
+    new_k_mode: str = 'optimal',
 ) -> Tuple[np.ndarray, np.ndarray]:
     """按需对图片去畸变，并返回投影时应该使用的内参。
 
     默认去畸变，因为人工检查目标框贴合时，去畸变图上的 pinhole 投影更稳定，
-    边缘截断目标也更不容易出现长飞线。显式使用 ``--raw-distorted`` 时，会退回
-    到原始畸变图和原始 K 的显示方式，用于检查板端原始输入链路。
+    边缘截断目标也更不容易出现长飞线。``new_k_mode=original`` 等价于
+    ``cv2.undistort(image, K, D, None, K)``；``optimal`` 保持原有行为，通过
+    ``getOptimalNewCameraMatrix`` 生成输出 K。显式使用 ``--raw-distorted`` 时，
+    会退回到原始畸变图和原始 K 的显示方式，用于检查板端原始输入链路。
     """
     intrinsic = to_numpy(cam_info['cam_intrinsic'])
     if not enabled:
         return image, intrinsic
+    if new_k_mode not in ('original', 'optimal'):
+        raise ValueError(f'Unsupported undistort new K mode: {new_k_mode}')
 
     distortion = np.asarray(cam_info.get('distortion', []), dtype=np.float64).reshape(-1)
     if distortion.size == 0 or np.allclose(distortion, 0):
@@ -1060,13 +1071,16 @@ def undistort_if_requested(
     h, w = image.shape[:2]
     dist_full = np.zeros(8, dtype=np.float64)
     dist_full[:min(distortion.size, dist_full.size)] = distortion[:dist_full.size]
-    cache_key = (h, w, tuple(intrinsic.reshape(-1)), tuple(dist_full), float(alpha))
+    cache_key = (
+        h, w, tuple(intrinsic.reshape(-1)), tuple(dist_full),
+        str(new_k_mode), float(alpha))
     map1, map2, new_k = get_undistort_maps(
         cache_key=cache_key,
         intrinsic=intrinsic,
         distortion=dist_full,
         image_size=(w, h),
         alpha=float(alpha),
+        new_k_mode=str(new_k_mode),
     )
     return cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR), new_k
 
@@ -1074,9 +1088,11 @@ def undistort_if_requested(
 def corners_from_boxes(boxes: np.ndarray) -> np.ndarray:
     """把 ``[x, y, z_center, l, w, h, yaw]`` 转成 lidar 坐标系 8 个角点。
 
-    yaw 旋转方向按 MMDetection3D 的 ``LiDARInstance3DBoxes.corners`` 实现，
-    即行向量形式下 ``x'=x*cos+y*sin, y'=-x*sin+y*cos``。之前使用普通数学
-    正向旋转，BEV 上 GT/Pred 仍会相互贴合，但投影到相机时左右边可能偏掉。
+    N7 公开 box 契约是 ``+X`` 向前、``+Y`` 向左，正 yaw 从 ``+X`` 朝
+    ``+Y`` 旋转。因此行向量实现必须使用
+    ``x'=x*cos-y*sin, y'=x*sin+y*cos``。这里不能照搬旧版
+    ``LiDARInstance3DBoxes.corners`` 的顺时针正方向，否则数值为负的小 yaw
+    会在 BEV 中被镜像到车辆左侧。
     """
     if boxes.size == 0:
         return np.zeros((0, 8, 3), dtype=np.float32)
@@ -1099,8 +1115,8 @@ def corners_from_boxes(boxes: np.ndarray) -> np.ndarray:
         ], dtype=np.float32)
         c, s = math.cos(yaw), math.sin(yaw)
         local_xy = local[:, :2].copy()
-        local[:, 0] = local_xy[:, 0] * c + local_xy[:, 1] * s
-        local[:, 1] = -local_xy[:, 0] * s + local_xy[:, 1] * c
+        local[:, 0] = local_xy[:, 0] * c - local_xy[:, 1] * s
+        local[:, 1] = local_xy[:, 0] * s + local_xy[:, 1] * c
         local += np.array([x, y, z], dtype=np.float32)
         corners[i] = local
     return corners
@@ -1267,6 +1283,7 @@ def draw_boxes_on_camera(
     max_edge_px: float,
     labels: Optional[Sequence[str]] = None,
     colors: Optional[Sequence[Tuple[int, int, int]]] = None,
+    undistort_new_k_mode: str = 'optimal',
 ) -> np.ndarray:
     """在相机图上绘制 3D 框。
 
@@ -1274,7 +1291,9 @@ def draw_boxes_on_camera(
     人工检查，默认先去畸变再用新内参走标准 pinhole 投影，并用边界裁剪显示
     截断目标；显式使用 ``--raw-distorted`` 时才在原始畸变图上叠框。
     """
-    image, intrinsic = undistort_if_requested(image, cam_info, undistort, undistort_alpha)
+    image, intrinsic = undistort_if_requested(
+        image, cam_info, undistort, undistort_alpha,
+        new_k_mode=undistort_new_k_mode)
     if undistort:
         lidar2img = compute_lidar2img(cam_info, intrinsic_override=intrinsic)
 
@@ -1612,6 +1631,7 @@ def render_camera_panel(
     draw_fullres: bool,
     display_aspect: str,
     camera_size: Optional[Tuple[int, int]] = None,
+    undistort_new_k_mode: str = 'optimal',
 ) -> np.ndarray:
     cam_info = info['cams'][cam_id]
     image_path = resolve_image_path(data_root, cam_info['data_path'])
@@ -1630,7 +1650,8 @@ def render_camera_panel(
         image = draw_boxes_on_camera(
             image, boxes, names, draw_cam_info, class_names,
             undistort, undistort_alpha, min_depth, max_edge_px,
-            labels=labels, colors=colors)
+            labels=labels, colors=colors,
+            undistort_new_k_mode=undistort_new_k_mode)
         if draw_fullres:
             image = resize_to_width(image, camera_width)
     if camera_size is not None:
@@ -1920,6 +1941,7 @@ def render_info(
     no_header: bool = False,
     camera_size: Optional[Tuple[int, int]] = None,
     legend_layout_items: Optional[Sequence[Tuple[str, Tuple[int, int, int]]]] = None,
+    undistort_new_k_mode: str = 'optimal',
 ) -> np.ndarray:
     box_layers: List[np.ndarray] = []
     name_layers: List[str] = []
@@ -2028,7 +2050,8 @@ def render_info(
         render_camera_panel(
             info, cam_id, data_root, boxes, name_layers, label_layers, color_layers, class_names, camera_width,
             undistort, undistort_alpha, min_depth, max_edge_px, draw_fullres,
-            display_aspect, camera_size)
+            display_aspect, camera_size,
+            undistort_new_k_mode=undistort_new_k_mode)
         for cam_id in choose_camera_order(info, camera_ids)
     ]
     mosaic = make_camera_mosaic(panels)
@@ -2151,10 +2174,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--no-bev', action='store_true', help='只保存相机拼图，不拼接 BEV 面板')
     parser.add_argument('--no-header', action='store_true',
                         help='不添加顶部信息栏；仅在需要无标题纯画面时使用')
-    parser.add_argument('--undistort', dest='undistort', action='store_true', default=True, help='画框前先对图片去畸变，并使用 OpenCV 返回的新内参投影；默认开启')
+    parser.add_argument(
+        '--undistort', dest='undistort', action='store_true', default=True,
+        help='画框前先对图片去畸变，并使用所选输出内参投影；默认开启')
     parser.add_argument('--raw-distorted', dest='undistort', action='store_false', default=argparse.SUPPRESS,
                         help='不去畸变，在原始畸变图上使用畸变投影；用于检查板端原始输入显示效果')
-    parser.add_argument('--undistort-alpha', type=float, default=0.0, help='OpenCV 去畸变 alpha；0 裁掉无效区域，1 保留完整视野')
+    parser.add_argument(
+        '--undistort-alpha', type=float, default=0.0,
+        help='仅 --undistort-new-k optimal 使用；0 裁掉无效区域，1 保留完整视野')
+    parser.add_argument(
+        '--undistort-new-k', choices=['original', 'optimal'], default='original',
+        help=(
+            '去畸变输出内参策略；original 等价于 cv2.undistort(image,K,D,None,K)，'
+            'optimal 使用 getOptimalNewCameraMatrix，此时 --undistort-alpha 才生效'))
     parser.add_argument('--max-corner-edge-px', type=float, default=0.0, help='原始畸变图中角点连线最大像素长度；0 表示按图像尺寸自动设置。默认去畸变时不使用该限制')
     parser.add_argument('--min-depth', type=float, default=0.1, help='不绘制深度小于该阈值的投影边')
     parser.add_argument('--fps', type=int, default=10, help='输出视频帧率')
@@ -2270,7 +2302,9 @@ def main() -> None:
                 args.gt_view_mode, gt_filter_visible_camera, gt_filter_range)
     logger.info('camera_width=%d camera_size=%s display_aspect=%s single_camera_view=%s',
                 camera_width, camera_size, args.display_aspect, single_camera_view)
-    logger.info('undistort=%s undistort_alpha=%.3f', args.undistort, args.undistort_alpha)
+    logger.info(
+        'undistort=%s undistort_new_k=%s undistort_alpha=%.3f',
+        args.undistort, args.undistort_new_k, args.undistort_alpha)
     if args.no_render:
         logger.info('Skip rendering because --no-render is set.')
         return
@@ -2349,6 +2383,7 @@ def main() -> None:
             no_header=args.no_header,
             camera_size=camera_size,
             legend_layout_items=video_legend_layout,
+            undistort_new_k_mode=args.undistort_new_k,
         )
         current_video_path = video_output_path(output_dir, info, args.video_group)
         saved_frame_dir = None
