@@ -104,7 +104,8 @@ baseline：
 
 - `mmdet3d/models/detectors/fastbev.py`
 - `tools/export_onnx.py`
-- `tools/export_2d_to_3d_model.py`
+- `tools/build_mono_front_board_assets.py`
+- `tools/run_mono_front_board_inference.py`
 
 ### 3.3 动态畸变和 backproject
 

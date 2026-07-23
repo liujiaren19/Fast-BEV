@@ -1,6 +1,6 @@
 # N7 Fast-BEV 实验汇总
 
-> 更新时间：2026-07-13；范围：N7 6V 可训练基线、6V 性能消融、单目前视四时序实验、当前原生单帧 S0 计划。
+> 更新时间：2026-07-23；范围：N7 6V 四时序精度基线、单目前视四时序 B0、原生单帧 S0、PC 侧 ONNX/LUT 与板端参考链路。
 >
 > 详细记录见：[N7_FASTBEV_EXPERIMENT_DETAILS.md](N7_FASTBEV_EXPERIMENT_DETAILS.md)
 >
@@ -8,29 +8,41 @@
 
 ## 1. 先看结论
 
-1. **N7 6V 基线已经证明可以训练，但现有日志不能证明完成了 20 epoch，也没有可确认的 6V eval 指标。**
-   2026-06-26 日志确认保存了 epoch1、epoch2，日志停在 epoch3 的 630/1858；epoch2 末采样 loss 为 0.8506。
+1. **旧 EXP-6V-00 仍只是可训练性证据；新的 EXP-6V-B0 已形成首个可信 6V 精度基线。**
+   2026-07-17 新 run 使用 6 camera × 4 times、4×L20、24/GPU、AdamW2 `8e-4` 和 20 epoch 上限。唯一日志已完整覆盖并保存 epoch1～17；训练外 `eval_summary.md` 对 epoch1～16 做了 val 复评。用户决定 epoch17 及以后不再作为本轮 checkpoint 选型参考，因此正式评估窗口冻结为 e1～16：canonical `mAP` 最佳为 epoch6 `0.453768`，BEV mAP@0.5 同样在 epoch6 最佳（`0.4787`）。
 
-2. **单目前视四时序的模型结构适配成立。**
+2. **EXP-6V-B0 已正式闭环：e6=best、e2=中远距 challenger、e16=terminal。**
+   epoch6 后，epoch7～16 已连续 10 个已评估 epoch 未刷新 canonical mAP，远超 patience=5；epoch16 已降至 `0.4192`。训练后段 loss 继续下降，但 val mAP、BEV、中远距 Recall 和预测数同步退化。epoch17 虽已保存，但按用户决策排除出正式选型窗口，不再要求补评，也不继续 epoch18～20。
+
+3. **单目前视四时序的模型结构适配成立。**
    四时序基线是每个样本 1 个相机 × 4 个时间步，共 4 张图；从 6V 改成单目时没有错误缩减四时序 3D fusion 的 1024 输入通道。
 
-3. **早期单目 full-data 实验和 2026-07-08 B0 必须分开。**
+4. **早期单目 full-data 实验和 2026-07-08 B0 必须分开。**
    早期高学习率实验出现过 AP 和 score collapse；其中一版还继承了不适用于前视 ROI 的 BEV vertical flip。2026-07-08 B0 没有发生这种 collapse。
 
-4. **当前可信的四时序对照是 EXP-MONO-B0，最佳权重为 epoch5。**
-   canonical `mAP`（center-distance mAP；历史键 `mAP/center_dist`）在 epoch5 为 0.344934；对应 BEV IoU mAP@0.5 为 0.3562。epoch15 的训练 loss 已降到约 0.65，但 AP 没有刷新，因此没有证据支持继续训练到 20 epoch。
+5. **当前可信的四时序对照是 EXP-MONO-B0，最佳权重为 epoch5。**
+   canonical `mAP`（center-distance mAP；历史键 `mAP/center_dist`）在 epoch5 为 0.344934；对应 BEV IoU mAP@0.5 为 0.3562。epoch15 末采样的 `positive_bag_loss=0.6496`，但总 loss 是 0.7928；AP 没有刷新，因此仍没有证据支持继续训练到 20 epoch。
 
-5. **epoch5 之后是平台波动，不是崩溃。**
+6. **epoch5 之后是平台波动，不是崩溃。**
    epoch6～15 的 `mAP` 约在 0.3366～0.3433 间波动；ATE、AOE、ASE 仍有部分改善，但主 AP 未超过 epoch5。
 
-6. **旧 eval 中 xyz 的小 signed mean 不能解释为“只有几厘米定位误差”。**
+7. **旧 eval 中 xyz 的小 signed mean 不能解释为“只有几厘米定位误差”。**
    x/y signed mean 会正负抵消；epoch5 的总体 mATE@2m 仍为 0.8899 m。旧 z_mean 约为 car -0.83 m、truck -1.67 m，符合 prediction bottom-center 与 GT gravity-center 混算产生的负半车高偏差。代码修复后，用户已用已有 result pkl 直接重评并确认 car/truck 的 z 偏差恢复正常；精确新数值和结果文件 hash 待归档。
 
-7. **当前产品路线已经切换为原生单帧。**
-   板端虽有六轴 IMU 和轮速，但 pose 接口尚未完成，因此近期不把四时序重复当前帧作为最终方案。EXP-MONO-S0 配置已准备好，尚无训练权重和指标。
+8. **原生单帧 EXP-MONO-S0 已完成 15 epoch，并最终冻结 epoch13。**
+   最终 canonical `mAP=0.356425`、BEV mAP@0.5=`0.3773`、mATE=`0.8588m`、mAOE=`4.0545°`、mASE=`0.2132`。epoch10 保留为中远距 challenger，epoch15 只作终止归档；最终 checkpoint/config/data/calibration hash 仍需补录。
 
-8. **下一轮先做公平的 S0 与 B0 对比，不同时调其他变量。**
-   单帧保持 cam0、704×256、ROI、voxel、anchor、distortion、GT 过滤、全局 batch、LR 和 COCO 初始化与 B0 一致；上限 15 epoch，独立单卡逐 epoch eval，优先比较 epoch5，并采用 best 后连续 5 个 epoch 未刷新则停止的规则。
+9. **S0 仍是近期产品 base，但优势是温和、且 6V/mono 指标不能直接横比。**
+   S0 e13 比 B0 e5 canonical mAP 高 `0.011491`，ATE/AOE/ASE 也更好；但 e13 truck Recall@2m 在 40～60m/60～80m 为 `0.6498/0.6435`，低于 e10 的 `0.6853/0.6693`。6V 使用全环视 ROI 和不同 GT 口径，不能用 `0.453768` 直接宣称相对 mono 的产品收益。
+
+10. **EXP-6V-B0 数据门禁按已知 clip 边界例外放行。**
+    用户确认 20260717 六目数据的门禁失败根因是各 clip 起始/末尾帧不齐全，并批准该已知边界条件放行；本轮记录为 `PASS_WITH_ACCEPTED_CLIP_BOUNDARY_EXCEPTION`。本地没有同步对应 gate/pkl，不能独立复算，但该问题不再阻塞本轮基线冻结。resolved test 仍复用 val pkl，因此当前指标只能称为 val 精度基线，不是独立 test。
+
+11. **PC 侧单帧部署链路已闭环到浮点参考，下一步分成 6V 资产归档和真实板卡验收两条线。**
+    dataset/production epoch13 PTH 对齐、Torch-CUDA fixed LUT、FP ONNX 功能对齐、独立 CPU 板端参考和 38 项回归已经完成；真实芯片 tensor dump、实际板端 runtime 和真实 INT8 数值验证仍未完成。用户确认 6V 的 PTH、pkl 和相关资产已在内网保存；当前工作区未同步实体/hash，但不再作为本轮精度结论的阻塞项。
+
+12. **6V 重训已登记为 `force_resize` 修复后的低优先级待办，当前保持收口。**
+    6V e6→e16 的后 20% loss 中位数从 `0.6501` 降到 `0.4212`，canonical mAP 却从 `0.453768` 降到 `0.4192`，说明优化器仍在拟合训练目标，不代表 val 精度仍在收敛。未来完成 `force_resize` 修复和等价性回归后，以新实验 ID/work_dir、原 `8e-4` 单变量重训一次；只有相同退化再次出现，再用 `4e-4` 做 challenger。该项不阻塞当前单帧产品和板端主线，无排期时不主动启动。
 
 ## 2. 证据等级
 
@@ -49,13 +61,14 @@
 | --- | --- | --- | --- | --- | --- |
 | SMK-MONO-00 | 2026-06-27 | 验证动态单目四时序模型路径 | nuScenes mini；1 camera × 4 times | 2080 Ti 完成 1 iter 和 test forward | train loss 4.0493；仅结构 smoke，不是 N7 精度 |
 | EXP-6V-00 | 2026-06-26 | N7 6V 四时序可训练基线 | 6 camera × 4 times；4×L20；每卡 24；LR 8e-4；20e 上限 | epoch1/2 已保存；epoch3 仅到 630/1858 | epoch2 末 loss 0.8506；无可信 eval |
+| EXP-6V-B0 | 2026-07-17～07-23 | N7 6V 四时序完整 val 精度基线 | 6 camera × 4 times；4×L20；每卡 24；AdamW2 8e-4；20e 上限 | e1～17 完成/保存；正式选型窗口冻结为 e1～16 | final best=e6；challenger=e2；terminal=e16；patience=10 |
 | ABL-6V-01 | 2026-06-30 | 6V backproject/畸变耗时消融 | 同类 6V full-data 链路 | 性能实验，不选精度权重 | 动态畸变旧路径约 20～22s/iter；优化后约 16s；关闭畸变约 6.8～7.2s |
 | EXP-MONO-T1 | 2026-07-03 | 单 sequence 单目四时序收敛验证 | 1×L20；每卡 64；Adam 4e-4；20e；vertical flip 0.5 | epoch1～20 已保存 | 单类有效 val；BEV mAP@0.5 在 e15 为 0.3415，truck GT=0，不可代表全量 |
 | EXP-MONO-T2 | 2026-07-03 | full-data 初始单目四时序 | 4×L20；每卡 64；约 8e-4；仍继承 vertical flip 0.5 | 日志确认 epoch1～10 已保存 | e5 训练内 eval BEV mAP@0.5=0.0974；历史外部 e10 eval 近 0 |
 | EXP-MONO-T3 | 2026-07-06 | 关闭 vertical flip 后的 clean 高 LR 重跑 | 4×L20；每卡 64；vertical flip 0；高 LR | 本机日志确认 e1～4；历史记录还有 e5 复评 | 历史逐 epoch BEV mAP@0.5：e2 最好 0.2897，e5=0；不能与 B0 混用 |
 | EXP-MONO-T4 | 2026-07-07 | 从 T3 epoch2 权重低 LR 恢复试验 | load_from T3 e2；不是 resume；Adam 2e-4；8e 上限 | e1～4 保存，e5 到 700/785 | loss 继续降至约 0.83；本机无完整 e5/eval，未形成正式基线 |
 | EXP-MONO-B0 | 2026-07-08 | 正式四时序单目前视对照 | 4×L20；每卡 64；AdamW2 1e-4；15e；vertical flip 0 | epoch1～15 均保存；best=e5 | canonical mAP 0.344934；BEV mAP@0.5 0.3562 |
-| EXP-MONO-S0 | 待内网 | 原生单帧产品基线 | 1 camera × 1 time；其余尽量与 B0 相同 | 配置已就绪，尚无 PTH | 待训练；先对比双方 e5 和各自 best |
+| EXP-MONO-S0 | 2026-07-13 | 原生单帧产品基线 | 1 camera × 1 time；4×L20；每卡 64；AdamW2 1e-4；15e | e1～15 完成；最终 best=e13 | canonical mAP 0.356425；BEV mAP@0.5 0.3773 |
 
 ## 4. 当前权重与路径总表
 
@@ -65,14 +78,43 @@
 
 - 初始化权重：
   pretrained_models/cascade_mask_rcnn_r18_fpn_coco-mstrain_3x_20e_nuim_bbox_mAP_0.5110_segm_mAP_0.4070.pth
-- 历史 work_dir：
+- 旧 EXP-6V-00 work_dir：
   /mnt/liujiaren/fastbev-python/work_dirs/n7_6v_704_256/20251017_20251030_20251031_20251203_gpu4_batch24_work_8_260626
-- 日志确认存在过：
+- 旧日志确认存在过：
   epoch_1.pth、epoch_2.pth
+- 当前 EXP-6V-B0 work_dir：
+  work_dirs/n7_6v_704_256/20251017_20251030_20251031_20251203_gpu4_batch24_work_8_260717
+- 当前训练日志：
+  work_dirs/n7_6v_704_256/20251017_20251030_20251031_20251203_gpu4_batch24_work_8_260717/20260717_173206.log
+- 当前逐 epoch eval 汇总：
+  work_dirs/n7_6v_704_256/20251017_20251030_20251031_20251203_gpu4_batch24_work_8_260717/test_results/eval_summary.md
+- 当前状态：
+  epoch1～17 checkpoint 已由日志确认保存；训练外 val 复评到 epoch16。用户决定 epoch17 及以后不纳入本轮选型，当前本机没有训练/eval 进程；PTH/pkl 由用户确认已在内网保存，本地只同步日志和汇总。
+- 最终 best：
+  epoch_6.pth，canonical `mAP=0.453768`，BEV mAP@0.5=`0.4787`。
 - 配置对应入口：
   configs/fastbev/custom/custom_fastbev_6v_r18_n7_704x256_dist_train.py
-- 证据日志：
+- 旧实验对照日志：
   /workspace/20260626_174629.log
+
+### 4.1A 当前 6V 精度基线 EXP-6V-B0
+
+- 本地 work_dir：
+  `work_dirs/n7_6v_704_256/20251017_20251030_20251031_20251203_gpu4_batch24_work_8_260717`
+- 训练日志：
+  `20260717_173206.log`，epoch17 保存后同步快照 SHA256 `bf5a98f4908ff1ac5d0d49fec687ae564577a9760dfd0c63492b2c681ba0635b`
+- eval 汇总：
+  `test_results/eval_summary.md`，SHA256 `ad2254ef828efcacf4a5b66cd2f556a037799f6620d4d442b42c91bc6a2ed580`
+- 训练完整性：
+  epoch1～17 各有 209 个日志点并出现保存标记。
+- eval 完整性：
+  汇总覆盖正式选型窗口 epoch1～16；epoch17 未评且按用户决策不再要求补评。目录内没有 `epoch_*.pth`、`eval_summary.csv/json`、逐 epoch metrics JSON、result pkl 或 eval log，不能在本地计算 checkpoint hash，也不能实体核验 checkpoint/result 一一对应。
+- 当前选择：
+  canonical best=`epoch_6.pth`；40～60m Recall challenger=`epoch_2.pth`；正式 terminal=`epoch_16.pth`。epoch17 仅保留为内网原始训练延续资产，不纳入本轮选型和结论。
+- 终止结论：
+  epoch6 后已有连续 10 个已评估 epoch 未刷新；本轮已经停止并闭环，不补评 e17，不继续 epoch18～20。
+- 复现缺口：
+  训练日志没有代码 commit；20260717 train/val pkl、标定版本和门禁报告未同步到本地，但用户确认 PTH/pkl 已在内网保存，并确认门禁仅为可接受的 clip 边界不齐。分析开始时仓库同名 dist config 只覆盖 `optimizer.lr`，沿论文 base 会继承标准 `Adam`，与本轮日志 resolved `AdamW2` 不一致；分析期间该配置被外部未提交改动显式收口为 `_delete_=True` 的 `AdamW2` 和本轮数据/schedule，本文没有修改该配置。真实训练结论继续以日志为准。
 
 ### 4.2 单 sequence 收敛验证
 
@@ -120,8 +162,43 @@
   configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18.py
 - 训练配置：
   configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18_dist_train.py
-- work_dir、PTH、eval 结果：
-  尚未产生，禁止预填虚构路径。
+- 日志记录的 work_dir（相对内网仓库）：
+  work_dirs/n7_mono_704_256_single_frame/20251017_20251030_20251031_20251203_gpu4_batch64_work_8_260713
+- 早期本地留存训练日志/逐 epoch 汇总只覆盖到 e9；后续完成状态来自用户确认和内网实跑记录。
+- 最终训练状态：
+  epoch_1.pth～epoch_15.pth 均完成，epoch13 为 canonical best，epoch10 保留为中远距 challenger，epoch15 为终止归档。
+- 最终 best：
+  epoch_13.pth，canonical `mAP=0.356425`，BEV mAP@0.5=`0.3773`，mATE=`0.8588m`，mAOE=`4.0545°`，mASE=`0.2132`。
+- 待内网补录：
+  epoch13/epoch10/epoch15 PTH、result pkl、resolved config、代码/数据/标定 SHA256。
+
+### 4.6 当前 6V-B0 阶段精度
+
+以下结果来自当前 `eval_summary.md`，只覆盖已经完成复评的 epoch1～16：
+
+| epoch | canonical mAP | BEV mAP@0.5 | mATE | mAOE | mASE | 结论 |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 0.3926 | 0.3921 | 0.8821m | 5.902° | 0.2225 | 初始可用 |
+| 2 | 0.4355 | 0.4349 | 0.8407m | 4.711° | 0.2187 | 快速提升 |
+| 3 | 0.4445 | 0.4491 | 0.8230m | 4.558° | 0.1964 | 继续提升 |
+| 4 | 0.4435 | 0.4592 | 0.8179m | 4.012° | 0.1950 | mAP 小幅回落 |
+| 5 | 0.4458 | 0.4652 | 0.7996m | 3.937° | 0.1860 | 接近最佳 |
+| **6** | **0.453768** | **0.4787** | **0.7793m** | **3.062°** | **0.1811** | **当前 canonical best** |
+| 7 | 0.4517 | 0.4714 | 0.7818m | 3.228° | 0.1815 | 接近最佳 |
+| 8 | 0.4462 | 0.4659 | 0.7879m | 4.022° | 0.1763 | 开始回落 |
+| 10 | 0.4373 | 0.4545 | 0.7763m | 2.929° | 0.1745 | AP 继续回落 |
+| 12 | 0.4366 | 0.4533 | 0.7599m | 3.122° | 0.1712 | 回归误差改善 |
+| 14 | 0.4265 | 0.4408 | 0.7683m | 3.264° | 0.1702 | AP 未恢复 |
+| 16 | 0.4192 | 0.4354 | 0.7636m | 3.119° | 0.1683 | AP 明显低于 e6 |
+
+截至 e16，epoch6 后已有 10 个已评估 checkpoint 未刷新 canonical mAP。loss 和 mASE 继续下降，但检测 AP 持续回落，表现为典型的后期过拟合/分类排序退化，而不是训练发散。patience=5 在 e11 已满足；e17 已保存，补评后即可停止，不能仅因训练 loss 更低就改用后期 checkpoint。
+
+epoch6 分类别为 car/truck center AP=`0.5956/0.3119`，BEV AP@0.5=`0.5627/0.3947`。正向 x 距离分桶的 Recall@2m 为：
+
+- car：0～20m `0.9314`、20～40m `0.8472`、40～60m `0.7577`；
+- truck：0～20m `0.8573`、20～40m `0.6857`、40～60m `0.5038`。
+
+该分桶只覆盖正向 x，不能代表 6V 全环视 ROI 的后向和纯侧向目标；因此 6V 与 mono 的距离表也不能直接横比。
 
 ## 5. B0 核心指标
 
@@ -160,16 +237,16 @@
 
 当前最明显的精度短板是 truck 和严格 center-distance AP；不能只看总体 BEV AP。
 
-## 6. 为什么 loss 降到 0.65 仍不建议继续到 20 epoch
+## 6. 为什么 positive bag loss 降到 0.65 仍不建议继续到 20 epoch
 
-EXP-MONO-B0 的采样总 loss：
+EXP-MONO-B0 的 epoch 末采样项如下。旧笔记中的 0.6496 是 `positive_bag_loss`，不是总 loss：
 
-| epoch | 末次采样 loss | mAP（center） |
-| ---: | ---: | ---: |
-| 1 | 1.4288 | 0.2891 |
-| 5 | 0.7919 | **0.3449** |
-| 10 | 0.6916 | 0.3366 |
-| 15 | 0.6496 | 0.3387 |
+| epoch | positive bag | negative bag | 总 loss | mAP（center） |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.4288 | 0.1493 | 1.5780 | 0.2891 |
+| 5 | 0.7919 | 0.1452 | 0.9371 | **0.3449** |
+| 10 | 0.6916 | 0.1420 | 0.8336 | 0.3366 |
+| 15 | 0.6496 | 0.1433 | 0.7928 | 0.3387 |
 
 loss 是训练目标，canonical `mAP` 是模型选择目标。epoch5 之后 loss 继续下降，但验证 AP 没有同步提升，表现更符合平台期或轻度过拟合。当前合理做法是保留 15 epoch 上限和 patience=5，而不是把单轮直接延长到 20。
 
@@ -193,9 +270,42 @@ loss 是训练目标，canonical `mAP` 是模型选择目标。epoch5 之后 los
 | optimizer | AdamW2，LR 1e-4 | 相同 |
 | 初始化 | COCO 2D pretrained | 相同 |
 | 上限 | 15 epoch | 15 epoch |
-| eval | B0 已逐 epoch复评 | 单卡服务器独立监控 |
+| eval | epoch1～15 已逐 epoch 复评 | epoch1～15 已完成；最终按 canonical mAP 选 e13 |
 
 第一轮只改变 n_times 和对应 3D fuse 通道。输入几何、anchor、CBGS、NMS、增强、LR 等优化放到 S0 基线形成后逐项 A/B。
+
+### 7.1 S0 当前逐 epoch 指标
+
+| epoch | mAP（center） | BEV mAP@0.5 | mATE@2m | mAOE | mASE | 结论 |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 0.2894 | 0.2796 | 0.9501 | 6.212° | 0.2928 | 初始可用 |
+| 2 | 0.3305 | 0.3388 | 0.9160 | 5.516° | 0.2522 | 快速提升 |
+| 3 | 0.3308 | 0.3422 | 0.9230 | 6.472° | 0.2487 | AP 持平、角度波动 |
+| 4 | 0.3349 | 0.3496 | 0.9029 | 4.581° | 0.2514 | 继续提升 |
+| 5 | 0.3518 | 0.3625 | 0.8818 | 4.771° | 0.2437 | 公平 epoch5 对比点 |
+| 6 | 0.3541 | 0.3693 | 0.8742 | 4.264° | 0.2333 | 接近当前最佳 |
+| 7 | 0.3527 | 0.3680 | 0.8816 | 4.428° | 0.2257 | 平台波动 |
+| 8 | 0.355078 | 0.3650 | 0.8681 | 4.592° | 0.2297 | 截至 e9 的历史 best |
+| 9 | 0.3548 | **0.3713** | **0.8667** | **3.971°** | **0.2256** | BEV/回归更好，主 mAP 略低 |
+| **13** | **0.356425** | **0.3773** | **0.8588** | **4.055°** | **0.2132** | **最终 canonical best** |
+
+表中保留 e1～9 作为早期过程证据；e10～12/e14～15 的精确逐 epoch 数值尚未同步到本地文档资产，但内网已完成 15 epoch 评估并最终选择 e13，不能再把 e8 写成当前 best。
+
+### 7.2 B0 与 S0 的同口径对比
+
+| 对比口径 | B0 | S0 | S0 相对变化 |
+| --- | ---: | ---: | ---: |
+| epoch5 canonical mAP | 0.344934 | 0.3518 | 约 +0.0069 |
+| epoch5 BEV mAP@0.5 | 0.3562 | 0.3625 | +0.0063 |
+| epoch5 mATE | 0.8899m | 0.8818m | -0.0081m |
+| epoch5 mAOE | 4.315° | 4.771° | +0.456°，较差 |
+| 各自最终 best canonical mAP | e5 0.344934 | e13 0.356425 | +0.011491 |
+| 各自最终 best BEV mAP@0.5 | e5 0.3562 | e13 0.3773 | +0.0211 |
+| 各自最终 best mATE | 0.8899m | 0.8588m | -0.0311m |
+| 各自最终 best mAOE | 4.315° | 4.055° | -0.260° |
+| 各自最终 best mASE | 0.2369 | 0.2132 | -0.0237 |
+
+S0 e13 是总体主模型，但不是每个产品切片都最优：e13 truck Recall@2m 在 40～60m/60～80m 为 `0.6498/0.6435`，低于 e10 的 `0.6853/0.6693`。因此保留 e10 作为中远距 challenger 是合理的；生产发布仍以 e13 为 canonical checkpoint，不能按单个距离切片偷偷替换主 best。
 
 ## 8. 当前代码审查项状态
 
@@ -203,11 +313,11 @@ loss 是训练目标，canonical `mAP` 是模型选择目标。epoch5 之后 los
 | --- | --- | --- |
 | 板端无 pose 的时序不等价 | 已做产品决策：近期原生单帧 | S0 路线正确；B0 只作离线对照 |
 | prediction box origin / z | 代码已修；已有 result pkl 重评确认 car/truck z 偏差正常 | 不需重训；补归档新数值、结果路径和 hash |
-| ONNX wrapper 分支 | 代码已修；合成 ONNX/ORT diff=0 | 真实 S0 checkpoint 仍需内网导出 |
-| 原生单帧配置 | 已新增并通过本地静态/合成检查 | 需 legacy 环境 model/dataloader/train/test smoke |
-| pkl strict 门禁 | 未完成 | 正式长训练前必须完成 split、相机、尺寸、类别、空帧审计 |
+| ONNX/LUT 浮点链路 | 真实 e13 已完成 PTH、FP ONNX、Torch-CUDA fixed LUT 和 canonical decode 功能对齐 | raw tensor 仍有 ORT/PTH 数值差；真实芯片/INT8 仍开放 |
+| 原生单帧配置 | 已完成 15 epoch、最终选择 e13，并完成生产图片 PTH/ONNX-FP 推理 | 最终 PTH/result/config/data/calibration hash 待归档 |
+| pkl strict 门禁 | 实现和旧 pkl 实跑已完成；报告为 FAIL | 已确认零泄漏和字段完整性；需处理 `labels_without_frame=851/90`、空 GT 丢弃和独立 test |
 | distortion-aware GT 可见性 | 未完成 | 当前模型 backproject 与 GT 过滤口径仍不完全一致 |
-| 生产推理 vs dataset 同图对齐 | 未完成 | 角度偏、20～30m 不清楚前先排除预处理/标定/坐标差异 |
+| 生产推理 vs dataset 同图对齐 | e13 PTH 在 N7 黄金样本和 5 个固定样本已 PASS；生产 info-json 数值路径也 PASS | 代码路径已闭环；物理标定仍需独立 lidar/image 验证 |
 | `force_resize` 关闭随机增强 | 首轮 A/B 后作为第 4 个正确性收口项 | 先拆分基础变换并验证无增强等价，再单独 A/B 随机增强 |
 | 704×256 stretch / 输入几何 | 待 S0 后 A/B | 可能影响远距小目标和预训练迁移上限 |
 | CBGS、anchor、NMS | 待数据统计后单变量 A/B | 当前不应盲调 |
@@ -241,13 +351,13 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 
 ## 10. 下一步执行口径
 
-1. 在内网先构建 EXP-MONO-S0 merged config，检查 dataloader 为 [B,1,3,256,704]、3D neck 输入为 [B,256,160,140]，完成 1 iter train/test smoke。
-2. 四卡只训练并逐 epoch 保存；使用 NO_VALIDATE=1。单卡服务器运行 tools/eval_epoch_checkpoints.py --watch。
-3. 优先得到 S0 epoch5，与 B0 epoch5 同口径比较；同时保留双方 best。
-4. best 连续 5 个已评估 epoch 未刷新时停止，不用训练 loss 代替 early-stop 判断。
-5. 归档 box-origin 重评后的 car/truck z signed mean、绝对误差、result pkl 路径和 hash；该修复已确认不需要重新训练。
-6. 初步 S0/B0 对比后，正式长训练前完成四项收口：pkl 门禁、生产/dataset 同图逐级对齐、distortion-aware GT 可见性一致，以及 `force_resize` 基础变换/随机增强拆分的无增强等价性回归。
-7. 正式 S0 基线建立后，再依次做输入几何/分辨率、增强、CBGS、anchor、NMS、初始化/蒸馏等单变量实验。
+1. EXP-6V-B0 已闭环：保留 e6 为 canonical best、e2 为正向 x 中远距 challenger、e16 为 terminal；e17 及以后不再纳入选型，不补评、不继续训练。
+2. 用户确认 6V PTH/pkl 已在内网保存；建议在内网资产 manifest 中固化 e6/e2/e16 的路径、大小、SHA256 和对应 result/metrics，但这不再阻塞本轮结论。
+3. 将真实芯片预处理、2D 输出、LUT gather/scatter、3D logits 和后处理 tensor dump 与独立 CPU 板端参考逐级对齐，并单独完成真实 INT8 数值验证。
+4. EXP-6V-B0 的六目 clip 起始/末尾不齐已按用户确认作为门禁例外放行；后续新增数据版本仍应保留 token/clip 泄漏、manifest、标定和 hash 审计。
+5. 低优先级代办：`force_resize` 基础变换/随机增强拆分及等价性回归完成后，用新实验 ID/work_dir、原 `8e-4` 单变量重训一次 6V；若 e6 后式退化复现，再增加 `4e-4` LR challenger。当前 6V 保持收口。
+6. 使用同步 lidar/image 独立验证生产车型物理标定；当前 info-json/pkl 数值一致不能替代物理投影正确性。
+7. 基于 S0 e13 和 6V e6 的稳定基线，分别做输入几何/分辨率、增强、CBGS、anchor、NMS、初始化/蒸馏等单变量实验。
 
 ## 11. 每轮实验必须补录的资产
 

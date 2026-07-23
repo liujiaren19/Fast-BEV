@@ -1,6 +1,6 @@
 # Fast-BEV N7 单目前视单帧产品化代办清单
 
-> 更新时间：2026-07-14
+> 更新时间：2026-07-23
 > 当前仓库：`/workspace/Fast-BEV_test_custom-fastbev-adapter`
 > 当前产品决策：板端近期使用原生单帧单目推理；六轴 IMU + 轮速 pose 尚在开发，四时序模型保留为离线上限和未来候选，不作为当前产品主路径。
 
@@ -59,25 +59,31 @@ S0 = cam0 + n_images=1 + n_times=1 + 无历史 pose
    - 拆分 `force_resize` 的确定性基础变换与随机图像增强，先做关闭随机增强的等价重构验证。
 5. 上述正确性问题收口后，再启动正式单帧训练和后续单变量能力优化。
 
-### 1.4 2026-07-14 当前同步与验证状态
+### 1.4 2026-07-23 当前同步与验证状态
 
 - [x] 当前仓库代码与内网代码已由用户确认同步一致；Markdown、Claude/Codex 本地辅助文件未同步到内网。
-- [x] S0 内网训练已至少运行到 epoch10；用户用 epoch8 在无真值生产车辆数据上完成可视化检查，直道约 40m 内的检出和定位观感明显优于四时序模型重复当前帧。
-- [ ] S0 的逐 epoch 定量指标、最终 best epoch、15 epoch 是否完成及 checkpoint/config/data hash 仍待补录；生产可视化不能替代独立 val/test 指标。
+- [x] S0 已完成 15 epoch；最终 canonical best 为 epoch13：mAP=`0.356425`、BEV@0.5=`0.3773`、mATE=`0.8588m`、mAOE=`4.0545°`、mASE=`0.2132`。
+- [x] S0 epoch13 为产品主 checkpoint；epoch10 保留为中远距 challenger，epoch15 只作终止归档。
+- [x] S0 e13 已完成 N7 dataset/production PTH 黄金样本与 5 个固定样本逐级对齐；生产 info-json 数值路径也通过。
+- [x] Torch-CUDA fixed LUT、FP ONNX 功能链和独立 CPU 板端参考已完成 PC 侧实测；38 项回归通过。
+- [ ] S0 e13/e10/e15 PTH、result、resolved config、代码/数据/标定 SHA256 仍待最终归档；现有生产集没有独立 GT。
+- [ ] 真实芯片 tensor dump、实际板端 runtime 和真实 INT8 数值验证仍未完成；PC 侧参考 PASS 不等于 M4 板端验收。
 - [x] 已对现有 B0 train/val pkl 运行严格门禁：token/clip 零重叠，cam0、图片/K/畸变、GT 分布和 pose 可审计。
 - [ ] 现有 B0 pkl 门禁仍为 `FAIL`：旧 converter 统计中 train/val 分别有 `labels_without_frame=851/90`，且尚无独立 test pkl；应保留报告并在重新转换或风险确认后关闭该项。该 FAIL 是数据问题被正常检出，不是门禁脚本异常崩溃。
+- [x] EXP-6V-B0 已收口：canonical best=e6、40～60m Recall challenger=e2、terminal=e16；e17 及以后不再纳入本轮选型。
+- [-] `force_resize` 修复后重训一次 6V 基线已登记为 P3 低优先级待办；当前不启动，也不阻塞单帧产品、板端或其他 P0/P1 工作。
 
-## 2. P0：下一版训练前必须完成
+## 2. P0：正式单帧基线和板端闭环前必须完成
 
 ### 2.1 固化 B0 实验资产
 
 - [x] 仓库 temporal dist config 已同步 `total_epochs=15`；内网仍需保存 2026-07-08 run 的完整 resolved config。
 - [x] 单帧对比配置固定 `total_epochs=15`，与 B0 使用相同上限和调度口径。
 - [x] 当前 GitHub 代码已拆分固化：B0/公共链路为 `2d8ab7d`，S0/ONNX/LUT 增量为 `c3ec682`；两笔 author/committer 均为 `liujiaren19 <1334282612@qq.com>`。
-- [ ] 继续归档内网对应 commit、提交前 dirty diff、环境版本和随机种子信息。
+- [ ] 继续归档内网对应 commit 和提交前 dirty diff；环境版本、4×L20 和 seed=0 已从日志留证。
 - [ ] 保存 train/val manifest、pkl、每车型标定和 epoch5 checkpoint 的 SHA256。
-- [ ] 保存 `/workspace/20260708_122556.log` 和 `/workspace/eval_summary.md` 的归档位置。
-- [ ] 给旧 collapse run 单独命名，禁止覆盖 B0 的 work_dir 或汇总文件。
+- [x] 已在实验汇总/详细记录中保存 `/workspace/20260708_122556.log` 和 `/workspace/eval_summary.md` 的归档位置。
+- [x] 旧 collapse run 已单独编号为 T2/T3，B0 使用独立实验 ID 和 work_dir；后续不得覆盖。
 - [ ] 记录预训练实际加载口径：ResNet backbone 可加载；FPN64、neck_fuse、3D neck 和 head 因 shape/结构不同主要为新初始化。
 
 验收：任何人可以从记录中唯一确定 B0 的代码、数据、标定、配置、checkpoint 和指标。
@@ -131,7 +137,9 @@ S0 = cam0 + n_images=1 + n_times=1 + 无历史 pose
 - [x] `neck_3d.fuse.in_channels=256`、`out_channels=256`，保留单帧 channel mixing。
 - [x] 保持首版 ROI、voxel、anchor、distortion、图像尺寸和 GT 过滤不变。
 - [x] 单帧 inference 不再创建或重复 4 份当前图。
-- [ ] 单帧 LUT 只包含当前相机固定 LUT，不读取历史帧 pose。
+- [x] 现有 pkl+config LUT 路径在 `n_times=1,sequential=False` 时只选择当前帧/cam0，只导出一个时序片段，不读取 `prev` 历史帧或历史 pose。
+- [ ] 新增板端固定路径标定参数直接生成单帧 LUT 的入口，不能要求生产侧先构造训练 pkl。
+- [ ] 对同一车型标定分别生成 pkl+config LUT 和固定标定 LUT，比较 projection、valid mask、gather/scatter index 与 metadata；一致后再确定板端唯一生产入口。
 
 验收：模型/dataloader 实际输入 shape 为 `[B,1,3,256,704]`，3D neck 收到 `[B,256,160,140]`。
 
@@ -179,25 +187,25 @@ S0 = cam0 + n_images=1 + n_times=1 + 无历史 pose
 
 - [x] legacy MMDetection 内网环境已成功构建并长时间训练 S0，证明 config/model/train 主链可运行。
 - [ ] train dataloader shape 检查通过。
-- [x] S0 已训练至少到 epoch10，loss 可正常反向传播和保存 checkpoint。
-- [x] epoch8 已完成生产图片 PTH 推理和可视化；标准 val 结果数量与 dataset 对齐仍需单独留证。
+- [x] S0 已完成 epoch1～15，loss 可正常反向传播和保存 checkpoint；最终 canonical best=e13。
+- [x] epoch13 已完成生产图片 PTH 推理、可视化和标准 dataset/production 同图逐级对齐。
 - [x] 原生 `n_times=1` config 下 PTH 单图生产脚本只创建当前帧，不再重复四份输入。
-- [ ] 2D/3D ONNX 和单帧 LUT smoke 通过。
-- [ ] `git diff --check`、相关 `py_compile` 通过。
+- [x] 真实 epoch13 的 2D/3D FP ONNX、Torch-CUDA fixed LUT、canonical decode 和独立 CPU 板端参考已完成 PC 侧功能对齐。
+- [x] 基线提交前相关 `py_compile`、合成检查和 `git diff --check` 已通过；真实芯片/INT8 仍按 M4 独立验收。
 
 ### 3.2 第一轮单帧/时序对比训练计划
 
-- [ ] S0 从与 B0 相同的 2D backbone 预训练起步，建立干净单帧 baseline。
-- [ ] 保持 4 卡、每卡 64、全局 batch 256；未改变全局 batch 时保持 `lr=1e-4`。
-- [ ] `total_epochs=15` 作为上限，与 B0 保持一致。
-- [ ] checkpoint 每 epoch 保存。
+- [x] S0 从与 B0 相同的 2D backbone 预训练起步，建立干净单帧 baseline。
+- [x] 保持 4 卡、每卡 64、全局 batch 256，`lr=1e-4`。
+- [x] `total_epochs=15` 作为上限，与 B0 保持一致；S0 已实际跑满。
+- [x] epoch1～15 checkpoint 已完成；最终保留 e13/e10/e15 三个角色。
 - [x] 四卡启动脚本支持 `NO_VALIDATE=1`，训练服务器不构建/执行 validation。
-- [ ] 每 epoch 由单卡独立服务器评估并更新 summary。
-- [ ] best key 以 canonical `mAP` 为主（兼容旧键 `mAP/center_dist`），同时监控 BEV mAP、car/truck AP、召回和 score 分布。
-- [ ] 优先比较双方 epoch5；同时以各自 best checkpoint 作为最终对比。
-- [ ] 连续 5 个 epoch 不刷新 best 可提前停止。
+- [x] epoch1～15 已由单卡服务器完成评估；本地文档仍待同步 e10～15 完整逐行 summary 资产。
+- [x] best key 以 canonical `mAP` 为主（兼容旧键 `mAP/center_dist`），同时监控 BEV mAP、car/truck AP、召回和 score 分布。
+- [x] 已比较双方 epoch5 和最终 best；S0 e13 比 B0 e5 canonical mAP 高 `0.011491`。
+- [x] S0 已按 15 epoch 上限完成，不再延长训练。
 - [ ] 记录 dynamic fp16 loss scale、overflow/skip-step 次数，确认零星 `grad_norm=inf` 是否可忽略。
-- [ ] 不根据 loss 是否继续下降判断 best checkpoint。
+- [x] 当前 best 按 canonical `mAP` 选择，不根据 loss 是否继续下降判断。
 
 ### 3.3 checkpoint 和阈值复评
 
@@ -362,12 +370,13 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 
 ### 6.1 浮点数值闭环
 
-- [ ] 单帧固定 LUT 按车型标定生成并版本化。
-- [ ] 保存 LUT metadata：标定 hash、输入变换、distortion、voxel、stride 和 channel layout。
-- [ ] 建立 `预处理 -> 2D ONNX -> LUT -> 3D ONNX -> canonical postprocess` 模拟主路径。
-- [ ] 逐级对齐 input tensor、2D feature、BEV、raw logits 和 decoded boxes。
+- [-] 单帧固定 LUT 已能按车型标定生成；车型/标定版本化和发布目录规范仍待固化。
+- [-] 新生成 LUT 已保存 info.json hash、输入变换、distortion、voxel、stride 和 channel layout；已有历史 bin 缺少 hash 时只能明确标记 `SKIP`，不能猜测资产关系。
+- [x] 已建立并用 N7 固定五样本、生产车固定十样本验证 `预处理 -> 2D ONNX -> LUT -> 3D ONNX -> canonical postprocess` PC 浮点模拟主路径；严格 raw tensor 差异仍按报告保留。
+- [x] 已逐级对齐 input tensor、2D feature、BEV、raw logits 和 decoded boxes；功能口径通过，PTH/ONNX 严格 tensor 口径不通过，差异边界已有记录。
+- [x] 已由 `tools/run_mono_front_board_inference.py` 固化只读 fixed-LUT 板端参考，`tools/analyze_mono_front_pipeline.py` 统一逐级诊断；旧 simulator/runtime/compare 已在 golden fixture 接管等价守卫后删除。真实板端 tensor dump 与真实 INT8 数值闭环仍单独跟踪。
 - [ ] 删除 `tools/utils.py` 中绝对 anchor 路径、十类 reshape 和固定阈值依赖。
-- [ ] 以 `bbox_head.get_bboxes()` 为后处理权威参考。
+- [x] 以 `bbox_head.get_bboxes()` 为后处理权威参考；板端展开实现必须旁路对照它，不能反向用旧 `tools/utils.py` 覆盖 canonical 语义。
 
 ### 6.2 量化校准
 
@@ -382,8 +391,14 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 
 - [ ] 模型内部继续使用顶部主 lidar 坐标。
 - [ ] 输出 API 明确轴方向、坐标原点、yaw 定义和 `box_origin`。
+- [ ] 当前生产接口只需要 `car`，但本轮浮点数值对齐仍保留已训练的 `car/truck` 两类 head、raw logits 和 canonical decode；待数值链路闭环后，再在统一输出层显式过滤 `truck`，并与板端 car-only 后处理逐项对齐，不能通过临时修改类别数掩盖差异。
 - [ ] 如下游需要后轴 ego，在统一输出层完成刚体变换。
 - [ ] 不单独修改 label、外参、ROI、anchor 或 LUT 中某一个坐标环节。
+
+### 6.4 本轮部署验证收尾
+
+- [x] 已完成当前 PTH/ORT/固定 LUT 验证阶段的代码梳理：正式入口已收敛为资产构建、生产推理、standalone 板端参考和统一 analyzer；旧 runtime/simulator/compare、一次性相机去畸变与 yaw 诊断、重复可视化模块、临时验证产物和缓存均已清理。旧/新等价结果已固化为 golden fixtures，38 项回归、删除模块 import audit 和任务范围 `git diff --check` 均通过。
+- [ ] 真实芯片 tensor dump、板端 runtime 和真实 INT8 数值验证后续单独完成；当前代码整理完成不等同于 M4 板端验收，模型侧可以继续进入输入几何、增强、采样/anchor/NMS 和优化策略实验。
 
 ## 7. P3：未来恢复时序的前置工作
 
@@ -392,6 +407,17 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 - [-] 评估当前帧固定 LUT + 历史 BEV warp，或历史动态 LUT。
 - [-] pose 异常时清空历史/重复当前帧，并在训练中加入对应 history dropout。
 - [-] PTH pose-aware、板端模拟和真实板端对齐后，才重新启用四时序产品模型。
+
+### 7.1 低优先级：`force_resize` 修复后重训 6V 基线
+
+- [-] 当前 EXP-6V-B0 保持冻结，不补评 e17、不继续 e18～20；保留 e6/e2/e16 三个正式角色。
+- [ ] 只有在 2.7 的 `force_resize` 拆分、关闭增强等价性和四时序共享增强参数回归全部通过后，才创建新的 6V 实验；暂定新实验 ID 为 `EXP-6V-B1`，必须使用新 work_dir，不覆盖 B0。
+- [ ] 第一轮只改变 `force_resize` 修复，保持 20260717 数据、6 camera × 4 times、ROI/voxel/anchor、AdamW2、`lr=8e-4`、seed 和 schedule 不变。
+- [ ] 从 epoch1 开始逐 epoch val，主键仍为 canonical center-distance mAP；同时监控 BEV、40～60m Recall、预测数和 score 分布，patience=5。
+- [ ] 若修复后的 `8e-4` 仍复现 e5～e7 达峰后持续退化，再单独建立 `4e-4` challenger；不在同一轮同时改变输入分辨率、数据、anchor、CBGS、NMS 或 loss。
+- [ ] 该项优先级低于当前单帧产品正确性、独立 test、真实板端/INT8 和物理标定闭环；没有新的排期或算力授权时不主动启动。
+
+验收：形成一轮可与 EXP-6V-B0 同口径比较的新 6V 基线，并能把变化归因于 `force_resize` 修复；是否降低 LR 由修复后轨迹决定。
 
 ## 8. 建议执行里程碑
 
@@ -403,14 +429,16 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 
 ### M1：单帧链路跑通
 
-- [ ] 原生 `n_times=1` config、PTH smoke、ONNX、固定 LUT 全部跑通。
-- [ ] 标准 dataset 与生产推理同图逐级一致。
+- [x] 原生 `n_times=1` config 已完成真实训练和 PTH 生产图片推理。
+- [x] 真实 S0 checkpoint FP ONNX/ORT、Torch-CUDA fixed LUT、decoded boxes 和独立 CPU 板端参考已在 PC 侧跑通。
+- [x] 标准 dataset 与 production e13 PTH 同图逐级一致；生产车型物理标定仍需 lidar/image 独立验证。
 
 ### M2：第一轮单帧/时序对比结果
 
-- [ ] 15 epoch 上限训练完成或 best 后连续 5 epoch early-stop。
-- [ ] val best、独立 test、距离分桶和生产回归集结果齐全。
-- [ ] 与当前四时序重复帧生产方案比较。
+- [x] S0 15 epoch 上限训练完成，最终 best=e13。
+- [x] 已完成 epoch5 公平对比和最终 best 对比；S0 e13 比 B0 e5 canonical mAP 高 0.011491。
+- [ ] val best 和距离分桶已形成；独立 test、最终资产 hash 和有 GT 生产回归集仍缺。
+- [x] 已完成与当前四时序重复帧生产方案的无 GT 可视化比较；正式有 GT/回归集结论仍归入上一项。
 
 ### M3：单变量能力优化
 
@@ -421,7 +449,7 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 
 ### M4：板端可验收
 
-- [ ] PTH/ORT/板端 float 对齐。
+- [ ] PTH/ORT/PC 板端参考 float 对齐已完成；真实芯片 tensor/runtime 对齐仍未完成。
 - [ ] 量化闭环。
 - [ ] 每车型标定/LUT/版本管理和输出坐标协议完成。
 
