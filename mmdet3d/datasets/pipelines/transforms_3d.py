@@ -1662,17 +1662,36 @@ class InternalRandomFlip3D(RandomFlip3D):
 
 @PIPELINES.register_module()
 class RandomAugImageMultiViewImage(object):
-    """Random scale the image
+    """对多视图图像执行基础几何变换和可选训练随机增强。
+
     Args:
-        scales
+        force_resize: 是否按 ``intrinsic_width/height`` 到网络输入尺寸构造
+            确定性基础变换。该模式用于图片已离线缓存、K 仍保持原生尺寸的
+            N7 数据。
+        enable_random_aug: 是否启用训练随机 resize/crop/flip/rotate。
+            ``None`` 保持历史行为：普通路径开启，``force_resize`` 路径关闭。
+        n_images: 每个时间步的实际相机数。启用随机增强时用于让同一相机的
+            多个时间帧共享同一组几何参数。
     """
-    def __init__(self, data_config=None, is_train=True, is_debug=False, is_exit=False, tmp='./figs', force_resize=False):
+    def __init__(self, data_config=None, is_train=True, is_debug=False,
+                 is_exit=False, tmp='./figs', force_resize=False,
+                 enable_random_aug=None, n_images=None):
         self.data_config = data_config
         self.is_train = is_train
         self.is_debug = is_debug
         self.is_exit = is_exit
         self.tmp = tmp
         self.force_resize = force_resize
+        if enable_random_aug is None:
+            # 保持旧配置兼容：原论文路径继续随机增强，N7 force_resize
+            # 路径继续保持确定性。
+            enable_random_aug = not force_resize
+        self.enable_random_aug = bool(enable_random_aug)
+        self.n_images = None if n_images is None else int(n_images)
+        if self.n_images is not None and self.n_images <= 0:
+            raise ValueError(
+                'n_images must be positive when provided, got {}'.format(
+                    self.n_images))
 
     def random_id(self, N=8, seed=None):
         if seed is not None:
@@ -1688,17 +1707,25 @@ class RandomAugImageMultiViewImage(object):
         """
         aug_imgs = []
         aug_extrinsics = []
+        shared_augmentations = {}
+        effective_n_images = self._resolve_n_images(results)
+        if (self.force_resize and self.is_train and
+                self.enable_random_aug and effective_n_images is None):
+            raise ValueError(
+                'n_images is required when force_resize training random '
+                'augmentation is enabled and view_layout is unavailable')
         for cam_id, img in enumerate(results['img']):
             pil_img = Image.fromarray(img, mode='RGB')
             cam_aug = results['lidar2img']['lidar2img_aug'][cam_id]
             if self.force_resize:
-                target_h, target_w = self.data_config['input_size'] if self.is_train else self.data_config['test_input_size']
-                resize, resize_dims, crop, flip, rotate, pad = self.sample_augmentation(
-                    H=target_h, W=target_w)
+                target_h, target_w = (
+                    self.data_config['input_size'] if self.is_train
+                    else self.data_config['test_input_size'])
                 resize_dims = (target_w, target_h)
                 crop = (0, 0, target_w, target_h)
                 flip = False
                 rotate = 0.0
+                pad = self.get_pad()
                 required_size_keys = ('intrinsic_height', 'intrinsic_width')
                 missing_size_keys = [
                     key for key in required_size_keys if key not in cam_aug]
@@ -1721,11 +1748,39 @@ class RandomAugImageMultiViewImage(object):
                 post_rot_init = torch.diag(torch.tensor([sx, sy], dtype=torch.float32))
                 post_tran_init = torch.zeros(2)
                 resize = 1.0
+
+                # 缓存图到网络输入尺寸的确定性基础缩放；图片已经是目标
+                # 尺寸时避免无意义的重复 resize。
+                if pil_img.size != resize_dims:
+                    pil_img = pil_img.resize(resize_dims)
+
+                if self.is_train and self.enable_random_aug:
+                    camera_slot = cam_id % effective_n_images
+                    if camera_slot not in shared_augmentations:
+                        shared_augmentations[camera_slot] = \
+                            self.sample_augmentation(
+                                H=target_h,
+                                W=target_w,
+                                is_train=True,
+                                randomize=True)
+                    resize, resize_dims, crop, flip, rotate, pad = \
+                        shared_augmentations[camera_slot]
+                else:
+                    # 这次调用只为消耗 RNG，返回值故意丢弃，保证关闭
+                    # 增强的冻结 baseline 与重构前逐字节一致。
+                    self.sample_augmentation(
+                        H=target_h,
+                        W=target_w,
+                        is_train=self.is_train,
+                        randomize=True)
             else:
-                resize, resize_dims, crop, flip, rotate, pad = self.sample_augmentation(
-                    H=pil_img.height,
-                    W=pil_img.width,
-                )
+                resize, resize_dims, crop, flip, rotate, pad = \
+                    self.sample_augmentation(
+                        H=pil_img.height,
+                        W=pil_img.width,
+                        is_train=self.is_train,
+                        randomize=(
+                            self.is_train and self.enable_random_aug))
                 post_rot_init = torch.eye(2)
                 post_tran_init = torch.zeros(2)
             post_pil_img, post_rot, post_tran = self.img_transform(
@@ -1753,13 +1808,17 @@ class RandomAugImageMultiViewImage(object):
             bboxes = results['gt_bboxes_3d']
             bid = self.random_id(8, results['sample_idx']) + fix
             for ii in range(len(results['img'])):
-                cam_id = ii % 6
-                cam_type = {True: 'curr', False: 'adj'}[ii // 6 == 0]
+                n_images = effective_n_images or len(results['img'])
+                cam_id = ii % n_images
+                cam_type = {
+                    True: 'curr',
+                    False: 'adj',
+                }[ii // n_images == 0]
                 # if cam_type != 'curr':
                 #     continue
                 try:
                     new_img = draw_lidar_bbox3d_on_img(bboxes, imgs[ii], lidar2imgs[ii], dict())
-                    img_filename = f'{self.tmp}/{bid}_imgaug_{cam_id}_{cam_type}_{ii // 6}_' + results['img_info'][ii]['filename'].split('/')[-1]
+                    img_filename = f'{self.tmp}/{bid}_imgaug_{cam_id}_{cam_type}_{ii // n_images}_' + results['img_info'][ii]['filename'].split('/')[-1]
                     if not os.path.exists(self.tmp):
                         os.makedirs(self.tmp)
                     cv2.imwrite(img_filename, new_img)
@@ -1773,24 +1832,85 @@ class RandomAugImageMultiViewImage(object):
             exit()
         return results
 
-    def sample_augmentation(self, H, W):
-        if self.is_train:
+    def _resolve_n_images(self, results):
+        """校验并返回当前视图组织中的实际相机数。"""
+        image_count = len(results['img'])
+        view_layout = results.get('view_layout')
+        if view_layout is not None:
+            if not isinstance(view_layout, dict):
+                raise TypeError(
+                    'view_layout must be a dict, got {}'.format(
+                        type(view_layout).__name__))
+            missing = [
+                key for key in ('n_images', 'n_times', 'sequential')
+                if key not in view_layout
+            ]
+            if missing:
+                raise KeyError(
+                    'view_layout is missing {}'.format(', '.join(missing)))
+            layout_n_images = int(view_layout['n_images'])
+            layout_n_times = int(view_layout['n_times'])
+            if layout_n_images <= 0 or layout_n_times <= 0:
+                raise ValueError(
+                    'view_layout n_images/n_times must be positive, got '
+                    '{}x{}'.format(layout_n_images, layout_n_times))
+            expected = layout_n_images * layout_n_times
+            if image_count != expected:
+                raise ValueError(
+                    'image count {} does not match view_layout {}x{}={}'.format(
+                        image_count, layout_n_images, layout_n_times,
+                        expected))
+            if (self.n_images is not None and
+                    self.n_images != layout_n_images):
+                raise ValueError(
+                    'RandomAugImageMultiViewImage.n_images={} conflicts with '
+                    'view_layout.n_images={}'.format(
+                        self.n_images, layout_n_images))
+            return layout_n_images
+
+        if self.n_images is not None:
+            if image_count % self.n_images != 0:
+                raise ValueError(
+                    'image count {} is not divisible by n_images={}'.format(
+                        image_count, self.n_images))
+            return self.n_images
+        return None
+
+    def sample_augmentation(self, H, W, is_train=None, randomize=None):
+        """采样图像几何参数。
+
+        ``is_train`` 只选择 train/test 尺寸契约，``randomize``
+        只决定训练参数是否采样随机扰动。
+        """
+        if is_train is None:
+            is_train = self.is_train
+        if randomize is None:
+            randomize = bool(is_train)
+        if is_train:
             fH, fW = self.data_config['input_size']  # (640, 1600),
             resize = float(fW)/float(W)  # 1600 / 1600
-            resize += np.random.uniform(*self.data_config['resize'])
+            if randomize:
+                resize += np.random.uniform(*self.data_config['resize'])
             resize_dims = (int(W * resize), int(H * resize))  # 900 1600
 
             newW, newH = resize_dims  # 1600 900
             crop_h_start = (newH - fH) // 2  # (900 - 640)  // 2 = 130
             crop_w_start = (newW - fW) // 2  # 1600 1600
-            crop_h_start += int(np.random.uniform(*self.data_config['crop']) * fH)
-            crop_w_start += int(np.random.uniform(*self.data_config['crop']) * fW)
+            if randomize:
+                crop_h_start += int(
+                    np.random.uniform(*self.data_config['crop']) * fH)
+                crop_w_start += int(
+                    np.random.uniform(*self.data_config['crop']) * fW)
 
             # (0, 130, 1600, 130+640)
             crop = (crop_w_start, crop_h_start, crop_w_start + fW, crop_h_start + fH)
 
-            flip = self.data_config['flip'] and np.random.choice([0, 1])
-            rotate = np.random.uniform(*self.data_config['rot'])
+            if randomize:
+                flip = self.data_config['flip'] and np.random.choice([0, 1])
+                rotate = np.random.uniform(*self.data_config['rot'])
+            else:
+                flip = False
+                rotate = 0.0
         else:
             fH, fW = self.data_config['test_input_size']
             resize = float(fW)/float(W)
@@ -1805,12 +1925,15 @@ class RandomAugImageMultiViewImage(object):
             flip = self.data_config['test_flip']
             rotate = self.data_config['test_rotate']
 
+        pad = self.get_pad()
+
+        return resize, resize_dims, crop, flip, rotate, pad
+
+    def get_pad(self):
         pad_data = self.data_config['pad']
         pad_divisor = self.data_config['pad_divisor']
         pad_color = self.data_config['pad_color']
-        pad = (pad_data, pad_color)
-
-        return resize, resize_dims, crop, flip, rotate, pad
+        return pad_data, pad_color
 
     def img_transform(self, img, post_rot, post_tran,
                       resize, resize_dims, crop,
@@ -1896,6 +2019,8 @@ class RandomAugImageMultiViewImage(object):
 
     def __repr__(self):
         repr_str = self.__class__.__name__
+        repr_str += '(force_resize={}, enable_random_aug={}, n_images={})'.format(
+            self.force_resize, self.enable_random_aug, self.n_images)
         return repr_str
 
 

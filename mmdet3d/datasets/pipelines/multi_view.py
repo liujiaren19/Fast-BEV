@@ -44,6 +44,12 @@ class MultiViewPipeline:
             if key not in ['img', 'img_prefix', 'img_info']:
                 results[key] = _results[key]
         results['img'] = imgs
+        # 记录实际输出的视图组织，供后续几何增强校验相机/时序契约。
+        # 非时序模式只输出一个时刻，即使构造参数保留了历史默认 n_times。
+        results['view_layout'] = dict(
+            n_images=int(self.n_images),
+            n_times=int(self.n_times if self.sequential else 1),
+            sequential=bool(self.sequential))
         # resort 2d box by random ids
         if 'gt_bboxes' in results.keys():
             gt_bboxes = self.__sort_list(results['gt_bboxes'], ids_list)

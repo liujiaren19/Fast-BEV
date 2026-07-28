@@ -32,6 +32,7 @@ import copy
 import json
 import math
 import pickle
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -157,11 +158,25 @@ def get_points(n_voxels: Sequence[int], voxel_size: Sequence[float], origin: Seq
 
 
 def test_image_aug_params(cam_aug: Dict[str, Any], data_config: Dict[str, Any], force_resize: bool) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int]]:
-    """复现 RandomAugImageMultiViewImage 在 is_train=False 下的 post_rot/tran。"""
+    """复现图像 pipeline 在 test/eval 下的确定性 post_rot/tran。
+
+    ``enable_random_aug`` 只控制训练随机阶段，不改变这里的 test/eval
+    基础几何。
+    """
     if force_resize:
         target_h, target_w = [int(v) for v in data_config['test_input_size']]
+        required = ('intrinsic_height', 'intrinsic_width')
+        missing = [key for key in required if key not in cam_aug]
+        if missing:
+            raise KeyError(
+                'test image transform requires {} when force_resize=True'.format(
+                    ', '.join(missing)))
         source_h = int(cam_aug['intrinsic_height'])
         source_w = int(cam_aug['intrinsic_width'])
+        if source_h <= 0 or source_w <= 0:
+            raise ValueError(
+                'intrinsic image size must be positive, got {}x{}'.format(
+                    source_w, source_h))
         sx = float(target_w) / float(source_w)
         sy = float(target_h) / float(source_h)
         post_rot = np.diag([sx, sy]).astype(np.float32)
@@ -879,6 +894,19 @@ def main() -> None:
     temporal_compensate = bool(dataset_cfg.get('temporal_compensate', True))
     data_config = aug_step['data_config']
     force_resize = bool(aug_step.get('force_resize', False))
+    enable_random_aug = bool(
+        aug_step.get('enable_random_aug', not force_resize))
+    if args.split == 'train' and enable_random_aug:
+        print(
+            'WARNING: --split train 的图像 pipeline 开启了随机增强；'
+            '当前 LUT 只复现确定性 test 基础几何，不代表训练时的'
+            '随机变换。',
+            file=sys.stderr)
+    aug_n_images = aug_step.get('n_images')
+    if aug_n_images is not None and int(aug_n_images) != n_images:
+        raise ValueError(
+            'RandomAugImageMultiViewImage.n_images={} 和 model.n_images={} '
+            '不一致'.format(aug_n_images, n_images))
     camera_overwrite_order = parse_index_list(args.camera_overwrite_order, n_images)
 
     img_meta, camera_id_sequence, frame_records = build_img_meta_for_sample(
@@ -912,6 +940,8 @@ def main() -> None:
         stride=args.stride,
         use_distortion=use_distortion,
         force_resize=force_resize,
+        enable_random_aug=enable_random_aug,
+        base_geometry_is_deterministic=True,
         data_config=data_config,
         camera_overwrite_order=camera_overwrite_order,
         dump_debug_volume=bool(args.dump_debug_volume),

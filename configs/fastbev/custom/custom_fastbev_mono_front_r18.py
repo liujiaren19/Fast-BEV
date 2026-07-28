@@ -42,8 +42,9 @@ img_norm_cfg = dict(
 data_config = {
     'input_size': (256, 704),
     # mono-front 使用 704x256 离线缓存图，RandomAugImageMultiViewImage
-    # 通过 force_resize=True 只做确定性 resize/K 缩放。图像随机增强在
-    # 该模式下不会生效；BEV/3D 增强由 RandomFlip3D/GlobalRotScaleTrans 控制。
+    # 通过 force_resize=True 完成 native K 到输入尺寸的基础几何变换。
+    # 当前 B0 显式关闭图像随机增强；BEV/3D 增强仍由
+    # RandomFlip3D/GlobalRotScaleTrans 控制。
     'resize': (0.0, 0.0),
     'crop': (0.0, 0.0),
     'rot': (0.0, 0.0),
@@ -76,7 +77,12 @@ train_pipeline = [
         scale_ratio_range=[0.95, 1.05],
         translation_std=[0.05, 0.05, 0.05],
         update_img2lidar=True),
-    dict(type='RandomAugImageMultiViewImage', data_config=data_config, force_resize=True),
+    dict(
+        type='RandomAugImageMultiViewImage',
+        data_config=data_config,
+        force_resize=True,
+        enable_random_aug=False,
+        n_images=1),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='FrontCameraVisibleObjectFilter', n_images=1, min_depth=0.1),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
@@ -89,7 +95,13 @@ test_pipeline = [
     dict(type='MultiViewPipeline', sequential=True, n_images=1, n_times=4, transforms=[
         dict(type='LoadImageFromFile', file_client_args=file_client_args)]),
     dict(type='LoadPointsFromFile', dummy=True, coord_type='LIDAR', load_dim=5, use_dim=5),
-    dict(type='RandomAugImageMultiViewImage', data_config=data_config, is_train=False, force_resize=True),
+    dict(
+        type='RandomAugImageMultiViewImage',
+        data_config=data_config,
+        is_train=False,
+        force_resize=True,
+        enable_random_aug=False,
+        n_images=1),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names, with_label=False),

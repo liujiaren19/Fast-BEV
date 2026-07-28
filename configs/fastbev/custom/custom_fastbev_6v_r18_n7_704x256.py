@@ -5,8 +5,8 @@
 - 图片已经离线从 1600x900 强制 resize 到 704x256。
 - info_json / pkl 中的相机内参仍保持 1600x900 标定，不要预先缩放 K。
 - 新版 pkl 必须写入 intrinsic_width/height 和 image_width/height；
-  RandomAugImageMultiViewImage 会按 intrinsic_* -> input_size 写入 post_rot，
-  保证几何只缩放一次。
+  RandomAugImageMultiViewImage 会按 intrinsic_* -> input_size 写入基础
+  post_rot，保证几何只缩放一次。
 """
 
 _base_ = './custom_fastbev_6v_r18.py'
@@ -27,7 +27,8 @@ ann_date = '20260625'
 ann_file_prefix = f'{ann_prefix}_{ann_scope}'
 
 # 704x256 缓存图仍使用原始 1600x900 标定 K，因此这里显式覆盖
-# pipeline，开启 force_resize 写入 intrinsic_* -> input_size 的 post_rot。
+# pipeline，开启 force_resize 写入 intrinsic_* -> input_size 的基础 post_rot。
+# 当前冻结的 6V-B0 显式关闭图像随机增强，避免重构改变已有 baseline。
 point_cloud_range = [-50, -50, -5, 50, 50, 3]
 class_names = ['car', 'truck']
 file_client_args = dict(backend='disk')
@@ -68,7 +69,12 @@ train_pipeline = [
         scale_ratio_range=[0.95, 1.05],
         translation_std=[0.05, 0.05, 0.05],
         update_img2lidar=True),
-    dict(type='RandomAugImageMultiViewImage', data_config=data_config, force_resize=True),
+    dict(
+        type='RandomAugImageMultiViewImage',
+        data_config=data_config,
+        force_resize=True,
+        enable_random_aug=False,
+        n_images=6),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -80,7 +86,13 @@ test_pipeline = [
     dict(type='MultiViewPipeline', sequential=True, n_images=6, n_times=4, transforms=[
         dict(type='LoadImageFromFile', file_client_args=file_client_args)]),
     dict(type='LoadPointsFromFile', dummy=True, coord_type='LIDAR', load_dim=5, use_dim=5),
-    dict(type='RandomAugImageMultiViewImage', data_config=data_config, is_train=False, force_resize=True),
+    dict(
+        type='RandomAugImageMultiViewImage',
+        data_config=data_config,
+        is_train=False,
+        force_resize=True,
+        enable_random_aug=False,
+        n_images=6),
     dict(type='KittiSetOrigin', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='DefaultFormatBundle3D', class_names=class_names, with_label=False),

@@ -1,0 +1,823 @@
+{
+  "schema_version": 1,
+  "fixture": "force-resize-legacy-equivalence-v1",
+  "source": {
+    "commit": "c1aea0d7c6beef930737bb3502d8c3aea7696d81",
+    "path": "mmdet3d/datasets/pipelines/transforms_3d.py",
+    "file_sha256": "27c6da0c6a9b4662d28dcd8265066292919b0ec6a93702ef2fbf9dbaea157c52",
+    "generator": "AST-loaded RandomAugImageMultiViewImage from git object",
+    "coverage_note": "3 force_resize view layouts x train/test plus ordinary train/test; 8 cases are the complete superset of the review's inconsistent 7-case count",
+    "array_sha256": "sha256(contiguous_numpy_bytes)",
+    "projected_points_note": "fixed-order scalar float32 projection; independent of NumPy/BLAS matmul accumulation order"
+  },
+  "cases": [
+    {
+      "id": "force_1x1_train",
+      "force_resize": true,
+      "is_train": true,
+      "enable_random_aug": false,
+      "configured_n_images": 1,
+      "n_images": 1,
+      "n_times": 1,
+      "seed": 202607281,
+      "expected": {
+        "images": {
+          "shape": [
+            1,
+            256,
+            704,
+            3
+          ],
+          "dtype": "uint8",
+          "sha256": "3402f866c8672198be3d1aea24ccb6cd9cf19d4472c7c15b55394e7d9f5de6ea"
+        },
+        "post_rot": {
+          "shape": [
+            1,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "e2ca1d3aea38d63945e44049b15d041afeb6799136b2b8f895c0beeb3afd96e4"
+        },
+        "post_tran": {
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "9d908ecfb6b256def8b49a7c504e6c889c4b0e41fe6ce3e01863dd7b61a20aa0"
+        },
+        "lidar2img": {
+          "shape": [
+            1,
+            4,
+            4
+          ],
+          "dtype": "float32",
+          "sha256": "083a89f93985b63500b35048a277e82d3e8e342ffb3ed0646d6d0f7d1e2d145a"
+        },
+        "normalized_tensor": {
+          "shape": [
+            1,
+            3,
+            256,
+            704
+          ],
+          "dtype": "float32",
+          "sha256": "9ed3b961e62efc6f77616d4a548bdb6751062cae12d2d27e6ce95254b8e33d6f"
+        },
+        "projected_points": {
+          "shape": [
+            1,
+            3,
+            2
+          ],
+          "dtype": "float32",
+          "sha256": "0dbbde2b2479058d51ed69658c3c984151c7b216a54452e718d7f73a6ad1a921"
+        },
+        "img_shape": {
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "int64",
+          "sha256": "64c7b2e43445f7873f1e1a79502e4e4b18ab323c20af74bb3b130aa8372fd082"
+        },
+        "numpy_rng_state": {
+          "algorithm": "MT19937",
+          "keys": {
+            "shape": [
+              624
+            ],
+            "dtype": "uint32",
+            "sha256": "cc9c3541f3e6a83c9d8d3e05a54a0773110ad64aaa54d93a9e948d1bf5e71e3d"
+          },
+          "position": 9,
+          "has_gauss": 0,
+          "cached_gaussian": {
+            "shape": [
+              1
+            ],
+            "dtype": "float64",
+            "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+          },
+          "next_random": {
+            "shape": [
+              8
+            ],
+            "dtype": "float64",
+            "sha256": "1dc374b1a7d85cdc309c690c4826cba820f52b68e171499ca1cb9b7623d08328"
+          }
+        }
+      }
+    },
+    {
+      "id": "force_1x1_test",
+      "force_resize": true,
+      "is_train": false,
+      "enable_random_aug": false,
+      "configured_n_images": 1,
+      "n_images": 1,
+      "n_times": 1,
+      "seed": 202607282,
+      "expected": {
+        "images": {
+          "shape": [
+            1,
+            256,
+            704,
+            3
+          ],
+          "dtype": "uint8",
+          "sha256": "3402f866c8672198be3d1aea24ccb6cd9cf19d4472c7c15b55394e7d9f5de6ea"
+        },
+        "post_rot": {
+          "shape": [
+            1,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "e2ca1d3aea38d63945e44049b15d041afeb6799136b2b8f895c0beeb3afd96e4"
+        },
+        "post_tran": {
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "9d908ecfb6b256def8b49a7c504e6c889c4b0e41fe6ce3e01863dd7b61a20aa0"
+        },
+        "lidar2img": {
+          "shape": [
+            1,
+            4,
+            4
+          ],
+          "dtype": "float32",
+          "sha256": "083a89f93985b63500b35048a277e82d3e8e342ffb3ed0646d6d0f7d1e2d145a"
+        },
+        "normalized_tensor": {
+          "shape": [
+            1,
+            3,
+            256,
+            704
+          ],
+          "dtype": "float32",
+          "sha256": "9ed3b961e62efc6f77616d4a548bdb6751062cae12d2d27e6ce95254b8e33d6f"
+        },
+        "projected_points": {
+          "shape": [
+            1,
+            3,
+            2
+          ],
+          "dtype": "float32",
+          "sha256": "0dbbde2b2479058d51ed69658c3c984151c7b216a54452e718d7f73a6ad1a921"
+        },
+        "img_shape": {
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "int64",
+          "sha256": "64c7b2e43445f7873f1e1a79502e4e4b18ab323c20af74bb3b130aa8372fd082"
+        },
+        "numpy_rng_state": {
+          "algorithm": "MT19937",
+          "keys": {
+            "shape": [
+              624
+            ],
+            "dtype": "uint32",
+            "sha256": "b413184de8f1fd69fb107f4b8f9bb9cfc339b2603b995c50b8217e19b590c6ef"
+          },
+          "position": 624,
+          "has_gauss": 0,
+          "cached_gaussian": {
+            "shape": [
+              1
+            ],
+            "dtype": "float64",
+            "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+          },
+          "next_random": {
+            "shape": [
+              8
+            ],
+            "dtype": "float64",
+            "sha256": "e030d419a30c303fa2294d1c42eb65bed47df4cc497ffe4e01b0f3549e055b51"
+          }
+        }
+      }
+    },
+    {
+      "id": "force_1x4_train",
+      "force_resize": true,
+      "is_train": true,
+      "enable_random_aug": false,
+      "configured_n_images": 1,
+      "n_images": 1,
+      "n_times": 4,
+      "seed": 202607283,
+      "expected": {
+        "images": {
+          "shape": [
+            4,
+            256,
+            704,
+            3
+          ],
+          "dtype": "uint8",
+          "sha256": "bc6872faa98840532513a3216d300dd72b0568fea1d8efa42ca8051428e9b621"
+        },
+        "post_rot": {
+          "shape": [
+            4,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "b3ee5b4f7af3d61bd69617115a03dba2ecdbfd5e9b416b64f98df1e5735cf80d"
+        },
+        "post_tran": {
+          "shape": [
+            4,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "2ea9ab9198d1638007400cd2c3bef1cc745b864b76011a0e1bc52180ac6452d4"
+        },
+        "lidar2img": {
+          "shape": [
+            4,
+            4,
+            4
+          ],
+          "dtype": "float32",
+          "sha256": "f763cfd0a2ffa2f22b8a33e0af5a6e4da0add9c1bf5de1507d1b82414310af62"
+        },
+        "normalized_tensor": {
+          "shape": [
+            4,
+            3,
+            256,
+            704
+          ],
+          "dtype": "float32",
+          "sha256": "638df03c11546b846b815aa4540c18284e5c38b711de0e9dad899f955e7db8d2"
+        },
+        "projected_points": {
+          "shape": [
+            4,
+            3,
+            2
+          ],
+          "dtype": "float32",
+          "sha256": "94de346c2c949b161da2e8a8c73a046eac374223f2ea4cf59cae92d4e719260b"
+        },
+        "img_shape": {
+          "shape": [
+            4,
+            3
+          ],
+          "dtype": "int64",
+          "sha256": "f8f8567fd73832d86a10dd0a3cf8861d7774523891a2af421614b80cc7491e7e"
+        },
+        "numpy_rng_state": {
+          "algorithm": "MT19937",
+          "keys": {
+            "shape": [
+              624
+            ],
+            "dtype": "uint32",
+            "sha256": "e00db0aee55b6eb211749898ee1b76a407225f875f07112376ea3048c2651dbe"
+          },
+          "position": 36,
+          "has_gauss": 0,
+          "cached_gaussian": {
+            "shape": [
+              1
+            ],
+            "dtype": "float64",
+            "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+          },
+          "next_random": {
+            "shape": [
+              8
+            ],
+            "dtype": "float64",
+            "sha256": "5f4742c34db8d176ba9f5eda4db1d09681abd85bb02325f7b9916ed79e84d4db"
+          }
+        }
+      }
+    },
+    {
+      "id": "force_1x4_test",
+      "force_resize": true,
+      "is_train": false,
+      "enable_random_aug": false,
+      "configured_n_images": 1,
+      "n_images": 1,
+      "n_times": 4,
+      "seed": 202607284,
+      "expected": {
+        "images": {
+          "shape": [
+            4,
+            256,
+            704,
+            3
+          ],
+          "dtype": "uint8",
+          "sha256": "bc6872faa98840532513a3216d300dd72b0568fea1d8efa42ca8051428e9b621"
+        },
+        "post_rot": {
+          "shape": [
+            4,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "b3ee5b4f7af3d61bd69617115a03dba2ecdbfd5e9b416b64f98df1e5735cf80d"
+        },
+        "post_tran": {
+          "shape": [
+            4,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "2ea9ab9198d1638007400cd2c3bef1cc745b864b76011a0e1bc52180ac6452d4"
+        },
+        "lidar2img": {
+          "shape": [
+            4,
+            4,
+            4
+          ],
+          "dtype": "float32",
+          "sha256": "f763cfd0a2ffa2f22b8a33e0af5a6e4da0add9c1bf5de1507d1b82414310af62"
+        },
+        "normalized_tensor": {
+          "shape": [
+            4,
+            3,
+            256,
+            704
+          ],
+          "dtype": "float32",
+          "sha256": "638df03c11546b846b815aa4540c18284e5c38b711de0e9dad899f955e7db8d2"
+        },
+        "projected_points": {
+          "shape": [
+            4,
+            3,
+            2
+          ],
+          "dtype": "float32",
+          "sha256": "94de346c2c949b161da2e8a8c73a046eac374223f2ea4cf59cae92d4e719260b"
+        },
+        "img_shape": {
+          "shape": [
+            4,
+            3
+          ],
+          "dtype": "int64",
+          "sha256": "f8f8567fd73832d86a10dd0a3cf8861d7774523891a2af421614b80cc7491e7e"
+        },
+        "numpy_rng_state": {
+          "algorithm": "MT19937",
+          "keys": {
+            "shape": [
+              624
+            ],
+            "dtype": "uint32",
+            "sha256": "277307cfe048110f7b2cf3a0dbcd3f7a4fa4470e896c8dd4822d8abc56722c0d"
+          },
+          "position": 624,
+          "has_gauss": 0,
+          "cached_gaussian": {
+            "shape": [
+              1
+            ],
+            "dtype": "float64",
+            "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+          },
+          "next_random": {
+            "shape": [
+              8
+            ],
+            "dtype": "float64",
+            "sha256": "8fa84a77b8668baf7a0ac73a3fa1077f8029cc71986471f442ca420c2ef2b97b"
+          }
+        }
+      }
+    },
+    {
+      "id": "force_6x4_train",
+      "force_resize": true,
+      "is_train": true,
+      "enable_random_aug": false,
+      "configured_n_images": 6,
+      "n_images": 6,
+      "n_times": 4,
+      "seed": 202607285,
+      "expected": {
+        "images": {
+          "shape": [
+            24,
+            256,
+            704,
+            3
+          ],
+          "dtype": "uint8",
+          "sha256": "f504d32e3550e6998f215cab8e2ff6ce2682bc2641c1f77894051308c9c7465b"
+        },
+        "post_rot": {
+          "shape": [
+            24,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "afa731cf255865c2631bd6af22e73ab72303a7554662bd78de1408428cadcb22"
+        },
+        "post_tran": {
+          "shape": [
+            24,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "1a0295f4bf5986c5f74eca9153a6a4cb10b073a01a76ba4a457fd862c78966a4"
+        },
+        "lidar2img": {
+          "shape": [
+            24,
+            4,
+            4
+          ],
+          "dtype": "float32",
+          "sha256": "98037ae4b204d293015f8c5d50e6ec40da6a91186179a1f8f72aedb1204b8bb4"
+        },
+        "normalized_tensor": {
+          "shape": [
+            24,
+            3,
+            256,
+            704
+          ],
+          "dtype": "float32",
+          "sha256": "aec1a9eda5f981feaee035b6a9c13bda2d7b8857a1a6c19c3f146945ae2c5e51"
+        },
+        "projected_points": {
+          "shape": [
+            24,
+            3,
+            2
+          ],
+          "dtype": "float32",
+          "sha256": "7e39d5352149689f00d9bb2b9916f012fb255c92c580541e580ed6b54dd69fc6"
+        },
+        "img_shape": {
+          "shape": [
+            24,
+            3
+          ],
+          "dtype": "int64",
+          "sha256": "f7039257d01ec55fa4adf0c25a88b3e6c47841bfa6b32c8234d0884bc8c23a61"
+        },
+        "numpy_rng_state": {
+          "algorithm": "MT19937",
+          "keys": {
+            "shape": [
+              624
+            ],
+            "dtype": "uint32",
+            "sha256": "c1c8d3738e4d8fedf01af3a83a46c296d67a1879164d8e988ed65b5e3ffbdb9e"
+          },
+          "position": 216,
+          "has_gauss": 0,
+          "cached_gaussian": {
+            "shape": [
+              1
+            ],
+            "dtype": "float64",
+            "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+          },
+          "next_random": {
+            "shape": [
+              8
+            ],
+            "dtype": "float64",
+            "sha256": "0f57c6b3d2553bc4fc1843750132886d43ed9ff90323d656a08c7e21be3ade19"
+          }
+        }
+      }
+    },
+    {
+      "id": "force_6x4_test",
+      "force_resize": true,
+      "is_train": false,
+      "enable_random_aug": false,
+      "configured_n_images": 6,
+      "n_images": 6,
+      "n_times": 4,
+      "seed": 202607286,
+      "expected": {
+        "images": {
+          "shape": [
+            24,
+            256,
+            704,
+            3
+          ],
+          "dtype": "uint8",
+          "sha256": "f504d32e3550e6998f215cab8e2ff6ce2682bc2641c1f77894051308c9c7465b"
+        },
+        "post_rot": {
+          "shape": [
+            24,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "afa731cf255865c2631bd6af22e73ab72303a7554662bd78de1408428cadcb22"
+        },
+        "post_tran": {
+          "shape": [
+            24,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "1a0295f4bf5986c5f74eca9153a6a4cb10b073a01a76ba4a457fd862c78966a4"
+        },
+        "lidar2img": {
+          "shape": [
+            24,
+            4,
+            4
+          ],
+          "dtype": "float32",
+          "sha256": "98037ae4b204d293015f8c5d50e6ec40da6a91186179a1f8f72aedb1204b8bb4"
+        },
+        "normalized_tensor": {
+          "shape": [
+            24,
+            3,
+            256,
+            704
+          ],
+          "dtype": "float32",
+          "sha256": "aec1a9eda5f981feaee035b6a9c13bda2d7b8857a1a6c19c3f146945ae2c5e51"
+        },
+        "projected_points": {
+          "shape": [
+            24,
+            3,
+            2
+          ],
+          "dtype": "float32",
+          "sha256": "7e39d5352149689f00d9bb2b9916f012fb255c92c580541e580ed6b54dd69fc6"
+        },
+        "img_shape": {
+          "shape": [
+            24,
+            3
+          ],
+          "dtype": "int64",
+          "sha256": "f7039257d01ec55fa4adf0c25a88b3e6c47841bfa6b32c8234d0884bc8c23a61"
+        },
+        "numpy_rng_state": {
+          "algorithm": "MT19937",
+          "keys": {
+            "shape": [
+              624
+            ],
+            "dtype": "uint32",
+            "sha256": "bd7e75b295cc16fd327a6fd5857a262de4acbd23eceeb66f49ce13f11a02663e"
+          },
+          "position": 624,
+          "has_gauss": 0,
+          "cached_gaussian": {
+            "shape": [
+              1
+            ],
+            "dtype": "float64",
+            "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+          },
+          "next_random": {
+            "shape": [
+              8
+            ],
+            "dtype": "float64",
+            "sha256": "bb0a95737aff20054c6036ea61cc61144642108968339dce5844c189b430fc31"
+          }
+        }
+      }
+    },
+    {
+      "id": "ordinary_6x4_train",
+      "force_resize": false,
+      "is_train": true,
+      "enable_random_aug": null,
+      "configured_n_images": null,
+      "n_images": 6,
+      "n_times": 4,
+      "seed": 202607287,
+      "expected": {
+        "images": {
+          "shape": [
+            24,
+            256,
+            704,
+            3
+          ],
+          "dtype": "uint8",
+          "sha256": "0fc11440c4ef946bcd7eaff09fe640ae00c240d09840f402ab4b5c0806f9cde6"
+        },
+        "post_rot": {
+          "shape": [
+            24,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "51eb291c3c75a3e98107e211da408660ae0b59aeeee2a04990adddbc12995cb8"
+        },
+        "post_tran": {
+          "shape": [
+            24,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "3731a84fb5782ab38337b3d634940d243b74f80035f687bb990b706c31b58f3b"
+        },
+        "lidar2img": {
+          "shape": [
+            24,
+            4,
+            4
+          ],
+          "dtype": "float32",
+          "sha256": "b1b44d9e1cd0a780acfd2c3fde5e4f560097c977a3826cc51466ddd16bbcce3c"
+        },
+        "normalized_tensor": {
+          "shape": [
+            24,
+            3,
+            256,
+            704
+          ],
+          "dtype": "float32",
+          "sha256": "da18d86b7c7dde91cb6ef2caf33bd1eb11141ad23085927737c0bfa9a7cb55dc"
+        },
+        "projected_points": {
+          "shape": [
+            24,
+            3,
+            2
+          ],
+          "dtype": "float32",
+          "sha256": "443353afceb8b65d179524bf8a86196525138ad69ee84ae6f8d9a9e53e3a280d"
+        },
+        "img_shape": {
+          "shape": [
+            24,
+            3
+          ],
+          "dtype": "int64",
+          "sha256": "f7039257d01ec55fa4adf0c25a88b3e6c47841bfa6b32c8234d0884bc8c23a61"
+        },
+        "numpy_rng_state": {
+          "algorithm": "MT19937",
+          "keys": {
+            "shape": [
+              624
+            ],
+            "dtype": "uint32",
+            "sha256": "69e3b19f151b61e56638c3b257b894718f42725baac19d7b63487af987373acf"
+          },
+          "position": 216,
+          "has_gauss": 0,
+          "cached_gaussian": {
+            "shape": [
+              1
+            ],
+            "dtype": "float64",
+            "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+          },
+          "next_random": {
+            "shape": [
+              8
+            ],
+            "dtype": "float64",
+            "sha256": "5ad525525a4b3078e612e8a3c1caeb23e3a971f667db7ccae9b006a09ee6cf6b"
+          }
+        }
+      }
+    },
+    {
+      "id": "ordinary_6x4_test",
+      "force_resize": false,
+      "is_train": false,
+      "enable_random_aug": null,
+      "configured_n_images": null,
+      "n_images": 6,
+      "n_times": 4,
+      "seed": 202607288,
+      "expected": {
+        "images": {
+          "shape": [
+            24,
+            256,
+            704,
+            3
+          ],
+          "dtype": "uint8",
+          "sha256": "f504d32e3550e6998f215cab8e2ff6ce2682bc2641c1f77894051308c9c7465b"
+        },
+        "post_rot": {
+          "shape": [
+            24,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "8f9c39298685cee8f742cf88654acdd0a29bfd9c52349f9e8239dd537396544e"
+        },
+        "post_tran": {
+          "shape": [
+            24,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "1a0295f4bf5986c5f74eca9153a6a4cb10b073a01a76ba4a457fd862c78966a4"
+        },
+        "lidar2img": {
+          "shape": [
+            24,
+            4,
+            4
+          ],
+          "dtype": "float32",
+          "sha256": "b01821ddff9f3ca15b96bcf26400f3a1c81bf742f93dd56740152325170466c8"
+        },
+        "normalized_tensor": {
+          "shape": [
+            24,
+            3,
+            256,
+            704
+          ],
+          "dtype": "float32",
+          "sha256": "aec1a9eda5f981feaee035b6a9c13bda2d7b8857a1a6c19c3f146945ae2c5e51"
+        },
+        "projected_points": {
+          "shape": [
+            24,
+            3,
+            2
+          ],
+          "dtype": "float32",
+          "sha256": "80d048b307ebc2f933f49d9918b21896c08fb2db3bdf8f0b4b7647b4269e8d41"
+        },
+        "img_shape": {
+          "shape": [
+            24,
+            3
+          ],
+          "dtype": "int64",
+          "sha256": "f7039257d01ec55fa4adf0c25a88b3e6c47841bfa6b32c8234d0884bc8c23a61"
+        },
+        "numpy_rng_state": {
+          "algorithm": "MT19937",
+          "keys": {
+            "shape": [
+              624
+            ],
+            "dtype": "uint32",
+            "sha256": "0f6b581bd75c3ac3479b90de17219259f0175d7d9ec1c10fd9c292854ca3a62d"
+          },
+          "position": 624,
+          "has_gauss": 0,
+          "cached_gaussian": {
+            "shape": [
+              1
+            ],
+            "dtype": "float64",
+            "sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"
+          },
+          "next_random": {
+            "shape": [
+              8
+            ],
+            "dtype": "float64",
+            "sha256": "06844eac91c8fe7905883408ab1d489530f7a2238419461c826c1d67bf111b5e"
+          }
+        }
+      }
+    }
+  ]
+}

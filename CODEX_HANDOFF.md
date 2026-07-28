@@ -698,3 +698,161 @@ Append a short dated note here after major debugging, conversion, or validation 
 - Priority disposition: The post-`force_resize` 6V rerun is recorded in `N7_MONO_FRONT_SINGLE_FRAME_TODO.md` as P3 low priority. It must use a new experiment ID/work_dir and does not reopen or block the closed EXP-6V-B0 baseline.
 - Config boundary: The run log resolves `AdamW2`, LR `8e-4`, weight decay `0.01` and backbone `lr_mult=0.1`. The repository dist config initially only overrode LR and would inherit standard Adam; another concurrent workstream later rebuilt it as AdamW2 with matching 20260717 data/schedule. This accuracy closeout did not modify the config, which remains a later reproducibility alignment rather than the original training snapshot; the log is the run-of-record.
 - Documentation closeout: Synchronized the final e6/e2/e16 selection, accepted clip-boundary gate exception, internally preserved asset status, S0 comparison and post-`force_resize` LR decision across `N7_FASTBEV_EXPERIMENT_SUMMARY.md`, `N7_FASTBEV_EXPERIMENT_DETAILS.md`, and this handoff.
+
+### 2026-07-23 N7 `force_resize` Two-Stage Geometry Local Closure
+
+- Root cause: `RandomAugImageMultiViewImage` historically sampled train-time
+  resize/crop/flip/rotate under `force_resize=True`, then overwrote every sampled
+  value with fixed 704x256 stretch parameters. The native
+  `intrinsic_width/height -> input_size` `post_rot` was correct and must remain;
+  setting `force_resize=False` would instead pair native 1600x900 K with an
+  identity post transform for cached 704x256 images.
+- Implementation: `force_resize` now remains the deterministic base stage and
+  `enable_random_aug` independently controls an optional train-only second
+  affine. `None` preserves historical behavior (`force_resize` off -> random
+  augmentation on; `force_resize` on -> off). When enabled, the random affine
+  composes after the native-K base affine and updates image, `post_rot`,
+  `post_tran` and `lidar2img` together. `n_images` defines actual camera slots;
+  time-major views reuse parameters by camera slot, so 1x1, 1x4 and 6x4 require
+  no fixed-six indexing. The disabled path intentionally retains the old
+  discarded sampling call so subsequent NumPy RNG state also stays unchanged.
+- Baseline/config contract: S0 single-frame, mono temporal and N7 6V train/test
+  pipelines explicitly set `enable_random_aug=False` and their real
+  `n_images`; the single-frame dist-train config inherits the same resolved
+  settings. Evaluation remains deterministic even if the switch is true.
+  `build_fastbev_lut.py` continues to reproduce only deterministic test
+  geometry, validates native intrinsic sizes and checks pipeline/model
+  `n_images` consistency.
+- Regression coverage: Added frozen-legacy exact comparisons for image,
+  `post_rot`, `post_tran`, `lidar2img`, normalized tensor, projected points and
+  NumPy RNG state; fixed-seed reproducibility; min/max crop, flip and positive/
+  negative rotation marker-projection checks; temporal camera sharing; dynamic
+  1x1/1x4/6x4 organization; deterministic LUT equivalence; baseline resolved
+  config checks; and a 6Vx4 disabled-path legacy comparison. Local
+  `py_compile`, both new CLI help checks, `git diff --check`, and the complete
+  `tools/tests` suite passed (`Ran 48 tests`, `OK`). The two NumPy 2
+  `DeprecationWarning` messages come from the pre-existing Tensor-to-NumPy
+  assignment in `img_transform` and do not change the exact comparison.
+- AUG1 statistics: Added read-only
+  `tools/data_converter/n7/analyze_n7_image_aug_targets.py`. It reproduces the
+  current class/front-ROI/cam0 pinhole-visible selection, then uses the existing
+  distortion-aware projection to report 704x256 target width/height/area,
+  clipped area ratio and edge margins by class and distance. This workspace has
+  no N7 train/val pkl, epoch13 PTH, `mmcv` or `mmdet`; therefore only synthetic
+  tool regression was run. No real target statistic, AUG1 amplitude/config, or
+  PTH/model result was fabricated.
+- Next legacy step: Run the statistics tool on
+  `data/N7_704_256/mono_front_pkl/custom_fastbev_20251017-20251030-20251031-20251203_infos_train_20260703.pkl`.
+  Use the resulting car/truck 20-40m and 40-60m pixel/edge quantiles to choose
+  conservative AUG1 ranges. Before any long training, run the retained
+  `tools/compare_mono_front_dataset_production.py` against epoch13 from both the
+  frozen baseline commit and this worktree with `--sample-index 0 --atol 0
+  --rtol 0 --dump-tensors --strict`, then compare the dumped input, 2D feature,
+  BEV input, raw cls/bbox/dir logits and decoded boxes. AUG1 must receive a new
+  config/experiment ID/work_dir only after those real gates pass.
+- Scope boundary: Distortion-aware GT filtering was not changed and remains a
+  separate statistics-first task. No GEOM1, CBGS, anchor, NMS, LR, loss,
+  checkpoint, ONNX, analyzer or board-reference change was mixed into this
+  work. No commit or push was made.
+
+### 2026-07-28 N7 `force_resize` Closeout Review Convergence
+
+- Contract convergence (F1/F2): `MultiViewPipeline` now writes explicit
+  `view_layout={n_images,n_times,sequential}` metadata after assembling the
+  actual image list. `RandomAugImageMultiViewImage` validates that layout on
+  every branch, detects explicit `n_images` conflicts and can infer camera
+  slots from the metadata. `sample_augmentation()` now separates
+  `is_train` (train/test size contract) from `randomize` (whether stochastic
+  additions are sampled); `is_train=True, randomize=False` therefore keeps the
+  deterministic train geometry and does not consume NumPy RNG state.
+- Geometry/LUT convergence (F3/F6): The `force_resize` base stage now performs
+  only the required native-size-to-input-size PIL resize and affine update;
+  the redundant zero-pad/core-transform bypass was removed. The LUT builder
+  explicitly warns when a train pipeline enables random image augmentation,
+  because a fixed LUT reproduces deterministic test geometry only, and records
+  `base_geometry_is_deterministic=true` in its metadata. The three N7 base
+  configs keep augmentation explicitly disabled and declare their real camera
+  counts; all three corresponding dist-train configs resolve to the same
+  contract.
+- Random-amplitude boundary: The S0 and mono-temporal configs currently use
+  zero image-randomization amplitudes (`resize/crop/rot = 0`, `flip=False`), so
+  changing only `enable_random_aug=True` would still be an identity transform;
+  a future mono AUG1 config must set its reviewed non-zero amplitudes in the
+  same isolated experiment change. The N7 6V 704x256 config is different: it
+  retains the legacy non-zero 6V amplitudes but explicitly disables them, so
+  turning on its switch alone would immediately change training and must not be
+  treated as equivalent to the two mono configs.
+- Frozen legacy evidence (T5): Removed the hand-written
+  `_legacy_force_resize` oracle. The new
+  `tools/tests/fixtures/force_resize_legacy_v1.json` was generated by AST-loading
+  the real old class from commit
+  `c1aea0d7c6beef930737bb3502d8c3aea7696d81`; the source-file SHA256 is
+  `27c6da0c6a9b4662d28dcd8265066292919b0ec6a93702ef2fbf9dbaea157c52`.
+  The fixture freezes image, affine/calibration matrices, normalized tensor,
+  projected points, image shape and complete/next-value NumPy RNG evidence.
+  It contains eight scenarios: 1x1, 1x4 and 6x4 under
+  `force_resize=True`, each in train and test mode, plus the ordinary
+  `force_resize=False` train and test paths. This is the full Cartesian set;
+  the review text called it seven even though its listed cases add up to eight.
+- Changed implementation/test files: `mmdet3d/datasets/pipelines/multi_view.py`,
+  `mmdet3d/datasets/pipelines/transforms_3d.py`,
+  `tools/data_converter/n7/build_fastbev_lut.py`, the three N7 base configs,
+  `tools/tests/test_force_resize_image_augmentation.py`, and
+  `tools/tests/fixtures/force_resize_legacy_v1.json`. The existing
+  `tools/data_converter/n7/analyze_n7_image_aug_targets.py` and
+  `tools/tests/test_n7_image_aug_target_stats.py` remain part of the earlier
+  statistics-first force-resize workstream rather than this review delta.
+- Local verification: Targeted `py_compile` passed; the focused force-resize
+  suite passed 10/10; complete discovery passed 50/50 (`Ran 50 tests`, `OK`);
+  both N7 CLI `--help` checks and `git diff --check` passed. Two NumPy 2
+  `DeprecationWarning` messages still originate from the pre-existing
+  tensor-to-NumPy assignment in `img_transform`; they do not affect exact
+  comparisons. An independent direct AST comparison against the actual old
+  class also found all eight frozen scenarios bit-exact, including subsequent
+  NumPy RNG state.
+- Cross-environment fixture portability: An internal legacy environment
+  initially differed only on the derived `ordinary_6x4_train` projected-point
+  SHA (`443353...` versus local NumPy 2.2.6 `358d17...`) while image,
+  `post_rot/post_tran`, `lidar2img`, normalized tensor and RNG evidence matched.
+  Reproduction showed that fixed-order scalar float32 accumulation yields the
+  internal SHA and NumPy/BLAS `matmul` differs by at most
+  `0.0001220703125 px`. The test-only `_project()` helper now uses fixed-order
+  float32 accumulation and the fixture records that contract; all eight cases
+  still pass when AST-loading the real class from `c1aea0d`, and the local
+  focused/full suites remain 10/10 and 50/50. No production implementation or
+  tolerance was changed.
+- Real legacy-stack gate passed (T7): The user synchronized the candidate into
+  the internal legacy environment, confirmed the complete suite reports
+  `Ran 50 tests` / `OK`, and ran baseline-worktree versus current-worktree
+  epoch13 comparisons with identical config, sample index 0, CUDA FP32,
+  `--atol 0 --rtol 0 --dump-tensors --strict`. The epoch13 checkpoint SHA256
+  was `897ae47de8889c4ff107e5cfa3f9b1d3f7a04f67362c8f1e050da7ec0dd851d7`
+  and the validation pkl SHA256 was
+  `ac19a123bd08a15fc9bc79b8829773d5428a41931d41a9ac5b6c783e498e0624`.
+  Both pre and post commands exited 0, and the cross-stage comparator reported
+  `T7 PASS`: dataset and production captures were bit-exact for input,
+  `neck_fuse_0` feature, `neck_3d` input, every raw cls/bbox/dir logit tensor
+  and decoded boxes. The discarded legacy RNG-sampling call (F7) remains in
+  place; deleting it is outside this closeout and would separately change the
+  cross-sample training RNG sequence.
+- Deferred decisions: F4 remains the train-GT visibility contract after random
+  crop/rotate. Reviewer measurement on 704x256 decomposed F5 into two
+  independent pre-existing upstream mismatches: integer `resize_dims`
+  truncation versus the floating analytic resize affine (measured maximum
+  0.838 px, consistent with the theoretical 0.893/0.961 px bounds), and PIL
+  `img.rotate()` NEAREST resampling versus the analytic `get_rot()` matrix
+  (measured maximum 1.222 px at `r=1.0`). The new two-stage affine remained
+  bit-identical to `c1aea0d` at the same amplitudes, so neither item is fixed in
+  this closeout; resize truncation and rotate resampling must be evaluated as
+  separate pre-AUG1 items. Ordinary `force_resize=False` temporal views still
+  sample each frame independently to preserve upstream exact compatibility;
+  choose any cross-time sharing policy explicitly before enabling that path for
+  future temporal augmentation. If a later 1600x900 migration removes the
+  `force_resize` branch, cross-time camera-slot sharing must be re-established
+  explicitly or explicitly rejected before temporal random augmentation is
+  enabled.
+- Next phase boundary: Migrating cached front images from 704x256 to 1600x900,
+  selecting resize/crop augmentation ranges and starting new GEOM experiments
+  are deliberately not implemented here. They require new experiment IDs and
+  work directories after the 704x256 T7 compatibility gate is closed. No
+  commit or push was made.
