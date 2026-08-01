@@ -23,7 +23,7 @@ import numpy as np
 
 
 EPOCH_RE = re.compile(r'^epoch_(\d+)\.pth$')
-METRIC_SCHEMA_VERSION = 2
+METRIC_SCHEMA_VERSION = 3
 SUMMARY_COLUMNS = [
     'epoch',
     'status',
@@ -33,6 +33,7 @@ SUMMARY_COLUMNS = [
     'mATE@2m',
     'mAOE_deg@2m',
     'mASE@2m',
+    'mAVE@2m',
     'car_center_AP',
     'truck_center_AP',
     'car_AP@0.5m',
@@ -46,15 +47,18 @@ SUMMARY_COLUMNS = [
     'car_ATE@2m',
     'car_AOE_deg@2m',
     'car_ASE@2m',
+    'car_AVE@2m',
     'truck_ATE@2m',
     'truck_AOE_deg@2m',
     'truck_ASE@2m',
+    'truck_AVE@2m',
     'car_bev_AP@0.5',
     'truck_bev_AP@0.5',
     'car_bev_AP@0.25',
     'truck_bev_AP@0.25',
     'car_gt',
     'truck_gt',
+    'eval_gt',
     'car_det',
     'truck_det',
     'eval_det',
@@ -79,6 +83,8 @@ OVERALL_MARKDOWN_COLUMNS = [
     'mATE@2m',
     'mAOE_deg@2m',
     'mASE@2m',
+    'mAVE@2m',
+    'eval_gt',
     'eval_det',
 ]
 CLASS_AP_MARKDOWN_COLUMNS = [
@@ -101,9 +107,11 @@ CLASS_TP_ERROR_MARKDOWN_COLUMNS = [
     'car_ATE@2m',
     'car_AOE_deg@2m',
     'car_ASE@2m',
+    'car_AVE@2m',
     'truck_ATE@2m',
     'truck_AOE_deg@2m',
     'truck_ASE@2m',
+    'truck_AVE@2m',
 ]
 BEV_SCORE_MARKDOWN_COLUMNS = [
     'epoch',
@@ -112,7 +120,9 @@ BEV_SCORE_MARKDOWN_COLUMNS = [
     'truck_bev_AP@0.5',
     'car_bev_AP@0.25',
     'truck_bev_AP@0.25',
+    'car_gt',
     'car_det',
+    'truck_gt',
     'truck_det',
     'car_score_p50',
     'car_score_p90',
@@ -122,6 +132,23 @@ BEV_SCORE_MARKDOWN_COLUMNS = [
     'truck_score_p90',
     'truck_score_p99',
     'truck_score_ge_0.2',
+]
+VELOCITY_CLASS_DETAIL_COLUMNS = [
+    'epoch',
+    'best',
+    'class',
+    'velocity_tp',
+    'AVE@2m',
+    'v_l2_p50',
+    'v_l2_p90',
+    'vx_mae',
+    'vx_p50',
+    'vx_p90',
+    'vy_mae',
+    'vy_p50',
+    'vy_p90',
+    'vx_mean',
+    'vy_mean',
 ]
 RANGE_BINS = [
     ('0_20m', '0-20m'),
@@ -159,10 +186,44 @@ RANGE_BIAS_MARKDOWN_COLUMNS = [
     'y_mean',
     'z_mean',
 ]
+RANGE_VELOCITY_ABS_MARKDOWN_COLUMNS = [
+    'epoch',
+    'best',
+    'class',
+    'range',
+    'gt',
+    'tp',
+    'velocity_tp',
+    'v_l2_mae',
+    'v_l2_p50',
+    'v_l2_p90',
+    'vx_mae',
+    'vx_p50',
+    'vx_p90',
+    'vy_mae',
+    'vy_p50',
+    'vy_p90',
+]
+RANGE_VELOCITY_BIAS_MARKDOWN_COLUMNS = [
+    'epoch',
+    'best',
+    'class',
+    'range',
+    'velocity_tp',
+    'vx_mean',
+    'vy_mean',
+]
 RANGE_DETAIL_COLUMNS = (
     RANGE_ABS_MARKDOWN_COLUMNS +
     [key for key in RANGE_BIAS_MARKDOWN_COLUMNS
-     if key not in RANGE_ABS_MARKDOWN_COLUMNS])
+     if key not in RANGE_ABS_MARKDOWN_COLUMNS] +
+    [key for key in RANGE_VELOCITY_ABS_MARKDOWN_COLUMNS
+     if key not in RANGE_ABS_MARKDOWN_COLUMNS and
+     key not in RANGE_BIAS_MARKDOWN_COLUMNS] +
+    [key for key in RANGE_VELOCITY_BIAS_MARKDOWN_COLUMNS
+     if key not in RANGE_ABS_MARKDOWN_COLUMNS and
+     key not in RANGE_BIAS_MARKDOWN_COLUMNS and
+     key not in RANGE_VELOCITY_ABS_MARKDOWN_COLUMNS])
 
 
 def parse_args():
@@ -762,6 +823,7 @@ def flatten_record(record, best_epoch):
         'mATE@2m': get_metric(record, 'mATE@2m'),
         'mAOE_deg@2m': get_metric(record, 'mAOE_deg@2m'),
         'mASE@2m': get_metric(record, 'mASE@2m'),
+        'mAVE@2m': get_first_metric(record, ['mAVE@2m', 'mAVE']),
         'car_center_AP': get_first_metric(
             record, ['car/center_AP', 'car/center_dist_mAP']),
         'truck_center_AP': get_first_metric(
@@ -777,15 +839,18 @@ def flatten_record(record, best_epoch):
         'car_ATE@2m': get_metric(record, 'car/ATE@2m'),
         'car_AOE_deg@2m': get_metric(record, 'car/AOE_deg@2m'),
         'car_ASE@2m': get_metric(record, 'car/ASE@2m'),
+        'car_AVE@2m': get_metric(record, 'car/AVE@2m'),
         'truck_ATE@2m': get_metric(record, 'truck/ATE@2m'),
         'truck_AOE_deg@2m': get_metric(record, 'truck/AOE_deg@2m'),
         'truck_ASE@2m': get_metric(record, 'truck/ASE@2m'),
+        'truck_AVE@2m': get_metric(record, 'truck/AVE@2m'),
         'car_bev_AP@0.5': get_metric(record, 'car/bev_AP@0.5'),
         'truck_bev_AP@0.5': get_metric(record, 'truck/bev_AP@0.5'),
         'car_bev_AP@0.25': get_metric(record, 'car/bev_AP@0.25'),
         'truck_bev_AP@0.25': get_metric(record, 'truck/bev_AP@0.25'),
         'car_gt': get_count_metric(record, 'car/gt_num'),
         'truck_gt': get_count_metric(record, 'truck/gt_num'),
+        'eval_gt': get_count_metric(record, 'eval/gt_num'),
         'car_det': get_count_metric(record, 'car/det_num'),
         'truck_det': get_count_metric(record, 'truck/det_num'),
         'eval_det': get_count_metric(record, 'eval/det_num'),
@@ -805,7 +870,49 @@ def flatten_record(record, best_epoch):
     # Keep fallback values if a future dataset changes metric names.
     if row['eval_det'] is None and 'eval/det_num' in metrics:
         row['eval_det'] = metrics['eval/det_num']
+    if row['eval_gt'] is None:
+        class_gt = [row['car_gt'], row['truck_gt']]
+        if all(isinstance(value, int) for value in class_gt):
+            row['eval_gt'] = sum(class_gt)
     return row
+
+
+def flatten_velocity_class_detail_records(records, best_epoch):
+    rows = []
+    for record in records:
+        epoch = int(record.get('epoch', -1))
+        best = '*' if best_epoch is not None and epoch == best_epoch else ''
+        for class_name in ['car', 'truck']:
+            rows.append({
+                'epoch': epoch,
+                'best': best,
+                'class': class_name,
+                'velocity_tp': get_count_metric(
+                    record, '{}/velocity_TP_num@2m'.format(class_name)),
+                'AVE@2m': get_metric(
+                    record, '{}/AVE@2m'.format(class_name)),
+                'v_l2_p50': get_metric(
+                    record, '{}/velocity_l2_p50@2m'.format(class_name)),
+                'v_l2_p90': get_metric(
+                    record, '{}/velocity_l2_p90@2m'.format(class_name)),
+                'vx_mae': get_metric(
+                    record, '{}/vx_abs_error_mean@2m'.format(class_name)),
+                'vx_p50': get_metric(
+                    record, '{}/vx_abs_error_p50@2m'.format(class_name)),
+                'vx_p90': get_metric(
+                    record, '{}/vx_abs_error_p90@2m'.format(class_name)),
+                'vy_mae': get_metric(
+                    record, '{}/vy_abs_error_mean@2m'.format(class_name)),
+                'vy_p50': get_metric(
+                    record, '{}/vy_abs_error_p50@2m'.format(class_name)),
+                'vy_p90': get_metric(
+                    record, '{}/vy_abs_error_p90@2m'.format(class_name)),
+                'vx_mean': get_metric(
+                    record, '{}/vx_error_mean@2m'.format(class_name)),
+                'vy_mean': get_metric(
+                    record, '{}/vy_error_mean@2m'.format(class_name)),
+            })
+    return rows
 
 
 def flatten_range_detail_records(records, best_epoch):
@@ -844,6 +951,30 @@ def flatten_range_detail_records(records, best_epoch):
                     'x_mean': get_metric(record, '{}/x_mean'.format(prefix)),
                     'y_mean': get_metric(record, '{}/y_mean'.format(prefix)),
                     'z_mean': get_metric(record, '{}/z_mean'.format(prefix)),
+                    'velocity_tp': get_count_metric(
+                        record, '{}/velocity_tp_num'.format(prefix)),
+                    'v_l2_mae': get_metric(
+                        record, '{}/velocity_l2_mean'.format(prefix)),
+                    'v_l2_p50': get_metric(
+                        record, '{}/velocity_l2_p50'.format(prefix)),
+                    'v_l2_p90': get_metric(
+                        record, '{}/velocity_l2_p90'.format(prefix)),
+                    'vx_mae': get_metric(
+                        record, '{}/vx_abs_mean'.format(prefix)),
+                    'vx_p50': get_metric(
+                        record, '{}/vx_abs_p50'.format(prefix)),
+                    'vx_p90': get_metric(
+                        record, '{}/vx_abs_p90'.format(prefix)),
+                    'vy_mae': get_metric(
+                        record, '{}/vy_abs_mean'.format(prefix)),
+                    'vy_p50': get_metric(
+                        record, '{}/vy_abs_p50'.format(prefix)),
+                    'vy_p90': get_metric(
+                        record, '{}/vy_abs_p90'.format(prefix)),
+                    'vx_mean': get_metric(
+                        record, '{}/vx_mean'.format(prefix)),
+                    'vy_mean': get_metric(
+                        record, '{}/vy_mean'.format(prefix)),
                 })
     return rows
 
@@ -874,6 +1005,18 @@ def write_range_csv(path, rows):
             writer.writerow({key: row.get(key, '') for key in RANGE_DETAIL_COLUMNS})
 
 
+def write_velocity_class_csv(path, rows):
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(
+            f, fieldnames=VELOCITY_CLASS_DETAIL_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                key: row.get(key, '')
+                for key in VELOCITY_CLASS_DETAIL_COLUMNS
+            })
+
+
 def write_markdown_table(f, columns, rows):
     f.write('| ' + ' | '.join(columns) + ' |\n')
     f.write('| ' + ' | '.join(['---'] * len(columns)) + ' |\n')
@@ -882,7 +1025,19 @@ def write_markdown_table(f, columns, rows):
         f.write('| ' + ' | '.join(cells) + ' |\n')
 
 
-def write_markdown(path, rows, range_rows, best_key, best_epoch, best_value):
+def _shared_count(rows, key):
+    values = {
+        int(row[key])
+        for row in rows
+        if row.get('status') == 'ok' and isinstance(row.get(key), int)
+    }
+    if len(values) == 1:
+        return next(iter(values))
+    return None
+
+
+def write_markdown(path, rows, velocity_class_rows, range_rows, best_key,
+                   best_epoch, best_value):
     with open(path, 'w', encoding='utf-8') as f:
         f.write('# Epoch Eval Summary\n\n')
         f.write('- best_key: `{}`\n'.format(best_key))
@@ -891,21 +1046,50 @@ def write_markdown(path, rows, range_rows, best_key, best_epoch, best_value):
                 best_epoch, best_key, float(best_value)))
         else:
             f.write('- best_epoch: none\n')
+        eval_gt = _shared_count(rows, 'eval_gt')
+        car_gt = _shared_count(rows, 'car_gt')
+        truck_gt = _shared_count(rows, 'truck_gt')
+        if eval_gt is not None:
+            class_parts = []
+            if car_gt is not None:
+                class_parts.append('car={}'.format(car_gt))
+            if truck_gt is not None:
+                class_parts.append('truck={}'.format(truck_gt))
+            suffix = ' ({})'.format(', '.join(class_parts)) if class_parts else ''
+            f.write('- eval_gt: `{}`{}; shared by all evaluated epochs\n'.format(
+                eval_gt, suffix))
+        elif rows:
+            f.write('- eval_gt: unavailable or varies across evaluated epochs\n')
         f.write('\n')
 
         f.write('## NuScenes-Like Overall\n\n')
         f.write('`mAP` is the canonical center-distance mAP: first average '
                 'AP@0.5m/1m/2m/4m within each class, then average classes '
                 'with GT. `BEV_mAP@0.5` is reported separately and is not '
-                'an alias of `mAP`.\n\n')
+                'an alias of `mAP`. `mAVE@2m` is the class-balanced mean 2D '
+                'velocity-vector L2 error over unique center-distance TP '
+                'matches <=2m, in m/s.\n\n')
         write_markdown_table(f, OVERALL_MARKDOWN_COLUMNS, rows)
 
         f.write('\n## Center-Distance AP By Class\n\n')
         write_markdown_table(f, CLASS_AP_MARKDOWN_COLUMNS, rows)
 
         f.write('\n## TP Errors By Class\n\n')
-        f.write('ATE/AOE/ASE are computed on TP matches with center distance <= 2m.\n\n')
+        f.write('ATE/AOE/ASE/AVE are computed on unique TP matches with '
+                'center distance <=2m. AVE is in m/s.\n\n')
         write_markdown_table(f, CLASS_TP_ERROR_MARKDOWN_COLUMNS, rows)
+
+        if velocity_class_rows:
+            f.write('\n## TP Velocity Detail By Class\n\n')
+            f.write(
+                '`velocity_tp` is the matched TP count with finite vx/vy in '
+                'both prediction and GT. `AVE@2m`/`v_l2_*` use '
+                '`||v_pred-v_gt||2`; vx/vy MAE and p50/p90 use absolute '
+                'component errors, while vx/vy mean retains signed bias. '
+                'vx/vy follow the Fast-BEV lidar frame (x forward, y left); '
+                'all velocity errors are in m/s.\n\n')
+            write_markdown_table(
+                f, VELOCITY_CLASS_DETAIL_COLUMNS, velocity_class_rows)
 
         f.write('\n## BEV And Score Detail\n\n')
         write_markdown_table(f, BEV_SCORE_MARKDOWN_COLUMNS, rows)
@@ -927,29 +1111,56 @@ def write_markdown(path, rows, range_rows, best_key, best_epoch, best_value):
                 'table must not be interpreted as absolute accuracy.\n\n')
             write_markdown_table(f, RANGE_BIAS_MARKDOWN_COLUMNS, range_rows)
 
+            f.write('\n## TP Velocity Absolute Error By GT X Range\n\n')
+            f.write(
+                'Velocity statistics reuse the same unique TP<=2m matches. '
+                '`velocity_tp` can be smaller than `tp` when a legacy box '
+                'does not contain finite vx/vy. `v_l2_mae` is the mean 2D '
+                'velocity-vector error; all values are in m/s.\n\n')
+            write_markdown_table(
+                f, RANGE_VELOCITY_ABS_MARKDOWN_COLUMNS, range_rows)
+
+            f.write('\n## TP Velocity Signed Bias By GT X Range\n\n')
+            f.write(
+                'Signed mean(pred-gt) for vx/vy diagnoses systematic velocity '
+                'bias and must not be interpreted as absolute error.\n\n')
+            write_markdown_table(
+                f, RANGE_VELOCITY_BIAS_MARKDOWN_COLUMNS, range_rows)
+
 
 def write_summaries(result_dir, best_key):
     records = load_existing_records(result_dir)
     best_epoch, best_value = find_best_epoch(records, best_key)
     rows = [flatten_record(record, best_epoch) for record in records]
+    velocity_class_rows = flatten_velocity_class_detail_records(
+        records, best_epoch)
     range_rows = flatten_range_detail_records(records, best_epoch)
 
     write_csv(result_dir / 'eval_summary.csv', rows)
+    write_velocity_class_csv(
+        result_dir / 'eval_velocity_summary.csv', velocity_class_rows)
     write_range_csv(result_dir / 'eval_range_summary.csv', range_rows)
-    write_markdown(result_dir / 'eval_summary.md', rows, range_rows, best_key,
-                   best_epoch, best_value)
+    write_markdown(
+        result_dir / 'eval_summary.md', rows, velocity_class_rows, range_rows,
+        best_key, best_epoch, best_value)
     write_json(result_dir / 'eval_summary.json', {
         'metric_schema_version': METRIC_SCHEMA_VERSION,
         'metric_definitions': {
             'mAP': 'mean per-class center AP over 0.5m/1m/2m/4m',
             'BEV_mAP@0.5': 'mean per-class BEV IoU AP at 0.5',
+            'mAVE@2m': (
+                'class-balanced mean 2D velocity L2 error over unique '
+                'center-distance TP<=2m, m/s'),
             'range_recall@2m': 'unique center-distance TP<=2m / range GT',
             'range_xyz_mae': 'mean(abs(pred-gt)) over matched TP<=2m',
+            'range_velocity_error': (
+                '2D L2 and vx/vy component errors over matched TP<=2m, m/s'),
         },
         'best_key': best_key,
         'best_epoch': best_epoch,
         'best_value': best_value,
         'rows': rows,
+        'velocity_class_rows': velocity_class_rows,
         'range_rows': range_rows,
         'records': records,
     })
@@ -987,6 +1198,11 @@ def main():
         raise FileNotFoundError(work_dir)
     if not test_script.exists():
         raise FileNotFoundError(test_script)
+
+    # 在进入 watch 循环或启动 tools/test.py 前先校验参数，避免一个拼写错误
+    # 每隔 poll_interval 重试一次完整 checkpoint。
+    parse_key_value_options(args.cfg_options)
+    parse_key_value_options(args.eval_options)
 
     print('config: {}'.format(config))
     print('work_dir: {}'.format(work_dir))

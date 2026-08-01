@@ -11,6 +11,7 @@ from mmdet.datasets import DATASETS
 
 from mmdet3d.core.bbox import LiDARInstance3DBoxes
 from mmdet3d.core.evaluation import indoor_eval
+from tools.n7_eval_velocity import summarize_velocity_errors
 from tools.n7_box_origin import boxes_to_numpy as n7_boxes_to_numpy
 from .custom_3d import Custom3DDataset
 
@@ -24,7 +25,7 @@ class CustomMultiViewDataset(Custom3DDataset):
                'barrier')
     N7_X_RANGE_BINS = ((0, 20), (20, 40), (40, 60), (60, 80))
     N7_TP_MATCH_DISTANCE = 2.0
-    N7_EVAL_METRIC_SCHEMA_VERSION = 2
+    N7_EVAL_METRIC_SCHEMA_VERSION = 3
 
     def __init__(self,
                  data_root,
@@ -495,8 +496,9 @@ class CustomMultiViewDataset(Custom3DDataset):
         return np.asarray(value)
 
     @classmethod
-    def _boxes_to_numpy(cls, boxes, target_origin='tensor', source_origin=None):
-        """通过 N7 公共 origin 契约取出前 7 维 box。
+    def _boxes_to_numpy(cls, boxes, target_origin='tensor', source_origin=None,
+                        box_dim=7):
+        """通过 N7 公共 origin 契约取出指定维数的 box。
 
         ``LiDARInstance3DBoxes.tensor[:, 2]`` 使用底中心 z，而 N7 converter
         保存的 GT ``location.z`` 使用 3D 框重心。评估 xyz 误差时需要把预测
@@ -508,13 +510,15 @@ class CustomMultiViewDataset(Custom3DDataset):
                 分别转换成重心或底中心 z。
             source_origin: 数组输入的显式语义，可为 ``center`` 或 ``bottom``。
                 mmdet3d box 对象会优先读取 ``gravity_center``，无需指定。
+            box_dim: 默认 ``7`` 以保持历史几何调用兼容；传 ``None`` 时保留
+                速度等全部扩展维。
         """
         public_target = 'native' if target_origin == 'tensor' else target_origin
         return n7_boxes_to_numpy(
             boxes,
             target_origin=public_target,
             source_origin=source_origin,
-            box_dim=7,
+            box_dim=box_dim,
             dtype=np.float32)
 
     @staticmethod
@@ -715,7 +719,8 @@ class CustomMultiViewDataset(Custom3DDataset):
         boxes = self._boxes_to_numpy(
             result.get('boxes_3d'),
             target_origin='center',
-            source_origin=result.get('box_origin'))
+            source_origin=result.get('box_origin'),
+            box_dim=None)
         scores = self._to_numpy(result.get('scores_3d')).astype(np.float32).reshape(-1)
         labels = self._to_numpy(result.get('labels_3d')).astype(np.int64).reshape(-1)
         valid_len = min(boxes.shape[0], scores.shape[0], labels.shape[0])
@@ -746,7 +751,6 @@ class CustomMultiViewDataset(Custom3DDataset):
             boxes = np.zeros((0, 7), dtype=np.float32)
         if boxes.ndim == 1:
             boxes = boxes.reshape(1, -1)
-        boxes = boxes[:, :7]
         labels = []
         for cat in info.get('gt_names', []):
             labels.append(self.CLASSES.index(cat) if cat in self.CLASSES else -1)
@@ -754,6 +758,30 @@ class CustomMultiViewDataset(Custom3DDataset):
         valid_len = min(boxes.shape[0], labels.shape[0])
         boxes = boxes[:valid_len]
         labels = labels[:valid_len]
+
+        # N7 converter 将速度单独保存在 gt_velocity；评估内部统一拼成
+        # [x,y,z,l,w,h,yaw,vx,vy]，与 code_size=9 的预测框一致。兼容少量
+        # 已把速度嵌入 gt_boxes 的历史数据；评估时缺失速度用 NaN 标记，不能
+        # 将“未标注”伪装成静止目标的零误差。
+        if 'gt_velocity' in info:
+            velocity = np.asarray(info['gt_velocity'], dtype=np.float32)
+            if velocity.size == 0:
+                velocity = np.zeros((0, 2), dtype=np.float32)
+            elif velocity.ndim == 1:
+                velocity = velocity.reshape(-1, 2)
+        elif boxes.shape[1] >= 9:
+            velocity = boxes[:, 7:9]
+        else:
+            velocity = np.full((0, 2), np.nan, dtype=np.float32)
+        if velocity.shape[0] < valid_len:
+            padded_velocity = np.full(
+                (valid_len, 2), np.nan, dtype=np.float32)
+            padded_velocity[:velocity.shape[0]] = velocity[:, :2]
+            velocity = padded_velocity
+        else:
+            velocity = velocity[:valid_len, :2]
+        boxes = np.concatenate([boxes[:, :7], velocity], axis=-1)
+
         valid = labels >= 0
         valid &= self._eval_range_mask(boxes)
         valid &= self._gt_visible_camera_mask(info, boxes)
@@ -840,14 +868,29 @@ class CustomMultiViewDataset(Custom3DDataset):
 
         *_abs_mean 是逐目标先取绝对值再求均值，即各轴 MAE，表示下游
         更关心的实际偏移量；*_mean 保留有符号均值，只用于诊断系统偏置。
+        AVE 使用同一批唯一 TP 的二维速度向量 L2 误差，不重新匹配。
         """
         range_bins = range_bins or self.N7_X_RANGE_BINS
+        velocity_summary = summarize_velocity_errors(matches, range_bins)
+        overall_velocity = velocity_summary['overall']
         stats = {
             'tp_num': len(matches),
             'ate': 0.0,
             'aoe': 0.0,
             'aoe_deg': 0.0,
             'ase': 0.0,
+            'ave': overall_velocity['velocity_l2_mean'],
+            'velocity_tp_num': overall_velocity['velocity_tp_num'],
+            'velocity_l2_p50': overall_velocity['velocity_l2_p50'],
+            'velocity_l2_p90': overall_velocity['velocity_l2_p90'],
+            'vx_abs_mean': overall_velocity['vx_abs_mean'],
+            'vx_abs_p50': overall_velocity['vx_abs_p50'],
+            'vx_abs_p90': overall_velocity['vx_abs_p90'],
+            'vy_abs_mean': overall_velocity['vy_abs_mean'],
+            'vy_abs_p50': overall_velocity['vy_abs_p50'],
+            'vy_abs_p90': overall_velocity['vy_abs_p90'],
+            'vx_mean': overall_velocity['vx_mean'],
+            'vy_mean': overall_velocity['vy_mean'],
             'x_abs_mean': 0.0,
             'x_abs_p50': 0.0,
             'x_abs_p90': 0.0,
@@ -867,6 +910,7 @@ class CustomMultiViewDataset(Custom3DDataset):
             stats['ranges'][key] = dict(
                 label=self._range_label(start, end),
                 tp_num=0,
+                **velocity_summary['ranges'][key],
                 x_abs_mean=0.0,
                 x_abs_p50=0.0,
                 x_abs_p90=0.0,
@@ -1049,6 +1093,18 @@ class CustomMultiViewDataset(Custom3DDataset):
         """把阈值转成适合日志 key 的短字符串。"""
         return ('{:.2f}'.format(float(thr))).rstrip('0').rstrip('.')
 
+    @staticmethod
+    def _format_optional_metric(value, format_spec):
+        """格式化可能因旧 7 维预测框而不可用的速度指标。"""
+        if value is None:
+            return '-'
+        try:
+            if not np.isfinite(float(value)):
+                return '-'
+            return format(float(value), format_spec)
+        except (TypeError, ValueError):
+            return '-'
+
     def _log_custom_eval(self, class_rows, range_rows, overall_metrics=None,
                          logger=None):
         """打印 nuScenes-like 摘要和业务分桶误差，便于训练日志查看。"""
@@ -1056,7 +1112,8 @@ class CustomMultiViewDataset(Custom3DDataset):
             return
         header = [
             'class', 'GT', 'det', 'center_AP', 'Recall@2m',
-            'ATE@2m', 'AOE@2m(deg)', 'ASE@2m', 'BEV_AP@0.5'
+            'ATE@2m', 'AOE@2m(deg)', 'ASE@2m', 'AVE@2m',
+            'BEV_AP@0.5'
         ]
         table_rows = [header]
         for row in class_rows:
@@ -1070,6 +1127,8 @@ class CustomMultiViewDataset(Custom3DDataset):
                 '{:.3f}'.format(metrics.get('ATE@2m', 0.0)),
                 '{:.2f}'.format(metrics.get('AOE_deg@2m', 0.0)),
                 '{:.3f}'.format(metrics.get('ASE@2m', 0.0)),
+                self._format_optional_metric(
+                    metrics.get('AVE@2m'), '.3f'),
                 '{:.4f}'.format(metrics.get('bev_AP@0.5', 0.0)),
             ])
         print_log('\nN7 nuScenes-like eval summary\n' + AsciiTable(table_rows).table, logger=logger)
@@ -1077,7 +1136,7 @@ class CustomMultiViewDataset(Custom3DDataset):
         if overall_metrics is not None:
             overall_rows = [[
                 'mAP(center)', 'BEV_mAP@0.5', 'mATE@2m',
-                'mAOE@2m(deg)', 'mASE@2m', 'GT', 'det'
+                'mAOE@2m(deg)', 'mASE@2m', 'mAVE@2m', 'GT', 'det'
             ], [
                 '{:.4f}'.format(overall_metrics.get('mAP', 0.0)),
                 '{:.4f}'.format(
@@ -1086,6 +1145,8 @@ class CustomMultiViewDataset(Custom3DDataset):
                 '{:.2f}'.format(
                     overall_metrics.get('mAOE_deg@2m', 0.0)),
                 '{:.3f}'.format(overall_metrics.get('mASE@2m', 0.0)),
+                self._format_optional_metric(
+                    overall_metrics.get('mAVE@2m'), '.3f'),
                 overall_metrics.get('eval/gt_num', 0),
                 overall_metrics.get('eval/det_num', 0),
             ]]
@@ -1096,7 +1157,8 @@ class CustomMultiViewDataset(Custom3DDataset):
         if range_rows:
             detail_header = [
                 'class', 'range', 'GT', 'TP@2m', 'Recall@2m',
-                'x_MAE', 'y_MAE', 'z_MAE'
+                'x_MAE', 'y_MAE', 'z_MAE', 'vTP', 'v_AVE',
+                'vx_MAE', 'vy_MAE'
             ]
             detail_rows = [detail_header]
             for row in range_rows:
@@ -1110,6 +1172,13 @@ class CustomMultiViewDataset(Custom3DDataset):
                     '{:.3f}'.format(row['x_abs_mean']) if has_tp else '-',
                     '{:.3f}'.format(row['y_abs_mean']) if has_tp else '-',
                     '{:.3f}'.format(row['z_abs_mean']) if has_tp else '-',
+                    row['velocity_tp_num'],
+                    self._format_optional_metric(
+                        row['velocity_l2_mean'], '.3f'),
+                    self._format_optional_metric(
+                        row['vx_abs_mean'], '.3f'),
+                    self._format_optional_metric(
+                        row['vy_abs_mean'], '.3f'),
                 ])
             print_log(
                 '\nN7 recall and TP xyz MAE by gt x range; TP@2m uses '
@@ -1134,6 +1203,7 @@ class CustomMultiViewDataset(Custom3DDataset):
         ate_by_class = []
         aoe_by_class = []
         ase_by_class = []
+        ave_by_class = []
         total_gt = 0
         total_det = 0
         range_rows = []
@@ -1198,12 +1268,29 @@ class CustomMultiViewDataset(Custom3DDataset):
             row_metrics['AOE@2m'] = tp_stats['aoe']
             row_metrics['AOE_deg@2m'] = tp_stats['aoe_deg']
             row_metrics['ASE@2m'] = tp_stats['ase']
+            row_metrics['AVE@2m'] = tp_stats['ave']
             ret_dict['{}/TP_num@2m'.format(class_name)] = int(tp_stats['tp_num'])
             ret_dict['{}/dist_recall@2m'.format(class_name)] = tp_recall
             ret_dict['{}/ATE@2m'.format(class_name)] = tp_stats['ate']
             ret_dict['{}/AOE@2m'.format(class_name)] = tp_stats['aoe']
             ret_dict['{}/AOE_deg@2m'.format(class_name)] = tp_stats['aoe_deg']
             ret_dict['{}/ASE@2m'.format(class_name)] = tp_stats['ase']
+            ret_dict['{}/AVE@2m'.format(class_name)] = tp_stats['ave']
+            ret_dict['{}/velocity_TP_num@2m'.format(
+                class_name)] = int(tp_stats['velocity_tp_num'])
+            ret_dict['{}/velocity_l2_p50@2m'.format(
+                class_name)] = tp_stats['velocity_l2_p50']
+            ret_dict['{}/velocity_l2_p90@2m'.format(
+                class_name)] = tp_stats['velocity_l2_p90']
+            for axis in ['vx', 'vy']:
+                ret_dict['{}/{}_abs_error_mean@2m'.format(
+                    class_name, axis)] = tp_stats['{}_abs_mean'.format(axis)]
+                ret_dict['{}/{}_abs_error_p50@2m'.format(
+                    class_name, axis)] = tp_stats['{}_abs_p50'.format(axis)]
+                ret_dict['{}/{}_abs_error_p90@2m'.format(
+                    class_name, axis)] = tp_stats['{}_abs_p90'.format(axis)]
+                ret_dict['{}/{}_error_mean@2m'.format(
+                    class_name, axis)] = tp_stats['{}_mean'.format(axis)]
             for axis in ['x', 'y', 'z']:
                 ret_dict['{}/{}_abs_error_mean@2m'.format(class_name, axis)] = tp_stats['{}_abs_mean'.format(axis)]
                 ret_dict['{}/{}_abs_error_p50@2m'.format(class_name, axis)] = tp_stats['{}_abs_p50'.format(axis)]
@@ -1213,6 +1300,8 @@ class CustomMultiViewDataset(Custom3DDataset):
                 ate_by_class.append(tp_stats['ate'])
                 aoe_by_class.append(tp_stats['aoe'])
                 ase_by_class.append(tp_stats['ase'])
+                if tp_stats['ave'] is not None:
+                    ave_by_class.append(tp_stats['ave'])
             range_gt_counts = self._count_gt_by_x_range(gt_for_class)
             for range_key, range_stats in tp_stats['ranges'].items():
                 range_gt_num = int(range_gt_counts.get(range_key, 0))
@@ -1224,6 +1313,28 @@ class CustomMultiViewDataset(Custom3DDataset):
                     ret_dict['{}/range_{}/{}_abs_p50'.format(class_name, range_key, axis)] = range_stats['{}_abs_p50'.format(axis)]
                     ret_dict['{}/range_{}/{}_abs_p90'.format(class_name, range_key, axis)] = range_stats['{}_abs_p90'.format(axis)]
                     ret_dict['{}/range_{}/{}_mean'.format(class_name, range_key, axis)] = range_stats['{}_mean'.format(axis)]
+                ret_dict['{}/range_{}/velocity_tp_num'.format(
+                    class_name, range_key)] = int(
+                        range_stats['velocity_tp_num'])
+                ret_dict['{}/range_{}/velocity_l2_mean'.format(
+                    class_name, range_key)] = range_stats['velocity_l2_mean']
+                ret_dict['{}/range_{}/velocity_l2_p50'.format(
+                    class_name, range_key)] = range_stats['velocity_l2_p50']
+                ret_dict['{}/range_{}/velocity_l2_p90'.format(
+                    class_name, range_key)] = range_stats['velocity_l2_p90']
+                for axis in ['vx', 'vy']:
+                    ret_dict['{}/range_{}/{}_abs_mean'.format(
+                        class_name, range_key, axis)] = range_stats[
+                            '{}_abs_mean'.format(axis)]
+                    ret_dict['{}/range_{}/{}_abs_p50'.format(
+                        class_name, range_key, axis)] = range_stats[
+                            '{}_abs_p50'.format(axis)]
+                    ret_dict['{}/range_{}/{}_abs_p90'.format(
+                        class_name, range_key, axis)] = range_stats[
+                            '{}_abs_p90'.format(axis)]
+                    ret_dict['{}/range_{}/{}_mean'.format(
+                        class_name, range_key, axis)] = range_stats[
+                            '{}_mean'.format(axis)]
                 ret_dict['{}/range_{}/tp_num'.format(class_name, range_key)] = int(range_stats['tp_num'])
                 ret_dict['{}/range_{}/gt_num'.format(
                     class_name, range_key)] = range_gt_num
@@ -1246,7 +1357,19 @@ class CustomMultiViewDataset(Custom3DDataset):
                     z_abs_p90=range_stats['z_abs_p90'],
                     x_mean=range_stats['x_mean'],
                     y_mean=range_stats['y_mean'],
-                    z_mean=range_stats['z_mean']))
+                    z_mean=range_stats['z_mean'],
+                    velocity_tp_num=int(range_stats['velocity_tp_num']),
+                    velocity_l2_mean=range_stats['velocity_l2_mean'],
+                    velocity_l2_p50=range_stats['velocity_l2_p50'],
+                    velocity_l2_p90=range_stats['velocity_l2_p90'],
+                    vx_abs_mean=range_stats['vx_abs_mean'],
+                    vx_abs_p50=range_stats['vx_abs_p50'],
+                    vx_abs_p90=range_stats['vx_abs_p90'],
+                    vy_abs_mean=range_stats['vy_abs_mean'],
+                    vy_abs_p50=range_stats['vy_abs_p50'],
+                    vy_abs_p90=range_stats['vy_abs_p90'],
+                    vx_mean=range_stats['vx_mean'],
+                    vy_mean=range_stats['vy_mean']))
             ret_dict['{}/gt_num'.format(class_name)] = gt_num
             ret_dict['{}/det_num'.format(class_name)] = det_num
 
@@ -1271,6 +1394,10 @@ class CustomMultiViewDataset(Custom3DDataset):
         ret_dict['mAOE@2m'] = float(np.mean(aoe_by_class)) if aoe_by_class else 0.0
         ret_dict['mAOE_deg@2m'] = float(np.degrees(ret_dict['mAOE@2m']))
         ret_dict['mASE@2m'] = float(np.mean(ase_by_class)) if ase_by_class else 0.0
+        ret_dict['mAVE@2m'] = (
+            float(np.mean(ave_by_class)) if ave_by_class else None)
+        # nuScenes 官方简称；@2m 后缀明确本项目沿用的 TP 匹配阈值。
+        ret_dict['mAVE'] = ret_dict['mAVE@2m']
         ret_dict['eval/gt_num'] = int(total_gt)
         ret_dict['eval/det_num'] = int(total_det)
         self._log_custom_eval(
