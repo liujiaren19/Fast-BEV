@@ -1,6 +1,6 @@
 # N7 Fast-BEV 实验详细记录
 
-> 更新时间：2026-07-23
+> 更新时间：2026-08-01
 >
 > 汇总入口：[N7_FASTBEV_EXPERIMENT_SUMMARY.md](N7_FASTBEV_EXPERIMENT_SUMMARY.md)
 >
@@ -1166,6 +1166,16 @@ work_dirs/n7_pkl_gate_b0/data_gate.md
 
 这不会使当前 S0/B0 首轮比较失效，因为两边使用相同口径；但它是正式训练前需要收口的实现问题，可能限制远距小目标和 COCO 预训练迁移。首轮 A/B 后应先拆分 native K/尺寸到 704×256 的确定性基础变换与可选随机增强，并在随机增强关闭时验证图像、`post_rot/post_tran`、投影和 logits 与旧实现等价。之后才用独立配置 A/B 随机增强；不能简单设置 `force_resize=False`，也不能把该变化与 stretch、704×384、数据修复同时引入。四时序若启用随机几何增强，同一相机四帧必须共享参数。
 
+2026-07-28 状态更新：上述 `force_resize` 收口已经完成。实现拆分了基础几何和
+可选随机阶段，增加 `view_layout` 契约、1×1/1×4/6×4 camera-slot 共享回归、
+真实旧实现 fixture 和 LUT 一致性检查；本地完整 suite 为 `Ran 50 tests, OK`。
+内网用相同 epoch13 checkpoint、val pkl 和 `atol=0, rtol=0` 完成 pre/post T7，
+input、2D feature、BEV input、raw cls/bbox/dir logits 和 decoded boxes 全部
+bit-exact。代码已提交并推送为
+`134d5f3124e0d11f40dbcbade9e5bfe07c28ff96`。这只关闭旧 704×256 基线的
+兼容性问题，不代表 AUG1 已完成；F4 GT 可见性、F5 resize/rotate 上游亚像素
+语义以及 `force_resize=False` 时序随机共享仍需在启用相关路径前独立处理。
+
 ### 15.7 anchor、CBGS、NMS
 
 当前都属于后置单变量优化：
@@ -1423,38 +1433,217 @@ camera-size WIDTH HEIGHT 只约束相机面板。示例：
 - 跨 clip 标题帧或切换标记；
 - 内网真实 B0 epoch5 sequence 视频验证。
 
+## 17A. EXP-MONO-GEOM1-A：1600×900 等比缩放中心裁剪
+
+### 17A.1 Run-of-record 契约
+
+- 唯一配置：
+  `configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18_n7_1600x900_scale_crop_dist_train.py`。
+  该文件为完整独立 config，不再依赖多层 `_base_`。
+- 本地配置 SHA256：
+  `d134b0bdbc4af0ec3aea391b884c20f46e792248eceecefa742f0639992b89fc`；
+  冻结的 resolved contract SHA256：
+  `dcfd9882e1e8d2f75348d8d693d0bc411adbb7930e47be306da18b8c67d961d4`。
+  旧记录 `8b4ecfdd...439e` 是正式 work_dir 写入配置前的训练前版本；当前文件的
+  修改时间早于正式日志启动时间，且日志中的 resolved config 与当前关键字段一致。
+  训练日志本身未嵌入配置文件 byte hash，因此不能把这一交叉核对表述为 checkpoint
+  已记录了配置 SHA256。
+- `force_resize=False`、`enable_random_aug=False`、`n_images=1`、`n_times=1`。
+  train/test 使用同一确定性图像契约：`1600×900 -> resize 704×396 ->
+  crop(0,70,704,326) -> 704×256`。对应
+  `post_rot=diag(0.44,0.44)`、`post_tran=[0,-70,0]`。
+  GEOM1-A 的配置、回归测试和正式训练日志均证明这是原生单帧 `1×1`；项目中的
+  `n_images=1,n_times=4` 是 temporal B0 契约，不能用于改写本实验历史。
+- ROI、voxel、anchor、类别、GT 口径、BEV 增强、AdamW2、`lr=1e-4`、
+  seed=0、15 epoch、COCO 初始化和 dynamic FP16 均与 S0 保持一致。
+- 初始化权重来源：
+  `pretrained_models/cascade_mask_rcnn_r18_fpn_coco-mstrain_3x_20e_nuim_bbox_mAP_0.5110_segm_mAP_0.4070.pth`。
+  日志确认从该路径加载兼容的 COCO Cascade Mask R-CNN R18/FPN 参数；它不是
+  Fast-BEV 完整模型 resume。当前工作区没有该权重实体，SHA256 待内网补录。
+- 正式 work_dir：
+  `work_dirs/n7_mono_1600_900_scale_crop/EXP-MONO-GEOM1-A/20251017_20251030_20251031_20251203_gpu4_batch64_work_8_260729`。
+
+### 17A.2 PKL 迁移和数据门禁
+
+内网按旧 704×256 train/val clip manifest 生成了一套指向原生图片的 PKL：
+
+- train PKL：
+  `data/N7_1600_900/mono_front_pkl/custom_fastbev_20251017-20251030-20251031-20251203_infos_train_20260728.pkl`；
+- val PKL：
+  `data/N7_1600_900/mono_front_pkl/custom_fastbev_20251017-20251030-20251031-20251203_infos_val_20260728.pkl`；
+- train：200,874 infos、364 clips、3,086,700 GT；
+- val：24,909 infos、45 clips、300,701 GT；
+- train/val token 和 clip overlap 均为 0；全部 camera 为 cam0，图片和 K metadata
+  均为 1600×900；`test=val`，没有虚构独立 test。
+
+新旧严格迁移对比输出
+`N7_PKL_MIGRATION_COMPARE=PASS failures=0`，确认 token/order、clip、timestamp、
+GT box/name、K、distortion、extrinsic 和 split 保持不变；只允许的图片路径、尺寸和
+相应 metadata 发生变化。PKL/manifest 精确 SHA256 已由内网报告生成，但实体和数值尚未
+同步到当前工作区，不能在本文虚构补写。
+
+全量图片检查覆盖 train 200,874 和 val 24,909 张，缺失文件、JPEG header 尺寸不符和
+解码错误均为 0。train/val 各抽 200 个 info 的 geometry check 失败数和最大误差均为 0。
+
+原始 strict data gate 仍保留 `FAIL`：converter provenance 记录 train/val 分别有
+851/90 个 clip 首尾标签无对应图像，train 另有 1,237 个空 GT 标签被旧 converter
+丢弃。该缺帧数量与旧 704×256 manifest 的已知边界条件一致，用户明确批准本实验放行，
+因此实验级结论为 `PASS_WITH_ACCEPTED_CLIP_BOUNDARY_EXCEPTION`。不得修改原始报告来
+制造无条件 PASS。
+
+已知内网报告入口为
+`work_dirs/validate_n7_1600_900_candidate/data_gate.md` / `data_gate.json` 及其
+train/val 子目录中的 `geometry_check.json`；全量图片扫描和 migration 报告/hash 应随
+最终资产一起归档。当前本地未同步这些实体，因此本文只记录用户回传结果，不声称本地复算。
+
+### 17A.3 F4、crop offset 和真实 pipeline
+
+F4 对 225,783 个 info 做了全量 keep/yaw 统计，并以固定 stride=100 对 2,259 帧、
+104,660 个记录做像素指标。中心裁剪 top=70 的结果为：
+
+| split | eval keep | train keep | eval-only | 比例 |
+| --- | ---: | ---: | ---: | ---: |
+| train | 958,707 | 958,606 | 101 | 0.0105% |
+| val | 85,239 | 85,229 | 10 | 0.0117% |
+
+合计差异 111/1,043,946=`0.01063%`，即 keep-mask 一致率 99.98937%。111 个目标全部
+位于 0～20m：car/truck=65/46；yaw 中 107 个位于 [-45°,45°]，另有
+[-90°,-45°] 和 [135°,180°] 各 2 个。20～80m 损失为 0，也没有侧向 yaw 聚集。
+两个被像素指标抽中的 crop-dropped 框位于 x=0.45/1.54m、y≈4.5m，其 box edge
+穿过相机近裁面，形成异常大的负 distortion margin。
+
+direct stretch 的 train/eval visibility 完全一致；已测 crop offset 均不为精确零差异。
+top=140 只损失 55 个目标，但会把输出主点 y 从 128 移到 58，不应为少 56 个边缘目标
+破坏冻结的中心裁剪契约。最终保留 top=70；原始零容忍状态仍是
+`F4_REVIEW_REQUIRED`，实验级记录为
+`PASS_WITH_ACCEPTED_NEAR_FIELD_CROP_EXCEPTION`，不修改 train/eval GT 口径。
+
+真实 `RandomAugImageMultiViewImage` pipeline 可视化 train/val 均输出
+`N7_SCALE_CROP_PIPELINE_VIS=PASS`，分别渲染 34/32 张，覆盖远距、上下边缘、
+非零 yaw 和 train 的两个采样 crop-dropped 目标。这一证据验证了真实训练 pipeline 的
+图像结果、post transform、lidar2img 与标记点同步；LANCZOS 定性工具不作为数值替代。
+F4 和样本选择的内网入口为 `work_dirs/n7_1600_900_scale_crop_analysis`；保留其中
+统计报告、`sample_selection_train.json`、`sample_selection_val.json` 和最终渲染图。
+
+### 17A.4 测试和吞吐门禁
+
+优化后的 F4 analyzer focused 回归 10/10、完整 `tools/tests` 62/62、相关
+`py_compile` 和 whitespace 检查通过。单卡 20GB 测试机以 batch64/workers8 运行
+10 warmup + 50 measure，两个候选均完成 dataloader、forward、backward 和 optimizer：
+
+| 配置 | iter mean | data mean | peak allocated | wall time |
+| --- | ---: | ---: | ---: | ---: |
+| S0 | 11.810291s | 0.094683s | 9926.1 MiB | 13m08.878s |
+| GEOM1-A | 13.276409s | 0.199413s | 9929.3 MiB | 15m04.678s |
+
+GEOM1-A 的 iter+data 增加 13.19%，样本吞吐下降 11.66%，显存仅增加 3.2 MiB。
+这是同机单变量正确性/开销证据，不能把绝对耗时外推到 4×L20。
+对应机器可读结果为 `work_dirs/n7_1600_900_training_gate/s0_50iter.json` 和
+`work_dirs/n7_1600_900_training_gate/geom1a_50iter.json`。
+
+### 17A.5 正式训练和最终精度结论
+
+4×L20、每卡 batch64、workers8、dynamic FP16 的 15 epoch run 已于
+2026-07-30 完成，e1～15 全部独立 val。canonical best=e11：
+
+历史启动记录与正式日志 resolved config 交叉确认的训练命令为：
+
+~~~bash
+cd /mnt/liujiaren/fastbev-python-custom-fastbev-adapter
+
+CONFIG="configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18_n7_1600x900_scale_crop_dist_train.py" \
+WORK_DIR="work_dirs/n7_mono_1600_900_scale_crop/EXP-MONO-GEOM1-A/20251017_20251030_20251031_20251203_gpu4_batch64_work_8_260729" \
+TRAIN_BATCH=64 \
+EVAL_BATCH=8 \
+WORKERS=8 \
+NO_VALIDATE=1 \
+bash tools/dist_train_ljr.sh
+~~~
+
+`tools/dist_train_ljr.sh` 使用 `torch.distributed.launch --nproc_per_node=4`，并把上述
+batch/worker 参数通过 `--cfg-options` 写入运行时配置。正式 train/val PKL 分别是：
+
+- `./data/N7_1600_900/mono_front_pkl/custom_fastbev_20251017-20251030-20251031-20251203_infos_train_20260728.pkl`；
+- `./data/N7_1600_900/mono_front_pkl/custom_fastbev_20251017-20251030-20251031-20251203_infos_val_20260728.pkl`。
+
+当前工作区的可核验运行资产为：
+
+| 资产 | 当前路径 | SHA256 / 状态 |
+| --- | --- | --- |
+| 完整训练日志 | `<work_dir>/20260729_110603.log` | `1abbd30779fe65b6ff5e255e5eb3751c61427f29ee86f45753395f8b3ee9079b` |
+| 逐轮评估汇总 | `<work_dir>/test_results/eval_summary.md` | `8e75a795c571f8e59ca468300232be2184ba20cb542d2b789f7943cf5ceb30f0` |
+| 本地 data gate Markdown | `work_dirs/validate_n7_1600_900_candidate/data_gate.md` | `aa012f55c7315b98dc55aa4fe9c92b5501fabaf0c590734aba846eb15d4aeef6` |
+
+日志确认 epoch11、epoch13、epoch15 均执行过 checkpoint 保存。按正式 work_dir 的
+运行契约，三者文件名为 `epoch_11.pth`、`epoch_13.pth`、`epoch_15.pth`，逐轮评估
+约定输出为 `test_results/epoch_N_val_results.pkl`、`epoch_N_metrics.json` 和
+`epoch_N_test.log`。这些文件当前均未同步，不能做实体存在性、大小或 SHA256 核验；
+train/val PKL、预训练权重和缓存图也未同步，均明确列为待内网补录。
+
+| 指标 | S0 e13 | GEOM1-A e11 | 差值 |
+| --- | ---: | ---: | ---: |
+| mAP | 0.356425 | 0.381993 | +0.025568 |
+| BEV mAP@0.5 | 0.3773 | 0.4016 | +0.0243 |
+| mATE@2m | 0.8588m | 0.8615m | +0.0027m |
+| mAOE@2m | 4.0545° | 4.6376° | +0.5831° |
+| mASE@2m | 0.2132 | 0.2113 | -0.0019 |
+
+GEOM e11 相对 S0 e13 的 40～60/60～80m Recall@2m：
+
+- car：`0.8313/0.7864 -> 0.8738/0.8178`，提升 `+0.0425/+0.0314`；
+- truck：`0.6498/0.6435 -> 0.7029/0.7112`，提升 `+0.0531/+0.0677`。
+
+方向误差没有同步改善：car AOE `3.0892° -> 3.5533°`，truck
+`5.0199° -> 5.7219°`。因此 GEOM1-A 证明等比 resize+center crop 对检测和
+中远距召回有效，但不能解释为 yaw 已解决。e11 冻结为下一轮候选基线；e13 的
+overall AOE=`4.4920°`、mASE=`0.2045` 为 GEOM 内最优，保留为方向/尺度
+challenger；e15 为 terminal。e15 没有刷新，不设计 EXT5。
+
+e11 作为后续微调起点的依据是预先声明的 canonical mAP 主键在 e1～15 中最高，
+同时相对 S0 e13 提升总体 mAP、BEV@0.5 和 car/truck 中远距 Recall。e13 仅在
+GEOM 内 AOE/ASE 更优，生产转弯场景未显示相对 e11 的明确 yaw 收益；e15 只是完整
+schedule 的终点。因此选 e11 不代表方向问题已经解决，后续应由真实城区路口和倾斜
+环道 GT 覆盖来补齐数据分布。
+
 ## 18. 当前下一步
+
+GEOM1-A 的门禁、15 epoch 训练和逐 epoch val 均已完成。当前阶段转为冻结资产、
+生产/yaw 分桶回归及后续真实数据微调设计。
 
 ### P0：立即执行
 
-1. EXP-6V-B0 已闭环：e6 canonical best、e2 中远距 challenger、e16 terminal；e17 及以后不再评估或训练；
-2. 先修复 `force_resize` 并完成确定性基础变换、随机增强开关和关闭增强时的等价性回归；
-3. 用户确认 6V PTH/pkl 已在内网保存、clip 起始/末尾不齐的门禁失败项已接受放行；建议补内网资产 manifest/hash，但不再阻塞本轮结论；
-4. 增加独立 test，并继续真实芯片 tensor dump、实际板端 runtime 和真实 INT8 数值验收。
+1. 冻结 e11/e13/e15 三个角色并补 PTH/result/config/data/calibration SHA256；
+2. 对 S0 e13、GEOM e11/e13 跑同一有 GT 生产回归，覆盖转弯、非共线 yaw、
+   40～80m 和倾斜弯道；
+3. 新增 yaw 分桶评估和 180°翻转率；现有 mAOE 只覆盖匹配 TP 且受高快共线分布
+   主导，不能直接解释生产斜向车辆；
+4. 对“x 方向一个车身偏差”增加更宽匹配阈值/未匹配统计；当前 x MAE 只统计
+   center distance<=2m 的 TP，会排除大误差样本；
+5. 不做 EXT5，不清理门禁、日志、评估或 checkpoint 证据。
 
-### P1：首轮对比期间并行
+### P1：下一轮数据准备
 
-1. 生成 B0 epoch5 与 S0 epoch13 的同 sequence 可视化；
-2. 建立横向约 90°、转弯和 40～80m 目标生产回归集；
-3. dataset/production e13 PTH 代码路径对齐已完成；下一步用同步 lidar/image 独立验证生产车型物理标定；
-4. 核查旧 pkl `labels_without_frame=851/90` 和空 GT 丢弃，重生或书面接受后形成正式门禁结论；
-5. 统计并修复 distortion visibility 差异；
-6. 拆分 `force_resize` 基础变换/随机增强，先完成关闭增强的等价性回归。
+1. `DATA1-CITY-YAW`：筛选城区路口/转弯 N7 真实 GT，统计 scene/frame/instance、
+   yaw/距离/类别分布并按 scene 防泄漏；
+2. `DATA3-BANKED-RING`：准备倾斜环道 N7 真实 GT，先核对标定、地面姿态和
+   yaw-only box 口径；两类真实数据可并行准备并保留来源标签；
+3. `DATA2-ENDURANCE-PSEUDO`：准备试车场耐久路 BEVFusion 伪标注，但后置于真实
+   GT；冻结 teacher/hash/阈值并人工抽检，验证集保持纯真实 GT；
+4. 用同步 lidar/image 独立验证生产车型物理标定，并继续 distortion visibility；
+5. 继续真实芯片 tensor dump、实际板端 runtime 和真实 INT8 数值验收。
 
-### P2：S0 可信后单变量 A/B
+### P2：GEOM1-A 后单变量 A/B
 
-1. stretch vs 等比 resize/crop vs 更高输入；
-2. 图像增强；
-3. CBGS/class-aware sampling；
-4. anchors；
-5. NMS/score calibration；
-6. temporal B0 warm-start 或蒸馏；
-7. LR/schedule/epoch。
+1. 优先从 GEOM e11 做真实 yaw/弯道数据微调；算力有限时可在质量审计后合并
+   DATA1+DATA3，但不能同时混入 AUG1 或伪标注；
+2. 在真实数据 winner 或 GEOM e11 上独立做 AUG1；
+3. 再评估 DATA2 伪标注生产域微调；
+4. 其后才考虑更高输入、CBGS、anchor、NMS、蒸馏和 LR/schedule。
 
 ### P3：低优先级 6V 重训
 
 1. 当前不重开 EXP-6V-B0；该基线继续冻结为 e6/e2/e16；
-2. 仅在 `force_resize` 修复和等价性回归完成后，以新实验 ID/work_dir 重训一次 6V；
+2. `force_resize` 修复和等价性回归前置条件已满足，但没有新的排期或算力授权时仍不启动；
 3. 第一轮保持原 `8e-4`、数据、seed、schedule、ROI/voxel/anchor 不变，只验证 `force_resize` 修复；
 4. 若修复后仍出现 e5～e7 达峰并持续退化，再做独立 `4e-4` challenger；该项不阻塞 P0/P1。
 
@@ -1528,6 +1717,11 @@ next_action:
 - S0：用户确认 15 epoch 完成，最终 best=e13，canonical mAP=0.356425、BEV@0.5=0.3773；精确最终资产 hash 待补录；
 - S0 vs B0：同口径 mono 内部为 S0 小幅领先；6V 与 mono 的相机、ROI、GT 过滤和 eval 集合不同，禁止直接用 mAP 数值宣称 6V 升降；
 - 数据门禁：用户确认 EXP-6V-B0 的失败项来自六目 clip 起始/末尾不齐，并批准 `PASS_WITH_ACCEPTED_CLIP_BOUNDARY_EXCEPTION`；本地未同步报告，本轮仍只有 val、无独立 test 结果；
-- 收敛/LR：6V 与 S0 都有 loss/验证指标解耦，但 6V 是 e6 后持续明显退化，S0 是平台后仍在 e13 刷新；先修 `force_resize` 并用原 `8e-4` 做控制，仅在退化复现时 A/B `4e-4`；
-- Git：GitHub B0/S0 代码基线为 `2d8ab7d`、`c3ec682`，用户确认内网对应提交已推送；
-- 正确的下一步：保持当前 6V 结论冻结；`force_resize` 修复后的 6V 重训作为 P3 低优先级、可归因的单变量实验保留，无排期时不主动启动。独立 test 和真实板卡/INT8 验收优先推进。
+- `force_resize`：两阶段重构、8 场景 fixture、完整 50 项测试和真实 epoch13 T7 已通过；commit `134d5f3` 已推送；
+- 收敛/LR：6V 与 S0 都有 loss/验证指标解耦，但 6V 是 e6 后持续明显退化，S0 是平台后仍在 e13 刷新；若未来启动 EXP-6V-B1，先用原 `8e-4` 控制，仅在退化复现时 A/B `4e-4`；
+- Git：当前主分支基线为 `134d5f3124e0d11f40dbcbade9e5bfe07c28ff96`；历史 B0/S0 代码基线为 `2d8ab7d`、`c3ec682`；
+- GEOM1-A：15 epoch 和逐 epoch val 已完成；e11 canonical mAP=0.381993、
+  BEV=0.4016，中远距 Recall 明显提升；mAOE 比 S0 e13 差 0.5831°，yaw 未解决；
+- 当前主任务：冻结 GEOM e11/e13/e15 资产，建立 yaw/生产回归，并优先准备
+  `DATA1-CITY-YAW` 与 `DATA3-BANKED-RING` 真实 GT；AUG1 独立后续，BEVFusion
+  耐久路伪标注再后置。独立 test、物理标定和真实板卡/INT8 继续并行。

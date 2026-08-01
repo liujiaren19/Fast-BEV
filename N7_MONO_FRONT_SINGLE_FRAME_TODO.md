@@ -1,6 +1,6 @@
 # Fast-BEV N7 单目前视单帧产品化代办清单
 
-> 更新时间：2026-07-23
+> 更新时间：2026-07-29
 > 当前仓库：`/workspace/Fast-BEV_test_custom-fastbev-adapter`
 > 当前产品决策：板端近期使用原生单帧单目推理；六轴 IMU + 轮速 pose 尚在开发，四时序模型保留为离线上限和未来候选，不作为当前产品主路径。
 
@@ -52,14 +52,13 @@ S0 = cam0 + n_images=1 + n_times=1 + 无历史 pose
    - best epoch 后连续 5 个 epoch 未刷新 best 即停止；
    - 本轮只比较“真实四时序”和“原生单帧”，不混入数据/分辨率/anchor 调优。
 3. 对比实验期间并行完善 eval 可视化，重点检查四时序 epoch5 的角度和中远距效果。
-4. 对比实验后、正式产品单帧训练前完成四个正确性收口项：
-   - pkl 训练前数据门禁；
-   - 生产推理与标准 dataset 路径逐级对齐；
-   - distortion-aware GT 可见性统一，修复当前模型畸变投影与 train/eval pinhole 过滤不一致。
-   - 拆分 `force_resize` 的确定性基础变换与随机图像增强，先做关闭随机增强的等价重构验证。
-5. 上述正确性问题收口后，再启动正式单帧训练和后续单变量能力优化。
+4. 首轮对比后的四个正确性收口项中，生产推理/dataset 代码路径对齐和
+   `force_resize` 等价重构已经完成；旧 pkl 的最终 PASS 与
+   distortion-aware GT 可见性仍未完成。
+5. S0 首轮训练和 PC 浮点部署参考已经完成。当前进入单变量能力优化，第一项为
+   1600×900 原生缓存上的 GEOM1-A 输入几何实验。
 
-### 1.4 2026-07-23 当前同步与验证状态
+### 1.4 2026-07-31 当前同步与验证状态
 
 - [x] 当前仓库代码与内网代码已由用户确认同步一致；Markdown、Claude/Codex 本地辅助文件未同步到内网。
 - [x] S0 已完成 15 epoch；最终 canonical best 为 epoch13：mAP=`0.356425`、BEV@0.5=`0.3773`、mATE=`0.8588m`、mAOE=`4.0545°`、mASE=`0.2132`。
@@ -71,6 +70,26 @@ S0 = cam0 + n_images=1 + n_times=1 + 无历史 pose
 - [x] 已对现有 B0 train/val pkl 运行严格门禁：token/clip 零重叠，cam0、图片/K/畸变、GT 分布和 pose 可审计。
 - [ ] 现有 B0 pkl 门禁仍为 `FAIL`：旧 converter 统计中 train/val 分别有 `labels_without_frame=851/90`，且尚无独立 test pkl；应保留报告并在重新转换或风险确认后关闭该项。该 FAIL 是数据问题被正常检出，不是门禁脚本异常崩溃。
 - [x] EXP-6V-B0 已收口：canonical best=e6、40～60m Recall challenger=e2、terminal=e16；e17 及以后不再纳入本轮选型。
+- [x] `force_resize` 两阶段重构、8 场景 legacy fixture、本地 50 项测试和内网
+  epoch13 T7 已完成；input、2D feature、BEV input、raw logits、decoded boxes
+  在 `atol=0, rtol=0` 下 bit-exact。代码已提交并推送为 `134d5f3`。
+- [x] EXP-MONO-GEOM1-A 原生 1600×900 PKL 已按旧 manifest 生成，
+  新旧 migration 对比 PASS，全量图片/几何检查完成；原始 strict data gate 因旧
+  clip 边界的 train/val `851/90` 个标签无图继续保留 FAIL，实验级按
+  `PASS_WITH_ACCEPTED_CLIP_BOUNDARY_EXCEPTION` 放行。
+- [x] F4 全量统计完成：中心裁剪 train/val 分别有 101/10 个 eval-only GT，
+  合计 111/1,043,946（0.01063%），全部在 0～20m 近场且无侧向 yaw 聚集；原始
+  `F4_REVIEW_REQUIRED` 保留，实验级按
+  `PASS_WITH_ACCEPTED_NEAR_FIELD_CROP_EXCEPTION` 放行。
+- [x] 真实 RandomAug pipeline train/val 可视化、focused 10/10、完整
+  `tools/tests` 62/62 以及单卡 20GB 环境的 S0/GEOM1-A 50 iter
+  forward/backward benchmark 已通过。
+- [x] 4×L20、每卡 64、dynamic FP16、15 epoch 正式训练和逐 epoch val 已完成。
+  canonical best=e11：mAP=`0.381993`、BEV@0.5=`0.4016`、mATE=`0.8615m`、
+  mAOE=`4.6376°`、mASE=`0.2113`；e13 保留为本轮方向/尺度 challenger，e15
+  为 terminal。相对 S0 e13，mAP/BEV 和中远距 Recall 明显提升，但整体及分类
+  AOE 变差，GEOM1-A 不能作为 yaw 问题已经解决的证据。
+- [-] 当前主任务转为 GEOM1-A 生产回归与后续真实 yaw/弯道数据优化准备。
 - [-] `force_resize` 修复后重训一次 6V 基线已登记为 P3 低优先级待办；当前不启动，也不阻塞单帧产品、板端或其他 P0/P1 工作。
 
 ## 2. P0：正式单帧基线和板端闭环前必须完成
@@ -154,30 +173,46 @@ S0 = cam0 + n_images=1 + n_times=1 + 无历史 pose
 - [x] 已输出 car/truck 数量和 `x/y/z/l/w/h/yaw` 分布。
 - [x] S0 不依赖 pose；门禁仍保留 key/history pose、offset 和 history shortage 审计供未来时序恢复使用。
 - [ ] 处理或书面接受旧 pkl 的 `labels_without_frame=851/90`，补独立 test 后重新运行 `--strict-data`，归档最终 PASS 报告。
+- [x] GEOM1-A 原生 1600×900 train/val PKL 已复用旧 704×256 manifest；
+  train/val 为 200,874/24,909 infos、364/45 clips、3,086,700/300,701 GT，
+  token/clip 零重叠，全部为 cam0 和 1600×900 图片/K metadata。
+- [x] GEOM1-A 新旧 PKL migration 对比为
+  `N7_PKL_MIGRATION_COMPARE=PASS failures=0`；token、GT、timestamp、K、
+  distortion、extrinsic 和 split 保持一致。
+- [x] GEOM1-A 全量 225,783 张图片均存在，JPEG header 尺寸和解码错误为 0；
+  train/val 各 200 个 geometry sample 的最大误差为 0。
+- [x] GEOM1-A 对已知 clip 边界缺帧形成书面实验例外，但不篡改原始严格报告；
+  当前仍是 `test=val`，没有虚构独立 test。
 
 验收：数据审计报告无 split 泄漏、相机/尺寸契约错误；发现严重问题时先修数据再启动长训练。
 
 ### 2.6 生产推理与标准 dataset 路径逐级对齐
 
-- [ ] 从 val 选同一张图，分别走 `tools/test.py` 和生产推理脚本。
-- [ ] 对比原图路径、resize/normalize 后 tensor、RGB/BGR、dtype 和 layout。
-- [ ] 对比 K、`intrinsic_width/height`、实际图片尺寸、distortion、extrinsic、`post_rot/post_tran`。
-- [ ] 对比 2D feature、BEV feature、raw cls/bbox/dir logits 和 decoded boxes。
-- [ ] 明确生产输出 yaw 使用顶部主 lidar 坐标，不误当相机 yaw 或后轴 ego yaw。
+- [x] 从 val 选同一张图，分别走标准 dataset 和生产推理样本构造路径；黄金样本及 5 个固定样本均 PASS。
+- [x] 对比原图路径、resize/normalize 后 tensor、RGB/BGR、dtype 和 layout。
+- [x] 对比 K、`intrinsic_width/height`、实际图片尺寸、distortion、extrinsic、`post_rot/post_tran`。
+- [x] 对比 2D feature、BEV feature、raw cls/bbox/dir logits 和 decoded boxes。
+- [x] 明确生产输出 yaw 使用顶部主 lidar 坐标，不误当相机 yaw 或后轴 ego yaw。
 - [ ] 每车型做 lidar 点/地面网格/已知 3D 框投影检查，重点看左右边缘和 20～40m。
-- [ ] 为生产样本保存推理 metadata，禁止只保留渲染图而无法追溯标定和预处理。
+- [x] 当前固定样本输出已保存推理 metadata、资产关系和逐级比较报告；后续正式生产回归集仍需版本化归档。
 
 验收：相同 val 图两条 PTH 路径在浮点容差内一致；否则不得用重新训练掩盖推理链路问题。
 
 ### 2.7 修复 force_resize 强制关闭图像增强
 
-- [ ] 保持当前首轮 S0/B0 A/B 不变：两边继续使用相同的 `force_resize=True`，避免引入第二个实验变量。
-- [ ] 把“native K/尺寸到 704×256 的确定性基础变换”和“训练随机 resize/crop/flip/rotate”拆成两个显式阶段。
-- [ ] 第一阶段关闭随机增强，对同一输入逐项对比当前实现与重构实现的图像、`post_rot/post_tran`、投影矩阵和模型 logits；必须在约定容差内一致。
-- [ ] 不直接把 `force_resize` 改成 `False`：704×256 缓存图与 `intrinsic_width/height` 对应的 native K 尺寸不同，必须保证 K/post transform 只缩放一次。
+- [x] 保持首轮 S0/B0 A/B 不变：两边使用相同的 `force_resize=True`，没有把重构混入已冻结基线。
+- [x] 把“native K/尺寸到 704×256 的确定性基础变换”和“训练随机 resize/crop/flip/rotate”拆成两个显式阶段。
+- [x] 第一阶段关闭随机增强，已逐项验证图像、`post_rot/post_tran`、投影矩阵、input、2D/BEV feature、raw logits 和 decoded boxes bit-exact。
+- [x] 704×256 旧缓存继续使用 `force_resize=True`，没有错误改成 `False`；K/post transform 仍只缩放一次。
 - [ ] 单帧路径验证通过后，再为随机增强增加独立 config 开关和单变量 A/B，不能和数据门禁、畸变可见性或输入分辨率一起改。
-- [ ] 四时序未来重新启用随机几何增强时，同一相机的四帧必须共享同一组参数；不能逐图片独立采样导致时序几何不一致。
-- [ ] 增加无随机增强、固定随机种子、边界 crop/flip/rotate 的几何回归测试。
+- [x] `force_resize=True` 四时序分支已按 camera slot 共享增强参数，并覆盖 1×4/6×4 回归。
+- [ ] 未来 1600×900 使用 `force_resize=False` 且恢复时序随机增强前，仍需明确实现或拒绝跨时间共享；当前普通路径为保持上游兼容而逐帧采样。
+- [x] 已增加无随机增强、固定随机种子、边界 crop/flip/rotate、view-layout 冲突和 LUT 几何回归测试。
+
+收口证据：提交 `134d5f3124e0d11f40dbcbade9e5bfe07c28ff96`；本地完整
+suite `Ran 50 tests, OK`；内网 epoch13 T7 的 pre/post 全链路在
+`atol=0, rtol=0` 下通过。F7 的丢弃式 RNG 调用继续保留，删除它会改变跨样本
+训练随机序列，不属于本轮 GEOM1-A。
 
 验收：关闭随机增强时重构前后输入和投影等价；开启增强时图像变换与投影严格同步，且 S0/B0 各自通过独立 A/B 后才进入默认训练配置。
 
@@ -186,7 +221,8 @@ S0 = cam0 + n_images=1 + n_times=1 + 无历史 pose
 ### 3.1 单帧 smoke validation
 
 - [x] legacy MMDetection 内网环境已成功构建并长时间训练 S0，证明 config/model/train 主链可运行。
-- [ ] train dataloader shape 检查通过。
+- [x] GEOM1-A 已通过真实 legacy dataloader、10 warmup + 50 iter
+  forward/backward/optimizer benchmark；训练 tensor 保持 704×256 输出契约。
 - [x] S0 已完成 epoch1～15，loss 可正常反向传播和保存 checkpoint；最终 canonical best=e13。
 - [x] epoch13 已完成生产图片 PTH 推理、可视化和标准 dataset/production 同图逐级对齐。
 - [x] 原生 `n_times=1` config 下 PTH 单图生产脚本只创建当前帧，不再重复四份输入。
@@ -299,23 +335,52 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 
 ### 5.1 输入几何和中远距能力
 
-- [ ] A：当前 704×256 非等比 stretch，作为 S0。
-- [ ] B：1600×900 等比缩放到约 704×396，再裁剪到 704×256。
+- [x] A：当前 704×256 非等比 stretch 已由 EXP-MONO-S0 e13 冻结为参考。
+- [x] B：EXP-MONO-GEOM1-A；使用一套原生 1600×900 PKL，在线等比缩放到
+  704×396，再按 `(0,70,704,326)` 中心裁剪到 704×256。migration/data/
+  geometry/F4/真实 pipeline/50 iter 门禁、4×L20 15 epoch 训练和逐 epoch val
+  均已完成；e11 canonical mAP=`0.381993`，成为下一轮微调候选基线。
+- [-] GEOM1-A 的配置、训练日志和 eval 汇总已在本地核验并记录 SHA256；e11/e13/e15
+  PTH、逐轮 result/metrics、train/val PKL、预训练权重和标定实体未同步，仍需内网
+  资产清单补录，不能用日志 hash 代替。
 - [ ] C：芯片允许时测试 704×384 或其他接近 16:9 的输入。
-- [ ] 根据真实 GT 投影统计选择 vertical crop offset，不默认中心裁剪。
-- [ ] 统计 20～40m、40～60m目标的原图/输入图像素宽高和 stride-4 feature 尺寸。
-- [ ] 比较总体、远距 car/truck AP/recall、吞吐、显存和板端延迟。
-- [ ] 所有基础 resize/crop 只通过一次 K/post transform 生效。
+- [x] 已用全量 keep mask 和抽样像素指标比较 direct stretch、中心裁剪及多个
+  vertical crop offset；top=140 虽少 56 个差异目标，但破坏中心主点契约，保留 top=70。
+- [x] 已按 car/truck、距离和 yaw 输出原图/输入/stride-4 尺寸、裁边、边缘余量与
+  train/eval keep-mask 统计；中心裁剪没有 20～80m GT 损失。
+- [x] 已比较总体和距离段：相对 S0 e13，GEOM e11 的 mAP `+0.025568`、
+  BEV@0.5 `+0.0243`；car 40～60/60～80m Recall@2m 提升
+  `+0.0425/+0.0314`，truck 提升 `+0.0531/+0.0677`。单机吞吐门禁已记录；
+  板端延迟仍待真实芯片验证。
+- [x] 所有基础 resize/crop 只通过一次 post transform 生效；回归确认
+  `post_rot=diag(0.44,0.44)`、`post_tran=[0,-70,0]` 及 lidar2img 同步。
 
 ### 5.2 图像增强和域泛化
 
-- [ ] 按 2.7 的等价性门禁，把确定性基础 resize/crop 与训练随机增强拆分。
-- [ ] 单帧先测试轻量 photometric/resize/crop/flip 增强。
+- [x] 按 2.7 的等价性门禁，把确定性基础 resize/crop 与训练随机增强拆分；旧 704×256 baseline 等价性已闭环。
+- [ ] `EXP-MONO-AUG1`：在 GEOM1-A e11 或后续真实数据 winner 上单独恢复轻量
+  photometric/resize/crop/flip 图像增强；保持数据、输入几何、初始化、optimizer
+  和 schedule 不变，验证总体泛化及非 0/180° yaw 收益，不能预设它一定改善 yaw。
 - [ ] 未来恢复时序时，四帧必须共享同一组几何增强参数。
 - [ ] 增加生产车型、日期、光照、天气和相机成像差异相关增强。
 - [ ] 检查增强对远处小目标是否有负面裁剪。
 
-### 5.3 yaw/方向专项诊断
+### 5.3 yaw/方向专项诊断与数据优化
+
+- [ ] 先补 yaw 分桶评估：按“到 0°/180° 最近角度”划分 aligned、mild、
+  oblique、lateral，并按类别/距离/场景统计 AP、Recall、AOE 和 180°翻转率；
+  当前 overall AOE 主要由高快共线分布主导，不能代表城区路口生产问题。
+- [ ] `DATA1-CITY-YAW`：筛选 N7 城区路口/转弯中 yaw 明显偏离 0°/180° 的
+  真实 GT；先统计 scene/frame/instance、car/truck、距离和 yaw 覆盖，再决定数据量，
+  按 scene 切分以避免相邻帧跨 train/val 泄漏。
+- [ ] `DATA2-ENDURANCE-PSEUDO`：加入试车场耐久路生产车数据，使用 BEVFusion
+  生成伪标注。固定 teacher checkpoint/config/hash、阈值、坐标系和过滤规则，
+  抽样人工质检并控制采样权重；验证集必须保持纯真实 GT。
+- [ ] `DATA3-BANKED-RING`：加入倾斜环道 N7 真实 GT，覆盖坡度/横坡、弯道曲率、
+  yaw、距离和类别；训练前先验证标定、地面姿态和 yaw-only box 坐标口径。
+- [ ] DATA1/DATA3 可并行准备并保留来源标签；首轮优先真实 GT，伪标注 DATA2
+  后置。若算力有限，可在完成质量审计后合并两类真实 GT 做一次产品导向微调，
+  但不得同时混入 AUG1 或伪标注。
 
 - [ ] 先排除生产标定、坐标系和可视化 heading 解释问题。
 - [ ] 分类别、距离、车辆和图像区域统计 yaw signed/absolute error。
@@ -411,7 +476,8 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 ### 7.1 低优先级：`force_resize` 修复后重训 6V 基线
 
 - [-] 当前 EXP-6V-B0 保持冻结，不补评 e17、不继续 e18～20；保留 e6/e2/e16 三个正式角色。
-- [ ] 只有在 2.7 的 `force_resize` 拆分、关闭增强等价性和四时序共享增强参数回归全部通过后，才创建新的 6V 实验；暂定新实验 ID 为 `EXP-6V-B1`，必须使用新 work_dir，不覆盖 B0。
+- [x] 2.7 的 `force_resize` 拆分、关闭增强等价性和 force-resize 四时序共享回归已经通过。
+- [ ] 只有获得新的排期/算力授权时才创建 `EXP-6V-B1`，必须使用新 work_dir，不覆盖 B0。
 - [ ] 第一轮只改变 `force_resize` 修复，保持 20260717 数据、6 camera × 4 times、ROI/voxel/anchor、AdamW2、`lr=8e-4`、seed 和 schedule 不变。
 - [ ] 从 epoch1 开始逐 epoch val，主键仍为 canonical center-distance mAP；同时监控 BEV、40～60m Recall、预测数和 score 分布，patience=5。
 - [ ] 若修复后的 `8e-4` 仍复现 e5～e7 达峰后持续退化，再单独建立 `4e-4` challenger；不在同一轮同时改变输入分辨率、数据、anchor、CBGS、NMS 或 loss。
@@ -442,8 +508,10 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 
 ### M3：单变量能力优化
 
-- [ ] 输入几何/分辨率。
-- [ ] 图像增强。
+- [x] 输入几何/分辨率：GEOM1-A 完成，e11 为 canonical best；中远距提升、
+  yaw 未解决。
+- [-] 真实 yaw/弯道数据准备与生产回归。
+- [ ] 图像增强：在真实数据候选或 GEOM e11 上独立执行 AUG1。
 - [ ] CBGS、anchor、NMS。
 - [ ] warm-start/蒸馏。
 
@@ -461,3 +529,7 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 - [ ] 不在 production pipeline/标定未对齐前，用重新训练解释角度偏差。
 - [ ] 不在 z 语义未确认前调整 anchor z 或评价垂直定位精度。
 - [ ] 不在数据分布统计前盲目修改 FreeAnchor/focal/loss 权重。
+- [ ] 不在当前 4×L20 上并行启动第二个训练，避免 GPU/NCCL/JPEG worker/存储争用。
+- [ ] 不因显存有余量在正式 run 中途修改每卡 batch64 或关闭 dynamic FP16。
+- [ ] 不把当前 15 epoch 原地改成 20；若 e15 仍刷新，另建 EXT5 并明确新 LR schedule。
+- [ ] 不在 GEOM1-A 结论前混入强制拉伸+AUG1；负向/歧义时才建无图像随机增强的 online-stretch control。

@@ -4,10 +4,11 @@ Compressed state for new Codex sessions. Read with `AGENTS.md`; do not load raw 
 
 ## Snapshot
 
-- Date: 2026-07-23
+- Date: 2026-07-31
 - Root: `/workspace/Fast-BEV_test_custom-fastbev-adapter`
-- Branch: `feature/n7-mono-front-from-6v-baseline`
-- Main workstream: N7 Fast-BEV 6V→单目前视四时序 B0→原生单帧 S0 的训练、评估和板端闭环。
+- Branch: `feature/n7-mono-s0-optimization-v1`
+- HEAD: `134d5f3124e0d11f40dbcbade9e5bfe07c28ff96`，已与 `origin/feature/n7-mono-s0-optimization-v1` 同步。
+- Main workstream: N7 Fast-BEV 6V→单目前视四时序 B0→原生单帧 S0→1600×900 GEOM1-A 的训练、评估和板端闭环。
 - Current product decision: 板端近期使用原生单帧；四时序 B0 保留为 pose-aware 离线对照/教师候选，不把重复当前帧作为最终产品方案。
 - Local container: RTX 5070 Ti, CUDA 12.8, `torch 2.7.1+cu128`.
 - Legacy training/model validation should run on the latest AutoDL/Seeta environment after path verification.
@@ -18,6 +19,23 @@ Compressed state for new Codex sessions. Read with `AGENTS.md`; do not load raw 
 ## Current Task State
 
 - Canonical experiment notes: `N7_FASTBEV_EXPERIMENT_SUMMARY.md` for the short view, `N7_FASTBEV_EXPERIMENT_DETAILS.md` for evidence, and `N7_MONO_FRONT_SINGLE_FRAME_TODO.md` for priorities.
+- `force_resize` closeout is complete. Commit `134d5f3` contains the two-stage
+  geometry/augmentation contract, legacy fixture and tests; the internal
+  epoch13 T7 pre/post comparison passed bit-exact for input, 2D feature, BEV
+  input, raw logits and decoded boxes at `atol=0, rtol=0`.
+- EXP-MONO-GEOM1-A migration/gates, 4×L20 15-epoch training and all epoch
+  evaluations are complete. Canonical best is epoch11: mAP `0.381993`,
+  BEV@0.5 `0.4016`, mATE `0.8615m`, mAOE `4.6376°`, mASE `0.2113`.
+  Relative to S0 e13, mAP/BEV and medium/far Recall improve materially, while
+  overall and per-class AOE regress. Keep e11 as the next fine-tune candidate,
+  e13 as the GEOM orientation/scale challenger and e15 as terminal; do not run
+  EXT5. S0 e13 remains the production fallback until targeted regression.
+- Next model-optimization task is real-GT yaw/curve coverage. Prepare N7 city
+  intersection/turning data (`DATA1-CITY-YAW`) and N7 banked-ring data
+  (`DATA3-BANKED-RING`) with source/yaw/range tags. Run image augmentation
+  (`AUG1`) separately after selecting the data winner. Proving-ground
+  endurance-road BEVFusion labels (`DATA2-ENDURANCE-PSEUDO`) are lower-trust
+  pseudo labels and remain behind real-GT work.
 - EXP-6V-B0 is the final full 6V four-temporal val baseline and must remain separate from the old trainability-only EXP-6V-00. The synchronized log proves epoch1～17 complete/save, while `eval_summary.md` covers epoch1～16. The user excludes epoch17 and later from formal selection, so the final roles are epoch6 canonical best (`mAP=0.453768`, BEV@0.5=`0.4787`), epoch2 40～60m Recall challenger and epoch16 terminal.
 - EXP-6V-B0 missed its epoch6 best for 10 evaluated epochs (epoch7～16), satisfying patience=5. The run is closed: do not evaluate epoch17 for selection and do not run epoch18～20. Any post-`force_resize` rerun is a separate P3 low-priority experiment, not a reopening of B0.
 - Only the training log and `eval_summary.md` are synchronized locally. The user confirms PTH/pkl assets are preserved internally; their local size/SHA256 remain unavailable but are not a blocker for the finalized decision. The user also confirms the 20260717 6V gate failure is caused by incomplete clip start/end boundaries and accepts that exception (`PASS_WITH_ACCEPTED_CLIP_BOUNDARY_EXCEPTION`). Resolved test still reuses val, so this remains a val baseline rather than independent test.
@@ -30,8 +48,13 @@ Compressed state for new Codex sessions. Read with `AGENTS.md`; do not load raw 
 - Historical no-GT production visualization already favored native single-frame over B0 repeated-current-frame inference. S0 e13 has since passed dataset/production PTH alignment on the N7 golden sample and five fixed samples; Torch-CUDA fixed LUT, FP ONNX functional-chain comparison and the independent CPU board-reference path are complete on PC, with 38 focused regressions passing. Real chip/runtime/INT8 and independent physical-calibration validation remain open.
 - Existing B0 pkl gate is a deliberate `FAIL`, not a crash: train/val token and clip overlap are zero, but legacy converter stats contain `labels_without_frame=851/90`; train also dropped 1237 empty-GT labels, and there is no independent test pkl.
 - Box-origin publicization and re-evaluation are complete for canonical dataset eval/visualization/production JSON+pkl; the vendor fixed-6V `tools/utils.py` path is still not canonical mono postprocess. Exact corrected z metrics/result hash still need archival.
-- GitHub code baseline commits are `2d8ab7d9855f787d55da8521b1993c445351037d` and `c3ec682e78e273fa6142e13825f0cde4857d7883`; documentation commit is `8551924be50aa0eb4f88454a36c2ea396955d6af`. Local branch matches origin. The user confirmed matching code changes were committed/pushed internally, but internal SHAs were not provided.
-- Low-priority model-training backlog: after `force_resize` is fixed and regression-tested, create a new 6V experiment/work_dir and rerun the original `8e-4` as a single-variable control. Test `4e-4` only if the post-e5～e7 decline repeats. This does not reopen EXP-6V-B0 and does not block current mono/product, independent-test or real chip/runtime/INT8 work.
+- GitHub code baseline commits are `2d8ab7d9855f787d55da8521b1993c445351037d`, `c3ec682e78e273fa6142e13825f0cde4857d7883` and current `134d5f3124e0d11f40dbcbade9e5bfe07c28ff96`; the current branch matches origin.
+- Low-priority model-training backlog: the `force_resize` prerequisite for
+  EXP-6V-B1 is now satisfied, but the rerun remains P3. If explicitly
+  scheduled, create a new experiment/work_dir and rerun the original `8e-4`
+  as a single-variable control; test `4e-4` only if the post-e5～e7 decline
+  repeats. It does not reopen EXP-6V-B0 or outrank GEOM1-A, independent test,
+  physical calibration or real chip/runtime/INT8 work.
 
 ## Mono-Front Model-Side Status
 
@@ -62,16 +85,20 @@ Compressed state for new Codex sessions. Read with `AGENTS.md`; do not load raw 
 
 ## Current Worktree Scope
 
-This repository has pre-existing tracked and untracked changes from multiple workstreams. The final 2026-07-23 EXP-6V-B0 accuracy closeout edits only:
+This repository has pre-existing tracked and untracked changes from multiple workstreams. The 2026-07-29 documentation synchronization owns only:
 
 ```text
 CODEX_HANDOFF.md
 N7_FASTBEV_EXPERIMENT_DETAILS.md
 N7_FASTBEV_EXPERIMENT_SUMMARY.md
+N7_MONO_FRONT_SINGLE_FRAME_TODO.md
 ```
 
-- The 6V dist config and `N7_MONO_FRONT_SINGLE_FRAME_TODO.md` were already modified by another concurrent workstream and are preserved; this accuracy closeout does not own those changes.
-- No file was deleted and no commit was created by this accuracy closeout.
+- `AGENTS.md` already contains the user-requested session/terminal naming policy and is not part of this documentation synchronization.
+- The untracked GEOM1-A configs, diagnostics and tests documented below are
+  pre-existing output from a separate local-preparation workstream; this
+  documentation synchronization does not claim or stage them.
+- No source/config/test file was edited, no file was deleted, and no commit was created by this documentation synchronization.
 - Other modified/deleted source files and all untracked paths shown by `git status --short` are pre-existing or belong to other workstreams; do not revert, delete, stage or submit them without explicit scope confirmation.
 - `tools/utils.py` remains a chip-vendor legacy fixed-6V postprocess path, not the canonical mono board postprocess. `.claude/`, `CLAUDE.md`, and `scripts/` are local workflow aids.
 - Do not add generated `mmdet3d.egg-info/` or cache changes to commits.
@@ -79,11 +106,12 @@ N7_FASTBEV_EXPERIMENT_SUMMARY.md
 ## Suggested Next Action
 
 1. Keep EXP-6V-B0 frozen at epoch6 best, epoch2 challenger and epoch16 terminal; do not evaluate epoch17 for selection or run later epochs.
-2. Fix `force_resize` and prove deterministic-base-transform/no-augmentation equivalence for the active product pipeline.
-3. Keep the subsequent 6V rerun as P3 low priority: use a new experiment/work_dir and original `8e-4`; test `4e-4` only if the same degradation repeats. Do not schedule it ahead of active P0/P1 work.
-4. Add an independent test split. The accepted clip-boundary gate exception and internally preserved PTH/pkl assets no longer block the current baseline.
-5. Complete real chip tensor dumps, actual board runtime and real INT8 numerical validation against the independent CPU board reference.
-6. Independently validate production calibration and distortion-aware visibility before broader geometry/resolution, sampling, anchor, NMS, initialization or distillation experiments.
+2. Freeze GEOM e11/e13/e15 and archive checkpoint/result/config/data/calibration hashes; no EXT5.
+3. Compare S0 e13 and GEOM e11/e13 on a real-GT production set, add yaw-angle bins and unmatched/looser-match depth-error statistics.
+4. Prepare `DATA1-CITY-YAW` and `DATA3-BANKED-RING` in parallel; prioritize real GT and prevent scene leakage. A product-oriented combined real-GT fine-tune is acceptable after source-specific QA, but keep source tags and do not mix AUG1/pseudo labels in that first run.
+5. Run `AUG1` separately on the selected real-data winner or GEOM e11, measuring yaw bins, far recall and production slices.
+6. Evaluate `DATA2-ENDURANCE-PSEUDO` only after teacher/hash/threshold/manual-QA and sampling-weight contracts are frozen; validation/test stay real-GT.
+7. Independent test, final asset hashes, physical calibration and real chip/runtime/INT8 validation remain open parallel work. EXP-6V-B1 stays P3.
 
 ## Data-Cleaning Conversation Prompt
 
@@ -856,3 +884,510 @@ Append a short dated note here after major debugging, conversion, or validation 
   are deliberately not implemented here. They require new experiment IDs and
   work directories after the 704x256 T7 compatibility gate is closed. No
   commit or push was made.
+
+### 2026-07-28 GEOM1-A Local Preparation And Internal Test Boundary
+
+- Split-environment contract: This task intentionally uses the canonical local
+  mirror at `/workspace/Fast-BEV_test_custom-fastbev-adapter` for code
+  generation/review and the user's internal
+  `/root/Fast-BEV_test_custom-fastbev-adapter` repository for data/model
+  execution. The local mirror matches branch
+  `feature/n7-mono-s0-optimization-v1` and commit `134d5f3`; N7 data, legacy
+  `mmcv`/`mmdet` runtime, model assets and real outputs remain internal and are
+  not expected to be locally accessible. The user will synchronize the exact
+  task files, run the supplied gates internally and return reports/logs for
+  review. Until those reports arrive, no real PKL, data-gate, F4,
+  dataloader/model smoke, throughput or visualization result is claimed.
+- Config preparation: Added independent `EXP-MONO-GEOM1-A` base/dist configs
+  for native cam0 images. Both resolved train/test image transforms explicitly
+  use `force_resize=False`, `enable_random_aug=False`, `n_images=1`,
+  `n_times=1`, and 704x256 input. They re-declare the pipelines so config
+  inheritance cannot retain the parent's cached `data_config`. The resolved
+  geometry is exactly `1600x900 -> 704x396 -> crop(0,70,704,326)`,
+  `post_rot=diag(0.44,0.44)`, `post_tran=[0,-70,0]`; test remains explicitly
+  `test=val`. Model/ROI/voxel/anchor/classes, BEV augmentation, AdamW2
+  `lr=1e-4`, schedule, 15 epochs and COCO initialization remain equal to S0.
+  The isolated work dir is
+  `work_dirs/n7_mono_1600_900_scale_crop/EXP-MONO-GEOM1-A`.
+- Read-only gates/tooling: Added `compare_n7_pkl_migration.py` to hash PKL and
+  manifests and reject token order/set, clip, timestamp, GT, K, distortion,
+  extrinsic or any other non-image-path/size change. Added
+  `analyze_n7_scale_crop_geometry.py` to compare direct stretch, center crop
+  and multiple vertical offsets by car/truck, x-distance and yaw bins; it
+  reports input/stride-4 target size, clipped ratio, edge margins, and exact
+  train/eval keep-mask differences. Any ratio above its configured threshold
+  is marked `F4_REVIEW_REQUIRED`. Added
+  `visualize_n7_scale_crop_pipeline.py` to consume its deterministic far/edge/
+  nonzero-yaw/crop-dropped selection and render native images through the real
+  `RandomAugImageMultiViewImage`, not the qualitative LANCZOS comparison tool.
+  Added `tools/benchmark_n7_training.py` to run a real legacy runner for one
+  backward smoke iteration or warmup plus 50 measured iterations and archive
+  data/iteration time, throughput and CUDA peak memory without starting an
+  epoch-length or long training job.
+- Local evidence: The existing production transform implementation was not
+  modified. New regression coverage checks front_wide 1600x900 K, exact
+  resize/crop/post affine, transformed image, lidar2img marker synchronization,
+  train/test determinism, unconsumed NumPy RNG, LUT/test geometry and resolved
+  S0-equivalent config contract. Focused tests passed 9/9; complete
+  `tools/tests` discovery passed 59/59; targeted `py_compile`, all three new
+  CLI help commands and `git diff --check` passed. The two existing NumPy 2
+  warnings still come from tensor-to-NumPy assignments in `img_transform`.
+- Required continuation: After the user synchronizes the task files into the
+  internal `/root/...` repository containing `data/N7_1600_900`, copy/reuse the original
+  `data/N7_704_256` manifests without auto-discovery or partial mode, generate
+  only train/val PKLs, run strict data/geometry and migration gates, then run
+  the F4 statistics. If GEOM1-A loses any material eval GT under the train
+  crop, stop for an explicit F4 decision before model smoke or training. If F4
+  passes, run legacy dataloader/forward/backward, 50-iteration S0 comparison
+  and selected pipeline visualization. Do not launch the 15-epoch run without
+  a subsequent user confirmation. No commit or push was made.
+
+### 2026-07-28 `force_resize` Commit Confirmation And GEOM1-A Handoff
+
+- Commit correction: The preceding closeout entry describes the state before
+  approval. The user subsequently approved, committed and pushed the exact
+  11-file scope as `134d5f3124e0d11f40dbcbade9e5bfe07c28ff96`
+  (`修复 N7 force_resize 图像增强与几何同步`), with both author and
+  committer set to `liujiaren19 <1334282612@qq.com>`. The current local branch
+  and its origin both point to that commit.
+- Closed status: The 704x256 compatibility work is complete, including the
+  internal epoch13 T7 bit-exact result. Do not reopen its implementation or
+  delete the retained F7 RNG-consumption call as part of GEOM1-A. The latter
+  would alter cross-sample training RNG and requires a separately reviewed
+  change if ever desired.
+- Current active phase: The user reports that native 1600x900 cam0 images are
+  already downloaded internally. Local base/dist configs, three read-only
+  diagnostics and regression coverage are prepared but uncommitted; focused
+  tests passed 9/9 and complete discovery passed 59/59. No real 1600x900 PKL,
+  internal data/geometry/F4 gate report, legacy model smoke, 50-iteration
+  profile, checkpoint or training log has yet been supplied. Therefore the
+  project must describe GEOM1-A as locally prepared/internal execution pending,
+  not as an active training run.
+- Data contract: Generate one PKL set pointing to native 1600x900 images and
+  reuse the frozen train/val manifests. Direct stretch and aspect-preserving
+  scale-crop are online config choices, not separate PKLs or offline caches.
+  Compare tokens, GT, calibration and split assignment against the 704x256
+  baseline; expected differences are image paths, image width/height and
+  related metadata only. Keep all old 704x256/golden assets.
+- First experiment: Use S0 e13 as the existing stretch reference. Audit and
+  use the prepared `force_resize=False, enable_random_aug=False` candidate implementing
+  `1600x900 -> 704x396 -> vertical crop 704x256`. Before long training, pass
+  strict data/geometry gates, quantify crop offsets and train/eval GT
+  visibility, verify resolved train/test geometry, and measure dataloader/
+  50-iteration throughput. Use a new experiment ID/work_dir and keep ROI,
+  voxel, anchors, optimizer, LR, seed, schedule, initialization and split fixed.
+- Decision rule: Do not start a parallel full 1600-online-stretch run. If the
+  scale-crop result improves the required overall/range/production slices,
+  adopt it without that extra ablation; run the stretch control only if the
+  result is negative or ambiguous. Then address turning/lateral-yaw coverage
+  as DATA1 and image augmentation as AUG1 in separate experiments.
+- Parallel open gates: independent test, old-pkl `labels_without_frame`/empty
+  GT disposition, synchronized lidar/image physical calibration,
+  distortion-aware GT visibility, final asset hashes, board 4K preprocessing
+  specification and real chip/runtime/INT8 validation remain open. The 6V-B1
+  rerun is still P3 despite its force-resize prerequisite now being satisfied.
+- Documentation synchronization: Updated
+  `N7_FASTBEV_EXPERIMENT_SUMMARY.md`,
+  `N7_FASTBEV_EXPERIMENT_DETAILS.md`,
+  `N7_MONO_FRONT_SINGLE_FRAME_TODO.md` and this handoff to reflect the current
+  commit and task ordering. No source/config/test file was changed and no
+  commit or push was made by this documentation-only update.
+
+### 2026-07-28 GEOM1-A Standalone Run-Of-Record Config
+
+- Config flattening: Replaced the prepared six-level GEOM1-A inheritance chain
+  with one complete formal training config,
+  `configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18_n7_1600x900_scale_crop_dist_train.py`.
+  It has no `_base_` assignment and explicitly freezes the full model, N7
+  dataset/pipelines, GEOM1-A image contract, optimizer/LR schedule, 15-epoch
+  limit, COCO initialization, FP16/runtime, seed 0, experiment ID and isolated
+  work dir. The old S0/6V/paper configs and the committed `force_resize`
+  implementation were not modified.
+- Migration evidence: Before flattening, the nested resolved config was frozen
+  with full SHA256
+  `d1c6078bf4ade8954dcb722448732dc7bdb9be8a248f13b7482de6967995f9b4`.
+  Its 28 effective model/data/pipeline/optimizer/runtime fields have SHA256
+  `dcfd9882e1e8d2f75348d8d693d0bc411adbb7930e47be306da18b8c67d961d4`;
+  the standalone config produces the same effective SHA exactly. The unused
+  inherited `custom_dataset_common` orphan still pointed to `N7_704_256` and
+  was intentionally not copied; every active standalone dataset path points to
+  `N7_1600_900`.
+- Candidate cleanup: Removed the untracked intermediate
+  `custom_fastbev_mono_front_single_frame_r18_n7_1600x900_scale_crop.py`.
+  Internal synchronization must also delete that obsolete file if an earlier
+  preparation copy is present. Training, eval, LUT, visualization and smoke
+  commands should all use the standalone `...scale_crop_dist_train.py` file.
+- Regression update: `tools/tests/test_n7_scale_crop_geometry.py` now enforces
+  no `_base_` assignment, absence of the obsolete intermediate config and
+  stale 704x256 helper, exact effective resolved SHA equivalence, explicit
+  seed 0, and the existing deterministic geometry/LUT/data-path contract.
+- Local verification: Targeted `py_compile` passed; the focused GEOM1-A suite
+  passed 8/8; complete `tools/tests` discovery passed 60/60; tracked
+  `git diff --check` passed and task-untracked no-index whitespace checks were
+  clean. The two existing NumPy 2 `DeprecationWarning` messages remain in the
+  unchanged `img_transform` tensor-to-NumPy assignments.
+- Remaining boundary: No internal data/model operation was run by this local
+  flattening. PKL migration, strict data/geometry/F4 gates, legacy dataloader,
+  forward/backward, 50-iteration throughput and selected real visualization
+  still require the user's internal repository and assets. Do not start the
+  15-epoch GEOM1-A training before those results are reviewed and the user
+  explicitly confirms it.
+
+### 2026-07-28 GEOM1-A Final Cleanup Reminder
+
+- User-required terminal step: After the complete GEOM1-A data gates, smoke,
+  throughput, 15-epoch training, evaluation and conclusion archive are
+  finished, perform a dedicated cleanup audit before closing the task.
+- Cleanup candidates: Generated Python/test caches, synthetic fixtures that
+  are no longer regression evidence, one-off diagnostics, superseded test
+  helpers, temporary visualization selections/images, benchmark scratch
+  work_dirs and other reproducible intermediate data that have no continuing
+  product or audit value.
+- Mandatory preservation: Do not delete or overwrite the native 1600x900
+  source data, final train/val PKLs and manifests, strict gate/migration/F4
+  reports and hashes, resolved run-of-record config, selected visual evidence,
+  throughput summaries, training logs/checkpoints, S0 epoch13 golden, 9797 or
+  board evidence, or the old 704x256 baseline assets.
+- Safety rule: Classify every candidate as retain/archive/delete, show the
+  exact paths, sizes and recoverability to the user, and wait for explicit
+  deletion approval. Do not recursively clean a broad data/work_dirs root and
+  do not mix unrelated dirty/untracked files into this cleanup.
+
+### 2026-07-29 GEOM1-A Native-Image Data Gate
+
+- Internal PKLs generated from the frozen 704x256 train/val clip manifests
+  contain 200874 train infos and 24909 val infos. Train/val token and clip
+  overlap are both zero; camera/image/intrinsic metadata is consistently cam0
+  and 1600x900, and the 200-sample geometry checks for both splits report zero
+  failures and zero maximum error.
+- The strict validator intentionally retains `FAIL` because converter
+  provenance records 851 train plus 90 val labels at clip boundaries without
+  a corresponding image. These counts match the known legacy condition and
+  were explicitly accepted by the user for this experiment; the 1237 dropped
+  empty-GT train labels remain a recorded warning pending the old/new PKL
+  equality check. Do not edit or relabel the raw strict report as PASS.
+- The user confirmed the completed `--check-image-files` scan checked all
+  200874 train and 24909 val PKL images, with zero missing files, zero JPEG
+  header-size mismatches and zero decode errors. The experiment-level result is
+  therefore `PASS_WITH_ACCEPTED_CLIP_BOUNDARY_EXCEPTION`; rerunning the costly
+  full image scan is unnecessary.
+- Next hard gate is the strict old-704/new-1600 PKL migration comparison. Long
+  training remains blocked until migration equality, F4 train/eval visibility,
+  real-pipeline visualization, legacy forward/backward smoke and 50-iteration
+  throughput checks are reviewed.
+
+### 2026-07-29 GEOM1-A F4 Full-Data Analyzer Scaling
+
+- The initial read-only F4 analyzer retained one Python dictionary for every
+  visible GT under every resize/crop strategy and repeated projection work for
+  each offset. At the native train/val scale this could create tens of millions
+  of rows, excessive memory/CSV output and avoidable repeated projection cost.
+- `analyze_n7_scale_crop_geometry.py` now computes eval/train keep masks and yaw
+  bucket counts over every selected frame, projects pinhole centers/corners once
+  per frame for reuse by all contracts, and projects distortion-aware box-edge
+  samples once per sampled metric frame. Pixel-size/crop/margin quantiles use a
+  deterministic frame-stride sample (`--metric-stride`, default 100); reports
+  state exact population counts and sampled metric counts separately.
+- The strict global F4 decision is explicitly bound to the run-of-record
+  `scale_crop_top_70` strategy. Other requested offsets remain visible as
+  `INFO_DIFFERENCE` rows but cannot falsely fail the center-crop candidate.
+- This is an analysis-only scalability change. It does not alter dataset,
+  training/eval filter, image transform, PKL, config or model behavior. A new
+  regression proves batched edge metrics equal the original single-box method
+  and that visibility uses all frames while pixel metrics are sampled.
+- Verification after the change: focused GEOM1-A tests passed 10/10, complete
+  `tools/tests` discovery passed 62/62, `py_compile` and no-index whitespace
+  checks passed. Internal execution must sync the updated analyzer (and test if
+  desired) before launching the formal F4 scan.
+
+### 2026-07-29 GEOM1-A Migration PASS And F4 Review
+
+- Internal strict old-704/new-1600 migration comparison completed with
+  `N7_PKL_MIGRATION_COMPARE=PASS failures=0`. The new native-image PKLs are
+  therefore accepted as label/token/calibration/split preserving; retain the
+  generated migration report and hashes.
+- The optimized F4 run processed all 225783 infos for exact visibility/yaw and
+  2259 deterministic metric frames, producing 104660 sampled pixel records.
+  The raw zero-tolerance status is `F4_REVIEW_REQUIRED` for the gated
+  `scale_crop_top_70` contract: train loses 101 of 958707 eval-visible car/truck
+  ROI targets (0.0105%) and val loses 10 of 85239 (0.0117%). Combined mismatch
+  is 111/1043946 = 0.01063%, or 99.98937% keep-mask agreement.
+- Direct stretch has exact train/eval visibility agreement. No tested crop
+  offset has exact agreement; top=140 has the smallest combined mismatch (55)
+  but would move the native principal point from crop-output y=128 to y=58 and
+  violate the frozen centered GEOM1-A geometry. Do not select it based on only
+  56 fewer edge targets, and do not modify eval GT visibility to manufacture a
+  PASS.
+- Current recommendation is to preserve center crop and classify the 0.01063%
+  difference as a bounded edge-crop exception only if exact class/distance/yaw
+  buckets show no material truck, middle/far-range or lateral-yaw concentration.
+  Long training remains paused at this F4 decision until that distribution is
+  reviewed and the exception is explicitly recorded.
+- Exact F4 bucket follow-up found all 111 top=70 eval-only targets in 0-20m:
+  65 car and 46 truck; 107 have yaw in [-45,45] degrees, with only two each in
+  [-90,-45] and [135,180]. There are zero 20-80m losses and no lateral-yaw
+  concentration. Two deterministic pixel-metric samples are at x=0.45m and
+  x=1.54m, y about 4.5m; their box edges cross the camera near plane and produce
+  extremely negative distortion-aware margins. Classify the experiment-level
+  result as `PASS_WITH_ACCEPTED_NEAR_FIELD_CROP_EXCEPTION`, while preserving
+  the raw zero-tolerance `F4_REVIEW_REQUIRED` report unchanged. Continue with
+  real train/test pipeline visualization and smoke; do not alter GT filtering,
+  eval visibility, crop offset or the centered GEOM1-A config.
+- Internal real-pipeline visualization then passed for both paths. The train
+  selection contained 40 each of far/top-edge/bottom-edge/nonzero-yaw and two
+  sampled crop-dropped targets; rendering used eight per category and produced
+  the expected 34 images. Val contained 40 in each non-dropped category and no
+  sampled dropped target, producing the expected 32 images. Both commands
+  reported `N7_SCALE_CROP_PIPELINE_VIS=PASS`, confirming the resolved real
+  `RandomAugImageMultiViewImage` can read native images and synchronously render
+  the selected post-crop projections. Preserve both visualization reports and
+  selected output images as gate evidence.
+- Internal one-GPU 10-warmup/50-measure training benchmarks both passed on a
+  separate single-card 20GB test machine at batch 64/workers 8; these were not
+  run on the target four-L20 training host. S0 reports iter mean 11.810291s,
+  data mean 0.094683s and
+  peak allocated memory 9926.1 MiB; GEOM1-A reports 13.276409s, 0.199413s and
+  9929.3 MiB. Thus end-to-end iter+data rises 11.904974s -> 13.475822s
+  (+13.19%), corresponding throughput falls 5.3759 -> 4.7492 samples/s
+  (-11.66%), while memory changes only +3.2 MiB (+0.032%). Wall time rises
+  13m08.9s -> 15m04.7s (+14.68%). Treat the relative A/B result as a valid
+  correctness/overhead gate for that machine, but do not extrapolate its
+  absolute wall time to four L20s. Target-host CPU/JPEG/storage and DDP behavior
+  must be measured from its initial 50-100 iterations. Concurrent native JPEG
+  decode/resize worker CPU contention can also lengthen the timed model section
+  even though post-pipeline tensor shapes are identical.
+- User selected the target four-L20 run-of-record directory
+  `work_dirs/n7_mono_1600_900_scale_crop/EXP-MONO-GEOM1-A/20251017_20251030_20251031_20251203_gpu4_batch64_work_8_260729`.
+  Keep the inherited S0 `fp16=dict(loss_scale='dynamic')` contract even though
+  target memory is sufficient; disabling FP16 would change numerical precision,
+  loss scaling, Tensor Core execution and speed in addition to image geometry.
+  Any FP32 diagnosis must be a separate, matched S0/GEOM control rather than a
+  mutation of the GEOM1-A run-of-record.
+- The formal four-L20 GEOM1-A run has started in that directory with per-GPU
+  batch 64, workers 8 and the retained dynamic FP16 contract. Initial logging
+  converged from the expected dataloader cold start (`data_time=2.6s`) to
+  0.055-0.099s, while iter time stabilized near 8.35s; framework memory reports
+  9986 MiB and `nvidia-smi` reports 13412 MiB per process/device including CUDA,
+  NCCL and reserved/cache overhead. Early ETA converged toward roughly 1 day
+  6-8 hours. Treat the run as healthy unless loss/grad/loss-scale or utilization
+  evidence says otherwise.
+- Do not use spare memory on the same four GPUs to overlap another distributed
+  training job. GPU compute/memory bandwidth, NCCL, host JPEG workers and storage
+  would contend, invalidating timing and increasing failure risk. A second run
+  is acceptable only on separately isolated GPUs/host. Also do not schedule a
+  confounded `force_resize + image augmentation` experiment: first evaluate
+  GEOM1-A; if negative/ambiguous, use native online stretch with image random
+  augmentation still disabled, or if GEOM1-A wins, test AUG1 on the selected
+  geometry. If middle/far improves but lateral yaw remains weak, prioritize DATA1.
+- Historical-session audit for the user's batch-size question found prior
+  four-GPU 6V-temporal experiments that raised per-GPU batch 24 -> 28 -> 30.
+  Batch 28 logged time 23.125s, data_time 2.015s and memory 31225 MiB; batch 30
+  still logged 20.686s after warmup with memory 33430 MiB, versus roughly 16s
+  for the optimized batch-24 path. The larger batches did not improve
+  throughput. This workload is heavier than mono S0, so it is evidence against
+  assuming spare memory implies speed, not a direct mono scaling curve.
+- Keep the active GEOM1-A run at 64/GPU (global 256), matching the S0 epoch13
+  golden and LR 1e-4. Changing it would require restarting, reduce optimizer
+  steps per 15 epochs, change the fixed 1000-iteration warmup fraction and
+  potentially require a separately validated LR/schedule. If future throughput
+  optimization is desired, benchmark larger batches in scratch runs on the same
+  target host and compare samples/second; do not mutate or resume the formal run
+  with a different batch.
+- Keep the active run's 15-epoch limit unchanged. Because its poly LR hook is
+  iteration-based (`by_epoch=False`), changing max epochs to 20 changes max
+  iterations and therefore changes the LR values throughout epochs 1-15; a
+  20-epoch run cannot be made comparable by simply ignoring epochs 16-20. The
+  active process has already resolved 15 epochs, so editing the config would not
+  affect it, while stop/restart or resume under a new horizon would introduce a
+  different schedule or an LR discontinuity. Evaluate all 15 checkpoints first.
+  Only if canonical and required range metrics are still establishing new bests
+  at epoch15 should a separately named five-epoch extension/fine-tune schedule
+  be designed; do not mutate GEOM1-A in place. Historical S0 peaked at epoch13
+  and used epoch15 only as terminal archive, so there is no current evidence for
+  a blind 20-epoch extension.
+
+### 2026-07-29 GEOM1-A Documentation Sync And Training Watch
+
+- Synchronized `N7_FASTBEV_EXPERIMENT_SUMMARY.md`,
+  `N7_FASTBEV_EXPERIMENT_DETAILS.md` and
+  `N7_MONO_FRONT_SINGLE_FRAME_TODO.md` to the completed migration/data/F4/
+  visualization/50-iteration gates and the active four-L20 training state.
+  The documents distinguish the preserved raw strict statuses from the two
+  experiment-level accepted exceptions; they do not relabel either raw report
+  as an unconditional PASS and do not claim model accuracy before validation.
+- Current wait boundary: leave the run-of-record process/config unchanged for
+  approximately one day. On the next review, first collect process health,
+  continuous log tail, current epoch/iter, LR, loss components, grad norm,
+  dynamic loss-scale/overflow evidence, checkpoint list/sizes, free disk and GPU
+  utilization. Then validate available checkpoints on the independent eval
+  host and compare canonical mAP, BEV@0.5, mATE/mAOE/mASE, class metrics and
+  0-80m Recall@2m against S0 epoch13 plus the epoch10 range challenger.
+- Do not launch another job on the same four GPUs, change batch/FP16/epoch
+  horizon, or clean any test/data/report/checkpoint evidence while the run is
+  active. Cleanup remains a separate post-experiment, user-approved inventory
+  operation. No commit or push was performed for this documentation update.
+
+### 2026-07-29 N7 Eval GT Population And Velocity Metrics
+
+- Added nuScenes-style velocity evaluation for the N7 9D box contract
+  `[x,y,z,l,w,h,yaw,vx,vy]`. `mAVE@2m`/official alias `mAVE` is the
+  class-balanced mean `||v_pred-v_gt||2` over the existing unique
+  center-distance TP matches <=2m; no second velocity-specific matching is
+  introduced. vx/vy follow the Fast-BEV lidar frame (x forward, y left), and
+  errors are reported in m/s.
+- Dataset metrics now include overall and per-class AVE, velocity TP coverage,
+  velocity-L2 p50/p90, vx/vy MAE p50/p90 and signed bias, plus the same fields
+  for the existing 0-20/20-40/40-60/60-80m GT-x buckets. Missing 7D or
+  non-finite velocity fields are excluded and exposed by `velocity_tp`; they
+  are not silently treated as zero error. The metric schema is bumped to v3.
+- `eval_summary.md` now writes the shared eval GT population near the top,
+  includes `mAVE@2m`, `eval_gt` and `eval_det` in NuScenes-Like Overall, adds
+  car/truck GT beside detection counts, and adds per-class/range velocity
+  absolute-error and signed-bias tables. CSV/JSON gain matching fields and a
+  new `eval_velocity_summary.csv`.
+- Local verification: focused velocity tests passed 3 plus one legacy
+  integration test skipped because local modern CUDA environment lacks mmcv;
+  complete `tools/tests` discovery passed 66 tests with that one expected
+  skip. Relevant `py_compile` and whitespace checks must remain green after
+  final diff review. The two pre-existing GEOM1-A tests were normalized to the
+  user-selected full run work_dir without changing the training config.
+- Internal action: sync `mmdet3d/datasets/custom_multiview_dataset.py`,
+  `tools/eval_epoch_checkpoints.py`, `tools/n7_eval_velocity.py`,
+  `tools/tests/test_n7_eval_velocity.py` and the adjusted
+  `tools/tests/test_n7_scale_crop_geometry.py`; restart only the eval watcher,
+  not training. Recompute epoch1 metrics from the existing result pkl with
+  `--epochs 1 --skip-inference --rerun-eval`; no inference rerun is required.
+  Confirm `eval_gt=85239`, finite car/truck velocity coverage and non-empty
+  mAVE/detail tables before treating the feature as internally validated.
+
+### 2026-07-29 N7 Eval Velocity Preservation And Watcher Argument Fix
+
+- Internal epoch1 re-evaluation exposed an implementation issue rather than
+  proving that the historical result pkl lacked velocity: N7 eval called the
+  shared box-origin converter with `box_dim=7`, so it discarded prediction
+  `vx/vy` even when `bbox3d2result` had preserved the model's 9D boxes.
+  `_parse_det_result` now retains all available dimensions while the shared
+  helper keeps its historical 7D default for other geometry callers.
+- The epoch2 watcher failure happened before model construction because it
+  forwarded malformed `--cfg-options data.test.samples_per_g`; MMCV requires
+  every item to be `key=value`. The formal config already has
+  `data.test.samples_per_gpu=8`, so the override is unnecessary. The watcher
+  now validates cfg/eval options before entering its polling loop, preventing
+  repeated checkpoint retries for the same CLI typo. The HAMI 48GB/20GB limit
+  inconsistency message was not the exit cause in this trace, though it should
+  still be watched after inference actually starts.
+- Regression coverage now checks malformed cfg-option rejection and, in the
+  legacy integration environment, prediction 9D velocity preservation through
+  `_parse_det_result`. Local focused tests passed 4 with one expected legacy
+  skip; complete `tools/tests` discovery passed 67 with that one skip;
+  `py_compile` and `git diff --check` passed.
+- Internal recovery: sync the updated dataset/eval script (and velocity helper
+  plus regression test if they are not already present), stop only the failed
+  eval watcher, rerun epoch1 evaluation from its existing result pkl, then
+  restart watch mode without `--cfg-options`. If epoch1 still reports zero
+  velocity TP after this fix, inspect the stored prediction box dimension;
+  only a genuinely 7D result pkl requires inference to be rerun.
+
+### 2026-07-31 GEOM1-A Final Result And Next Optimization Route
+
+- Completion: The formal four-L20 GEOM1-A run completed all 15 epochs and all
+  checkpoint evaluations. The synchronized log ends with the epoch15
+  checkpoint save; `eval_summary.md` contains a fixed `eval_gt=85239` for every
+  epoch and selects epoch11 by canonical mAP.
+- Result: e11 has mAP `0.381993`, BEV@0.5 `0.4016`, mATE `0.8615m`, mAOE
+  `4.6376°` and mASE `0.2113`. Against S0 e13, mAP is `+0.025568` and BEV is
+  `+0.0243`; car 40-60/60-80m Recall rises `+0.0425/+0.0314`, and truck rises
+  `+0.0531/+0.0677`.
+- Boundary: Orientation does not improve. Overall AOE worsens `+0.5831°`;
+  car/truck AOE worsen `+0.4641°/+0.7020°`. Existing range x-MAE is conditional
+  on <=2m TP matches and cannot rule out the reported one-body-length depth
+  error among unmatched cases.
+- Frozen roles: e11 is canonical and the next fine-tune candidate; e13 is the
+  GEOM orientation/scale challenger (`mAOE=4.4920°`, `mASE=0.2045`); e15 is
+  terminal. Do not create EXT5. Keep S0 e13 as production fallback until
+  targeted production and board regression pass.
+- Next route: first add yaw-binned/production evaluation, then prioritize
+  `DATA1-CITY-YAW` and `DATA3-BANKED-RING` real GT. Run `AUG1` independently on
+  the selected base. Keep BEVFusion endurance-road data as explicitly managed
+  `DATA2-ENDURANCE-PSEUDO`, after real-GT work.
+- Documentation synchronization touched only the four canonical Markdown
+  files. No source/config/test file was changed and no commit or push was made.
+
+### 2026-08-01 GEOM1-A Submission Boundary And Reproducibility Audit
+
+- Git baseline: `HEAD` and `origin/feature/n7-mono-s0-optimization-v1` are both
+  `134d5f3124e0d11f40dbcbade9e5bfe07c28ff96`; the commit exists locally and on
+  the remote, and is the verified `force_resize` closeout. The worktree still
+  contains mixed historical changes, so no broad staging or cleanup is allowed.
+- Actual experiment contract: the standalone run-of-record config is
+  `configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18_n7_1600x900_scale_crop_dist_train.py`,
+  SHA256 `d134b0bdbc4af0ec3aea391b884c20f46e792248eceecefa742f0639992b89fc`.
+  The prior `8b4ecfdd...439e` value was a pre-run version before the unique
+  work_dir was written and is no longer the final config hash. The run is
+  `n_images=1,n_times=1,sequential=False`, not temporal `1x4`; it uses native
+  1600x900 images, 704x396 resize, crop `(0,70,704,326)`, final 704x256,
+  `force_resize=False` and `enable_random_aug=False`.
+- Reproduction evidence: the formal command used `CONFIG=<standalone config>`,
+  the unique `WORK_DIR`, `TRAIN_BATCH=64`, `EVAL_BATCH=8`, `WORKERS=8`,
+  `NO_VALIDATE=1`, and `bash tools/dist_train_ljr.sh` from
+  `/mnt/liujiaren/fastbev-python-custom-fastbev-adapter`. The resolved log
+  confirms four L20s, seed 0, 15 epochs, the 20260728 native train/val PKLs and
+  the COCO Cascade Mask R-CNN R18/FPN initialization path.
+- Locally verified assets: the training log SHA256 is
+  `1abbd30779fe65b6ff5e255e5eb3751c61427f29ee86f45753395f8b3ee9079b`, the
+  `eval_summary.md` SHA256 is
+  `8e75a795c571f8e59ca468300232be2184ba20cb542d2b789f7943cf5ceb30f0`, and the
+  retained `data_gate.md` SHA256 is
+  `aa012f55c7315b98dc55aa4fe9c92b5501fabaf0c590734aba846eb15d4aeef6`.
+  e11/e13/e15 PTH, per-epoch result/metrics/log files, train/val PKLs,
+  pretrained weights, calibration and cached images are absent locally; their
+  existence/hash must be filled from the internal asset store and was not
+  fabricated from naming conventions.
+- Proposed source boundaries: put the standalone config, formal F4 analyzer and
+  scale/crop regression in the core commit because the regression imports the
+  analyzer. Put strict migration comparison/test, real-pipeline visual gate and
+  training benchmark in the data/gate commit. Keep the dataset 9D-box change,
+  epoch evaluator, velocity helper and its tests together in a separate
+  velocity commit. Put the four canonical experiment documents in the final
+  result commit.
+- Exclusions: `AGENTS.md`, `.claude/`, `CLAUDE.md`, inference Unicode-output
+  changes, BST/vendor/debug files, Ozone download, destructive-capable camera
+  alignment cleanup and qualitative resize-strategy comparison are not part of
+  the GEOM1-A submission. No Phase-B data, PKL or training config was modified
+  or generated during this audit. No file was staged and no commit was created.
+- Submission order was subsequently changed by the user to an internal-first
+  rule for every future commit. The exact candidate scope must first be synced
+  to the internal canonical repo, validated in the legacy/real-data environment,
+  reviewed and committed there. Only the internally committed final contents
+  may then be synced back and committed in this local mirror. This container
+  currently cannot access the known internal repo paths, so it must remain
+  before `git add`/`git commit` until the internal result is returned.
+
+### 2026-08-01 GEOM1-A Internal-First Submission Completion
+
+- Internal validation: the user synchronized all non-Markdown candidate files
+  to `/mnt/liujiaren/fastbev-python-custom-fastbev-adapter`. `py_compile`
+  passed; PKL migration pytest passed 2/2; velocity pytest passed 5/5 including
+  the legacy integration path; and complete unittest discovery passed 68/68.
+  Geometry pytest initially exposed accidental collection of imported helper
+  `test_image_aug_params`; aliasing it to `_test_image_aug_params` preserved the
+  ten intended tests and the user confirmed the rerun passed.
+- Internal submission: the user confirmed all intended internal changes were
+  committed before local submission. Codex/Claude conversation-oriented
+  Markdown is intentionally local-only and is not part of internal sync or
+  internal commits.
+- Local mirror commits completed before final documentation/push:
+  `230d5ae` freezes the standalone GEOM1-A config, F4 analyzer and geometry
+  regression; `e8fa7d5` adds migration and training-gate tools; `23fa1b7`
+  records session naming and internal-first submission rules; `36945bd` adds
+  epoch evaluation/velocity metrics; and `7f148f4` adds Unicode-safe inference
+  output naming and regression coverage.
+- Approved divergence: the internal evaluator and inference script contain
+  additional usage examples. The user reviewed those diffs and explicitly
+  approved leaving them internal-only instead of copying them back. The local
+  functional implementation and tests remain the locally validated versions;
+  exact file equality is not claimed for those approved example-only changes.
+- Scope integrity: unrelated data cleaning/download, qualitative resize
+  comparison, BST/vendor/debug, local Claude configuration and generated model/
+  data/work-dir assets remain untracked or unstaged. No Phase-B data, PKL or
+  training config was created before Phase-A submission.

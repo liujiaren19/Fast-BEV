@@ -1,6 +1,6 @@
 # N7 Fast-BEV 实验汇总
 
-> 更新时间：2026-07-23；范围：N7 6V 四时序精度基线、单目前视四时序 B0、原生单帧 S0、PC 侧 ONNX/LUT 与板端参考链路。
+> 更新时间：2026-08-01；范围：N7 6V 四时序精度基线、单目前视四时序 B0、原生单帧 S0、PC 侧 ONNX/LUT 与板端参考链路、`force_resize` 收口、1600×900 GEOM1-A 结果及后续数据/AUG 路线。
 >
 > 详细记录见：[N7_FASTBEV_EXPERIMENT_DETAILS.md](N7_FASTBEV_EXPERIMENT_DETAILS.md)
 >
@@ -38,11 +38,17 @@
 10. **EXP-6V-B0 数据门禁按已知 clip 边界例外放行。**
     用户确认 20260717 六目数据的门禁失败根因是各 clip 起始/末尾帧不齐全，并批准该已知边界条件放行；本轮记录为 `PASS_WITH_ACCEPTED_CLIP_BOUNDARY_EXCEPTION`。本地没有同步对应 gate/pkl，不能独立复算，但该问题不再阻塞本轮基线冻结。resolved test 仍复用 val pkl，因此当前指标只能称为 val 精度基线，不是独立 test。
 
-11. **PC 侧单帧部署链路已闭环到浮点参考，下一步分成 6V 资产归档和真实板卡验收两条线。**
-    dataset/production epoch13 PTH 对齐、Torch-CUDA fixed LUT、FP ONNX 功能对齐、独立 CPU 板端参考和 38 项回归已经完成；真实芯片 tensor dump、实际板端 runtime 和真实 INT8 数值验证仍未完成。用户确认 6V 的 PTH、pkl 和相关资产已在内网保存；当前工作区未同步实体/hash，但不再作为本轮精度结论的阻塞项。
+11. **PC 侧单帧部署链路已闭环到浮点参考，下一步分成资产归档和真实板卡验收两条线。**
+    dataset/production epoch13 PTH 对齐、Torch-CUDA fixed LUT、FP ONNX 功能对齐、独立 CPU 板端参考和 38 项 mono-front 回归已经完成；`force_resize` 提交门禁对应完整 `tools/tests` 50 项，叠加尚未提交的 GEOM1-A 工具和回归后当前工作区完整 discovery 为 62 项。真实芯片 tensor dump、实际板端 runtime 和真实 INT8 数值验证仍未完成。用户确认 6V 的 PTH、pkl 和相关资产已在内网保存；当前工作区未同步实体/hash，但不再作为本轮精度结论的阻塞项。
 
-12. **6V 重训已登记为 `force_resize` 修复后的低优先级待办，当前保持收口。**
-    6V e6→e16 的后 20% loss 中位数从 `0.6501` 降到 `0.4212`，canonical mAP 却从 `0.453768` 降到 `0.4192`，说明优化器仍在拟合训练目标，不代表 val 精度仍在收敛。未来完成 `force_resize` 修复和等价性回归后，以新实验 ID/work_dir、原 `8e-4` 单变量重训一次；只有相同退化再次出现，再用 `4e-4` 做 challenger。该项不阻塞当前单帧产品和板端主线，无排期时不主动启动。
+12. **`force_resize` 已完成代码、回归、内网 epoch13 T7 和提交收口。**
+    两阶段基础几何/随机增强已拆分，8 组真实旧实现 fixture 和完整 50 项测试通过；内网 pre/post 的 input、2D feature、BEV input、raw logits、decoded boxes 在 `atol=0, rtol=0` 下 bit-exact。代码已提交并推送为 `134d5f3124e0d11f40dbcbade9e5bfe07c28ff96`。未来 AUG1 仍必须使用独立配置；F4 GT 可见性、F5 上游亚像素/旋转语义和普通路径时序共享仍是启用增强前的独立事项。
+
+13. **EXP-MONO-GEOM1-A 已完成并证明输入几何升级有效，但没有解决 yaw。**
+    训练前 migration/F4/真实 pipeline/50 iter 门禁及两个约定例外保持不变；4×L20、每卡 64、dynamic FP16、15 epoch 和全部逐 epoch val 已完成。canonical best=e11：`mAP=0.381993`、BEV@0.5=`0.4016`、mATE=`0.8615m`、mAOE=`4.6376°`、mASE=`0.2113`。相对 S0 e13，mAP `+0.025568`、BEV `+0.0243`，car 40～60/60～80m Recall@2m 提升 `+0.0425/+0.0314`，truck 提升 `+0.0531/+0.0677`；但整体 mAOE 变差 `+0.5831°`，car/truck AOE 分别变差 `+0.4641°/+0.7020°`。因此 e11 是下一轮候选基线，S0 e13 仍保留为生产回退；e13 保留为 GEOM 内方向/尺度 challenger，e15 为 terminal，不启动 EXT5。
+
+14. **下一阶段优先补真实 yaw/弯道数据，AUG1 和伪标注后置。**
+    当前 val 以高快共线车辆为主，缺少对城区路口非 0/180° yaw 的充分约束。先建立 yaw 分桶和生产有 GT 回归，再准备 `DATA1-CITY-YAW` 与 `DATA3-BANKED-RING` 两类 N7 真实 GT；随后在 winner 上独立做 `AUG1`。试车场耐久路 BEVFusion 数据登记为 `DATA2-ENDURANCE-PSEUDO`，必须按伪标注管理、保持纯真实 GT 验证集，优先级低于真实 GT。
 
 ## 2. 证据等级
 
@@ -69,6 +75,7 @@
 | EXP-MONO-T4 | 2026-07-07 | 从 T3 epoch2 权重低 LR 恢复试验 | load_from T3 e2；不是 resume；Adam 2e-4；8e 上限 | e1～4 保存，e5 到 700/785 | loss 继续降至约 0.83；本机无完整 e5/eval，未形成正式基线 |
 | EXP-MONO-B0 | 2026-07-08 | 正式四时序单目前视对照 | 4×L20；每卡 64；AdamW2 1e-4；15e；vertical flip 0 | epoch1～15 均保存；best=e5 | canonical mAP 0.344934；BEV mAP@0.5 0.3562 |
 | EXP-MONO-S0 | 2026-07-13 | 原生单帧产品基线 | 1 camera × 1 time；4×L20；每卡 64；AdamW2 1e-4；15e | e1～15 完成；最终 best=e13 | canonical mAP 0.356425；BEV mAP@0.5 0.3773 |
+| EXP-MONO-GEOM1-A | 2026-07-29～07-30 | 原生 1600×900 等比缩放+中心裁剪单变量对照 | 1 camera × 1 time；4×L20；每卡 64；AdamW2 1e-4；dynamic FP16；15e | e1～15 训练/评估完成；best=e11 | mAP 0.381993；BEV 0.4016；中远距 Recall 提升，AOE 退化 |
 
 ## 4. 当前权重与路径总表
 
@@ -171,6 +178,45 @@
   epoch_13.pth，canonical `mAP=0.356425`，BEV mAP@0.5=`0.3773`，mATE=`0.8588m`，mAOE=`4.0545°`，mASE=`0.2132`。
 - 待内网补录：
   epoch13/epoch10/epoch15 PTH、result pkl、resolved config、代码/数据/标定 SHA256。
+
+### 4.5A 当前 GEOM1-A
+
+- 唯一 run-of-record 配置：
+  `configs/fastbev/custom/custom_fastbev_mono_front_single_frame_r18_n7_1600x900_scale_crop_dist_train.py`
+- 配置为完整独立文件，不再依赖多层 `_base_`；本地文件 SHA256：
+  `d134b0bdbc4af0ec3aea391b884c20f46e792248eceecefa742f0639992b89fc`。
+  旧记录 `8b4ecf...439e` 对应正式 work_dir 写入前的训练前版本，不再作为
+  run-of-record 配置 hash。
+- 已冻结 resolved contract SHA256：
+  `dcfd9882e1e8d2f75348d8d693d0bc411adbb7930e47be306da18b8c67d961d4`。
+- 图像契约：`force_resize=False`、`enable_random_aug=False`、`n_images=1`、
+  `n_times=1`；train/test 均为 `1600×900 -> 704×396 -> crop(0,70,704,326)`，
+  `post_rot=diag(0.44,0.44)`、`post_tran=[0,-70,0]`。
+  这里的 `1×1` 是 GEOM1-A 已训练配置；`n_images=1,n_times=4` 属于 temporal B0，
+  不能倒写成 GEOM1-A 的复现契约。
+- 数据规模：train 200,874 infos / 364 clips / 3,086,700 GT；val 24,909
+  infos / 45 clips / 300,701 GT；train/val token 和 clip 零重叠，`test=val`，
+  当前没有虚构独立 test。
+- 严格迁移：`N7_PKL_MIGRATION_COMPARE=PASS failures=0`；全量图片检查为
+  225,783/225,783 存在，JPEG header 尺寸和解码错误均为 0。原始 data gate
+  因旧 manifest 的 clip 边界缺帧保持 `FAIL`，实验级为
+  `PASS_WITH_ACCEPTED_CLIP_BOUNDARY_EXCEPTION`。
+- F4：全量 keep-mask 一致率 99.98937%；111 个差异全部在 0～20m 近场，
+  不涉及 20～80m 或侧向 yaw 聚集。保留原始 `F4_REVIEW_REQUIRED`，实验级为
+  `PASS_WITH_ACCEPTED_NEAR_FIELD_CROP_EXCEPTION`。
+- 真实 pipeline 可视化：train/val 分别通过并渲染 34/32 张；涵盖远距、上下边缘、
+  非零 yaw 和采样 crop-dropped 目标。
+- 单卡 20GB 机器的 10 warmup + 50 iter：S0/GEOM1-A 的 iter mean 为
+  `11.810291s/13.276409s`，data mean 为 `0.094683s/0.199413s`，峰值显存为
+  `9926.1/9929.3 MiB`。GEOM1-A 端到端慢 13.19%，但该绝对时间不能外推到 L20。
+- 正式 work_dir：
+  `work_dirs/n7_mono_1600_900_scale_crop/EXP-MONO-GEOM1-A/20251017_20251030_20251031_20251203_gpu4_batch64_work_8_260729`。
+- 最终状态：4×L20 15 epoch 于 2026-07-30 完成，e1～15 全部评估。
+  canonical best=e11（mAP `0.381993`）；GEOM 内 e13 的 overall AOE/ASE 最优，
+  作为方向/尺度 challenger，e15 为 terminal。训练完整日志和评估汇总已同步，
+  SHA256 分别为 `1abbd307...079b` 和 `8e75a795...0f0`。当前工作区没有
+  e11/e13/e15 PTH、逐轮 result/metrics、原始 PKL 和预训练权重实体；这些资产的
+  路径与 SHA256 仍待内网归档，不得用日志/汇总 hash 代替。
 
 ### 4.6 当前 6V-B0 阶段精度
 
@@ -315,11 +361,11 @@ S0 e13 是总体主模型，但不是每个产品切片都最优：e13 truck Rec
 | prediction box origin / z | 代码已修；已有 result pkl 重评确认 car/truck z 偏差正常 | 不需重训；补归档新数值、结果路径和 hash |
 | ONNX/LUT 浮点链路 | 真实 e13 已完成 PTH、FP ONNX、Torch-CUDA fixed LUT 和 canonical decode 功能对齐 | raw tensor 仍有 ORT/PTH 数值差；真实芯片/INT8 仍开放 |
 | 原生单帧配置 | 已完成 15 epoch、最终选择 e13，并完成生产图片 PTH/ONNX-FP 推理 | 最终 PTH/result/config/data/calibration hash 待归档 |
-| pkl strict 门禁 | 实现和旧 pkl 实跑已完成；报告为 FAIL | 已确认零泄漏和字段完整性；需处理 `labels_without_frame=851/90`、空 GT 丢弃和独立 test |
-| distortion-aware GT 可见性 | 未完成 | 当前模型 backproject 与 GT 过滤口径仍不完全一致 |
+| pkl strict 门禁 | 新旧 migration PASS、全量图片/几何检查通过；原始报告因已知 clip 边界 851/90 缺帧保持 FAIL | GEOM1-A 按 `PASS_WITH_ACCEPTED_CLIP_BOUNDARY_EXCEPTION` 放行；保留 1,237 个 train 空 GT 丢弃警告，仍无独立 test |
+| distortion-aware GT 可见性 | GEOM1-A F4 全量完成；中心裁剪 111/1,043,946 个 eval-only GT，全部为 0～20m 近场 | 原始 `F4_REVIEW_REQUIRED` 保留；按 `PASS_WITH_ACCEPTED_NEAR_FIELD_CROP_EXCEPTION` 放行，不改 GT 口径 |
 | 生产推理 vs dataset 同图对齐 | e13 PTH 在 N7 黄金样本和 5 个固定样本已 PASS；生产 info-json 数值路径也 PASS | 代码路径已闭环；物理标定仍需独立 lidar/image 验证 |
-| `force_resize` 关闭随机增强 | 首轮 A/B 后作为第 4 个正确性收口项 | 先拆分基础变换并验证无增强等价，再单独 A/B 随机增强 |
-| 704×256 stretch / 输入几何 | 待 S0 后 A/B | 可能影响远距小目标和预训练迁移上限 |
+| `force_resize` 关闭随机增强 | 已完成；commit `134d5f3`，内网 T7 bit-exact PASS | 旧 704×256 baseline 已冻结；AUG1 仍需独立实验 |
+| 704×256 stretch / 输入几何 | GEOM1-A e1～15 完成；e11 mAP=0.381993、BEV=0.4016，中远距 Recall 明显提升但 AOE 退化 | 采用 e11 作为下一轮候选基线；先做 yaw 分桶/生产回归与真实 yaw/弯道数据，不做 EXT5 |
 | CBGS、anchor、NMS | 待数据统计后单变量 A/B | 当前不应盲调 |
 
 ## 9. eval 可视化现状
@@ -352,12 +398,14 @@ python tools/data_converter/n7/visualize_n7_fastbev_pkl.py \
 ## 10. 下一步执行口径
 
 1. EXP-6V-B0 已闭环：保留 e6 为 canonical best、e2 为正向 x 中远距 challenger、e16 为 terminal；e17 及以后不再纳入选型，不补评、不继续训练。
-2. 用户确认 6V PTH/pkl 已在内网保存；建议在内网资产 manifest 中固化 e6/e2/e16 的路径、大小、SHA256 和对应 result/metrics，但这不再阻塞本轮结论。
-3. 将真实芯片预处理、2D 输出、LUT gather/scatter、3D logits 和后处理 tensor dump 与独立 CPU 板端参考逐级对齐，并单独完成真实 INT8 数值验证。
-4. EXP-6V-B0 的六目 clip 起始/末尾不齐已按用户确认作为门禁例外放行；后续新增数据版本仍应保留 token/clip 泄漏、manifest、标定和 hash 审计。
-5. 低优先级代办：`force_resize` 基础变换/随机增强拆分及等价性回归完成后，用新实验 ID/work_dir、原 `8e-4` 单变量重训一次 6V；若 e6 后式退化复现，再增加 `4e-4` LR challenger。当前 6V 保持收口。
-6. 使用同步 lidar/image 独立验证生产车型物理标定；当前 info-json/pkl 数值一致不能替代物理投影正确性。
-7. 基于 S0 e13 和 6V e6 的稳定基线，分别做输入几何/分辨率、增强、CBGS、anchor、NMS、初始化/蒸馏等单变量实验。
+2. 保留旧 704×256 数据、原生 1600×900 PKL/manifest/gate、epoch13/9797/板端黄金证据；当前不执行测试资产清理。实验结束后另列 retain/archive/delete 精确清单并等待批准。
+3. 冻结 GEOM1-A：e11=canonical best，e13=方向/尺度 challenger，e15=terminal；补齐 PTH/result/config/data/calibration hash，不做 EXT5。
+4. 先对 S0 e13、GEOM e11/e13 跑同一生产有 GT 回归集，并新增按“到 0°/180° 最近角度”的 yaw 分桶指标；当前 overall mAOE 不能代表城区路口斜向车辆。
+5. 并行筛选 `DATA1-CITY-YAW` 与 `DATA3-BANKED-RING` N7 真实 GT，按 scene 防泄漏并保留来源/yaw/距离标签。算力有限时可在质量审计后合并为一次真实数据微调，但不同时启用 AUG1。
+6. 在真实数据 winner 或 GEOM e11 上单独做 `AUG1`；固定数据、几何、初始化和 schedule，重点看 yaw 分桶、远距 recall 和生产回归。
+7. `DATA2-ENDURANCE-PSEUDO` 后置：固定 BEVFusion teacher/hash/阈值，人工抽检并控制权重，验证集保持纯真实 GT。
+8. 并行补独立 test、S0/6V/GEOM 资产 hash、同步 lidar/image 物理标定，以及真实芯片 tensor/runtime/INT8 闭环。
+9. `EXP-6V-B1` 保持 P3 低优先级；没有新排期或算力授权时不主动启动。
 
 ## 11. 每轮实验必须补录的资产
 
