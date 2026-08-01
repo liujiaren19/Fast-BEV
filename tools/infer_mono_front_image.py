@@ -129,6 +129,7 @@ import os
 import pickle
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -1451,7 +1452,10 @@ def should_render_visualization(processed_index: int, visualized_count: int,
 
 
 def safe_output_name(text: str) -> str:
-    return re.sub(r"[^0-9A-Za-z._-]+", "_", str(text)).strip("._") or "vehicle"
+    # 保留车型名中的中文等 Unicode 字母/数字，同时过滤路径分隔符、空白和
+    # 其他特殊字符，确保结果始终只是 output-dir 下的单层目录名。
+    normalized = unicodedata.normalize("NFC", str(text))
+    return re.sub(r"[^\w.-]+", "_", normalized, flags=re.UNICODE).strip("._") or "vehicle"
 
 
 def run_inference_job(

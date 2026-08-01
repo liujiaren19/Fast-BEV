@@ -323,6 +323,15 @@ class MonoFrontPipelineContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "禁止自动复制当前图"):
             production.make_temporal_paths(image, 4, args)
 
+    def test_production_vehicle_output_name_preserves_unicode_safely(self):
+        self.assertEqual(
+            production.safe_output_name("9852_HK_海豹06"),
+            "9852_HK_海豹06")
+        self.assertEqual(
+            production.safe_output_name("../9852 HK/海豹06"),
+            "9852_HK_海豹06")
+        self.assertEqual(production.safe_output_name(".."), "vehicle")
+
     def test_qdq_float_io_is_not_manually_quantized(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "qdq.onnx"
